@@ -2,6 +2,7 @@
 name = "sloptweak"
 version = "0.2.0"
 description = "SlopTweak launcher"
+license = "MIT"
 edition = "2021"
 publish = false
 
