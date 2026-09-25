@@ -44,6 +44,7 @@ pub fn passes(offer: &Offer, q: &OfferQuery) -> bool {
         && offer.dph_total <= q.max_dph
         && offer.disk_space_gb >= q.min_disk_gb
         && offer.cuda_max_good >= q.min_cuda
+        && offer.compute_cap >= q.min_compute_cap
         && offer.dph_total.is_finite()
         && offer.inet_down_cost.is_finite()
         && offer.inet_down_cost >= 0.0
@@ -113,11 +114,12 @@ mod tests {
             dph_total: dph,
             storage_cost: 0.2,
             inet_down_cost: down_cost,
-            inet_down_mbps: 4000.0,
+            inet_down_mbps: 900.0,
             reliability: 0.995,
             verified: true,
             disk_space_gb: 100.0,
             cuda_max_good: 12.8,
+            compute_cap: 860,
             geolocation: Some("US".into()),
             machine_id: Some(id + 1000),
         }
@@ -128,9 +130,10 @@ mod tests {
             min_vram_gb: 12.0,
             min_disk_gb: 50.0,
             min_reliability: 0.98,
-            min_inet_down_mbps: 2000.0,
+            min_inet_down_mbps: 500.0,
             max_dph: 0.5,
             min_cuda: 12.4,
+            min_compute_cap: 750,
             limit: 64,
         }
     }
@@ -189,11 +192,12 @@ mod tests {
             ("unverified", Box::new(|o| o.verified = false)),
             ("multi-gpu", Box::new(|o| o.num_gpus = 2)),
             ("unreliable", Box::new(|o| o.reliability = 0.97)),
-            ("slow link", Box::new(|o| o.inet_down_mbps = 1999.0)),
+            ("slow link", Box::new(|o| o.inet_down_mbps = 499.0)),
             ("small vram", Box::new(|o| o.gpu_ram_mb = 8192.0)),
             ("too pricey", Box::new(|o| o.dph_total = 0.51)),
             ("small disk", Box::new(|o| o.disk_space_gb = 40.0)),
             ("old cuda", Box::new(|o| o.cuda_max_good = 12.2)),
+            ("old gpu arch", Box::new(|o| o.compute_cap = 520)),
             ("nan price", Box::new(|o| o.dph_total = f64::NAN)),
             ("negative bw", Box::new(|o| o.inet_down_cost = -1.0)),
         ];

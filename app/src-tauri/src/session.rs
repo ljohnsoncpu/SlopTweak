@@ -884,6 +884,7 @@ impl SessionManager {
         let mut last_stage: Option<(String, Option<String>, Option<i64>)> = None;
         let mut sidecar_errors = 0u32;
         let mut last_host_status: Option<(Option<String>, Option<String>)> = None;
+        let mut last_progress = Instant::now();
         loop {
             if started.elapsed() >= ready_timeout {
                 return Provisioned::Retry(format!(
@@ -902,8 +903,11 @@ impl SessionManager {
                             host_status.1.as_deref().unwrap_or("").trim()
                         ));
                         last_host_status = Some(host_status);
+                        last_progress = Instant::now();
                     }
-                    if let Health::Failed(r) = info.health(started.elapsed()) {
+                    if let Health::Failed(r) =
+                        info.health(started.elapsed(), last_progress.elapsed())
+                    {
                         return Provisioned::Retry(r);
                     }
                     if base.is_none() {

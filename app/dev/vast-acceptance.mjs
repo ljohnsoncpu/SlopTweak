@@ -326,7 +326,7 @@ if (existsSync(join(DATA_DIR, "active_instance.json"))) {
 }
 
 vite = spawn("npx", ["vite", "--port", "1420", "--strictPort"], { cwd: APP, shell: true, windowsHide: true, stdio: "ignore" });
-await waitFor(async () => (await fetch("http://localhost:1420/")).ok, 30000, "vite");
+await waitFor(async () => (await fetch("http://127.0.0.1:1420/")).ok, 30000, "vite");
 
 const created = new Set();
 const tracker = setInterval(async () => {

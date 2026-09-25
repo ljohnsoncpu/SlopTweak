@@ -41,7 +41,8 @@ failure and destroy.
 `No such container`. The host stopped it before the image ran. It cost
 ~$0.035 before we destroyed it. → Phase 2: treat
 `actual_status=loading` + `intended_status=stopped` as failed and move to
-the next offer, and cap `loading` at ~8 min regardless.
+the next offer, and cap `loading` at ~8 min regardless. (Superseded in
+Phase 2 by the stall-aware check; see "Startup policy".)
 
 ## 2. Instance self-identity and scoped keys ✅ Live
 
@@ -259,9 +260,9 @@ Findings from the run:
   hosts (two on the same KR machine, 560 Mbps; one VN, 868 Mbps) all hit
   the cap. `status_msg` showed Docker pull progress
   (`…: Download complete`), not an error. The app destroyed each one and
-  failed cleanly after 3 tries (~$0.007). Fixes:
-  - Default `min_inet_down_mbps` is now **2000**. 45 offers qualified at
-    ≤$0.50/hr.
+  failed cleanly after 3 tries (~$0.007). Fixes (the first fix, a 2 Gbps
+  floor, was reverted per the decision below):
+  - **Stall-aware loading check** (see "Startup policy" below).
   - A failed attempt now excludes the whole `machine_id`, not only the
     offer id (one machine lists several offers).
   - Provisioning logs `actual_status`/`status_msg` changes, so the pull,
@@ -285,9 +286,43 @@ Findings from the run:
 | 52531231 | 47594081 (RTX 3060, US-CT, 2.4 Gbps) | R1 passed; destroyed by Stop |
 | 52532104 | 47594081 | R2 passed; destroyed via orphan "Shut it down" |
 | 52532417 | 47594090 (same machine) | R3 passed; self-destroyed by the watchdog |
+| 52590528 | 51832512 (GTX TITAN X, 500 Mbps floor) | Startup-policy re-test: 634 s loading (past the old 8-min cap, progressing), Ready at **896 s**; R1 checks passed; destroyed by Stop |
 
-Phase 2 total **~$0.086** (credit $11.5389 → $11.4526; late charges may
+Phase 2 total **~$0.124** (credit $11.5389 → $11.4149; late charges may
 post).
+
+## Startup policy (user decision, 2026-09-25)
+
+The user prefers cheap to fast: **up to 15 minutes to start is fine**, and
+the app shouldn't over-filter on link speed.
+- `min_inet_down_mbps` is back to **500**.
+- The fixed 8-minute `loading` cap is replaced by:
+  - **stall**: fail if `actual_status`/`status_msg` hasn't changed for
+    **5 min**. Dead hosts are silent, while pulling hosts update every few
+    seconds. This still catches the Phase 1 dead-host case.
+  - **hard cap**: 12 min of `loading`. This leaves about 3 min of the
+    15-minute per-attempt budget for download, verify, and register (159 s
+    on a 2.4 Gbps host, 262 s on the slow host).
+  - Unchanged: `Error response from daemon`, and loading with
+    `intended_status=stopped`, fail immediately.
+- Re-tested live on the cheapest pick, a GTX TITAN X at $0.0626/hr: Ready
+  at 14.9 min, which is inside the budget but only just. On a similar host,
+  a retry would push the total past 15 min.
+- **GPU architecture floor** `min_compute_cap = 750` (Turing / RTX 20-series
+  and newer, Vast units). Without it, the cheapest pick was Maxwell
+  (compute 5.2). The pinned image uses **torch 2.7.1+cu128** (Invoke
+  v6.14.1 `pyproject.toml`). That probably still runs sm_5x, but SDXL is
+  slow there, and torch 2.8+ drops Maxwell/Pascal. With the floor, 54
+  offers still qualify; the cheapest was an RTX 2060 at $0.062/hr.
+  (🧪 Unverified: whether generation works on sm_52 with this image.
+  Invoke logs to a file, not the container log, so `request_logs` didn't
+  show the device.)
+- Faster startup, if we want it later: hosts with the image cached reach
+  `running` in ~15 s instead of 6–10 min. There's no known offer field for
+  that; a per-machine "was fast before" memory is one option.
+- Dev harness note: `webview-check.mjs` flaked twice, right after a
+  rebuild or the mock-UI run (cold WebView2 start), then passed 6 runs in a
+  row.
 
 ## Decisions (user, 2026-09-24)
 

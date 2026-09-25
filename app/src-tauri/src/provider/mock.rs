@@ -29,6 +29,9 @@ pub enum MockBehavior {
     ProvisionFails(String),
     /// Becomes ready, then the watchdog destroys it after this long.
     SelfDestructAfterReady(Duration),
+    /// A slow host: `loading` with changing pull progress for this long,
+    /// then behaves normally.
+    SlowPull(Duration),
 }
 
 /// Parse `SLOPTWEAK_MOCK_SCRIPT`, e.g. `daemon,dead,normal`, so failure paths
@@ -46,6 +49,7 @@ pub fn parse_script(script: &str) -> Vec<MockBehavior> {
             "selfdestruct" => Some(MockBehavior::SelfDestructAfterReady(Duration::from_secs(
                 120,
             ))),
+            "slowpull" => Some(MockBehavior::SlowPull(Duration::from_secs(60))),
             _ => None,
         })
         .collect()
@@ -85,6 +89,17 @@ struct MockInstance {
     heartbeats: u32,
     destroyed: bool,
     ready_at: Option<Instant>,
+}
+
+impl MockInstance {
+    /// Time since creation, minus any simulated slow image pull.
+    fn age(&self) -> Duration {
+        let raw = self.created.elapsed();
+        match self.behavior {
+            MockBehavior::SlowPull(d) => raw.saturating_sub(d),
+            _ => raw,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -163,7 +178,7 @@ impl MockProvider {
 
     fn info(&self, id: u64, inst: &MockInstance) -> InstanceInfo {
         let t = &self.timings;
-        let age = inst.created.elapsed();
+        let age = inst.age();
         let mut info = InstanceInfo {
             id,
             actual_status: Some("loading".into()),
@@ -187,6 +202,10 @@ impl MockProvider {
                 info.cur_state = Some("stopped".into());
             }
             MockBehavior::DaemonError | MockBehavior::DeadHost | MockBehavior::NeverStarts => {}
+            MockBehavior::SlowPull(d) if inst.created.elapsed() < d => {
+                let secs = inst.created.elapsed().as_secs();
+                info.status_msg = Some(format!("layer{}: Downloading {}s", secs / 20, secs));
+            }
             _ if age >= t.running_after => {
                 info.actual_status = Some("running".into());
                 if age >= t.label_after {
@@ -221,11 +240,12 @@ fn default_offers() -> Vec<Offer> {
         dph_total: dph,
         storage_cost: 0.2,
         inet_down_cost: down,
-        inet_down_mbps: 4000.0,
+        inet_down_mbps: 900.0,
         reliability: rel,
         verified: true,
         disk_space_gb: 120.0,
         cuda_max_good: 12.8,
+        compute_cap: 860,
         geolocation: Some("Mockland".into()),
         machine_id: Some(id * 10),
     };
@@ -343,7 +363,7 @@ impl MockSidecar {
             .values_mut()
             .find(|i| i.token_hash == hash && !i.destroyed)
             .ok_or_else(|| SidecarError::Unreachable("no such tunnel".into()))?;
-        let age = inst.created.elapsed();
+        let age = inst.age();
         let t = &self.timings;
         if matches!(
             inst.behavior,
@@ -357,7 +377,7 @@ impl MockSidecar {
 }
 
 fn stage_at(inst: &mut MockInstance, t: &MockTimings) -> SidecarStatus {
-    let age = inst.created.elapsed();
+    let age = inst.age();
     let (stage, detail, progress) = if let MockBehavior::ProvisionFails(d) = &inst.behavior {
         if age >= t.download_from {
             ("failed", Some(d.clone()), None)

@@ -17,7 +17,7 @@ SLOPTWEAK_PROVIDER=mock npx tauri dev
 ```
 
 `SLOPTWEAK_MOCK_SCRIPT=daemon,dead,normal` scripts per-create failures
-(`daemon`, `dead`, `stuck`, `taken`, `provfail`, `selfdestruct`, `normal`)
+(`daemon`, `dead`, `stuck`, `taken`, `provfail`, `selfdestruct`, `slowpull`, `normal`)
 so the retry and failure paths can be seen in the UI.
 
 ## Module map

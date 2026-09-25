@@ -33,6 +33,10 @@ pub struct Settings {
     pub expected_hours: f64,
     pub min_reliability: f64,
     pub min_inet_down_mbps: f64,
+    /// GPU architecture floor, Vast units. 750 = Turing (RTX 20xx) and newer:
+    /// fp16 tensor cores for SDXL, and still supported after the torch 2.8
+    /// drop of Maxwell/Pascal. Live, a GTX TITAN X (520) was the cheapest pick.
+    pub min_compute_cap: u32,
     pub idle_minutes: u32,
     pub heartbeat_minutes: u32,
     pub max_session_minutes: u32,
@@ -47,9 +51,10 @@ impl Default for Settings {
             max_dph: 0.50,
             expected_hours: 1.0,
             min_reliability: 0.98,
-            // The ~GB-scale Invoke image pull must finish inside the 8-minute
-            // loading cap; 500-900 Mbps hosts missed it three times live.
-            min_inet_down_mbps: 2000.0,
+            // Cheap over fast: slow hosts pull the image slowly, but loading may
+            // run up to 12 min while it shows progress (15 min per attempt).
+            min_inet_down_mbps: 500.0,
+            min_compute_cap: 750,
             idle_minutes: 20,
             heartbeat_minutes: 10,
             max_session_minutes: 240,
@@ -86,6 +91,7 @@ pub fn offer_query(model: &Model, s: &Settings) -> OfferQuery {
         min_inet_down_mbps: s.min_inet_down_mbps,
         max_dph: s.max_dph,
         min_cuda: MIN_CUDA,
+        min_compute_cap: s.min_compute_cap,
         limit: 64,
     }
 }

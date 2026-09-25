@@ -397,11 +397,25 @@ async fn dead_host_and_stuck_loading_move_on() {
     wait_for(&h.mgr, is_ready).await;
     assert_eq!(h.mock.created_offers().len(), 3);
     assert_eq!(h.mock.live_ids().len(), 1);
-    // NeverStarts is abandoned at the 8-minute loading cap, well before the
-    // 15-minute ready timeout.
+    // NeverStarts shows no progress, so it's abandoned at the stall limit,
+    // well before the 12-minute loading cap.
     let waited = t0.elapsed();
-    assert!(waited >= crate::provider::MAX_LOADING, "{waited:?}");
-    assert!(waited < Duration::from_secs(12 * 60), "{waited:?}");
+    assert!(waited >= crate::provider::MAX_STALL, "{waited:?}");
+    assert!(waited < crate::provider::MAX_LOADING, "{waited:?}");
+    h.mgr.stop_and_wait(Duration::from_secs(300)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_pull_with_progress_is_kept() {
+    // An 11-minute image pull on a cheap host: past the old 8-minute cap,
+    // but it keeps making progress, so we wait instead of retrying.
+    let h = harness(vec![MockBehavior::SlowPull(Duration::from_secs(11 * 60))]);
+    let t0 = tokio::time::Instant::now();
+    start(&h);
+    wait_for(&h.mgr, is_ready).await;
+    assert_eq!(h.mock.created_offers().len(), 1, "no retry");
+    let waited = t0.elapsed();
+    assert!(waited < Duration::from_secs(15 * 60), "{waited:?}");
     h.mgr.stop_and_wait(Duration::from_secs(300)).await;
 }
 

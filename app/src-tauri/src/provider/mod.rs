@@ -34,6 +34,8 @@ pub struct Offer {
     pub verified: bool,
     pub disk_space_gb: f64,
     pub cuda_max_good: f64,
+    /// GPU architecture, Vast units (e.g. 860 = sm_86). 0 if unknown.
+    pub compute_cap: u32,
     pub geolocation: Option<String>,
     /// Physical machine; one machine can list several offers.
     pub machine_id: Option<u64>,
@@ -48,6 +50,8 @@ pub struct OfferQuery {
     pub min_inet_down_mbps: f64,
     pub max_dph: f64,
     pub min_cuda: f64,
+    /// Vast units (750 = Turing / RTX 20-series).
+    pub min_compute_cap: u32,
     pub limit: u32,
 }
 
@@ -98,8 +102,14 @@ pub enum Health {
     Failed(String),
 }
 
-/// Cap on `loading` before we assume the host is stuck (findings §1).
-pub const MAX_LOADING: Duration = Duration::from_secs(8 * 60);
+/// Hard cap on `loading`. Slow (cheap) hosts may take this long to pull the
+/// image; it leaves ~3 min of the 15-min attempt budget for provisioning
+/// (measured 159 s live).
+pub const MAX_LOADING: Duration = Duration::from_secs(12 * 60);
+
+/// Give up sooner if `loading` shows no progress (unchanged `status_msg`) for
+/// this long. Dead hosts sit silent; pulling hosts update it every few seconds.
+pub const MAX_STALL: Duration = Duration::from_secs(5 * 60);
 
 impl InstanceInfo {
     pub fn is_ours(&self) -> bool {
@@ -114,8 +124,9 @@ impl InstanceInfo {
     }
 
     /// Classify the provider-side state. `waited` is how long we've been
-    /// waiting for this instance to start.
-    pub fn health(&self, waited: Duration) -> Health {
+    /// waiting for this instance to start; `stalled` is how long its
+    /// status has been unchanged.
+    pub fn health(&self, waited: Duration, stalled: Duration) -> Health {
         let msg = self.status_msg.as_deref().unwrap_or("");
         if msg.contains("Error response from daemon") {
             return Health::Failed("the GPU host could not start the app image".into());
@@ -132,6 +143,11 @@ impl InstanceInfo {
         }
         if waited >= MAX_LOADING {
             return Health::Failed("the GPU host took too long to start the machine".into());
+        }
+        if stalled >= MAX_STALL {
+            return Health::Failed(
+                "the GPU host stopped making progress starting the machine".into(),
+            );
         }
         Health::Starting
     }
@@ -211,7 +227,7 @@ mod tests {
             Some("Error response from daemon: manifest unknown"),
         );
         assert!(matches!(
-            i.health(Duration::from_secs(5)),
+            i.health(Duration::from_secs(5), Duration::ZERO),
             Health::Failed(_)
         ));
     }
@@ -221,12 +237,12 @@ mod tests {
         // Findings §1: loading forever with intended_status=stopped.
         let i = info(Some("loading"), Some("stopped"), None);
         assert!(matches!(
-            i.health(Duration::from_secs(30)),
+            i.health(Duration::from_secs(30), Duration::ZERO),
             Health::Failed(_)
         ));
         let i = info(None, Some("stopped"), Some(""));
         assert!(matches!(
-            i.health(Duration::from_secs(30)),
+            i.health(Duration::from_secs(30), Duration::ZERO),
             Health::Failed(_)
         ));
     }
@@ -234,20 +250,50 @@ mod tests {
     #[test]
     fn health_loading_cap() {
         let i = info(Some("loading"), Some("running"), None);
-        assert_eq!(i.health(Duration::from_secs(60)), Health::Starting);
-        assert!(matches!(i.health(MAX_LOADING), Health::Failed(_)));
+        assert_eq!(
+            i.health(Duration::from_secs(60), Duration::ZERO),
+            Health::Starting
+        );
+        assert!(matches!(
+            i.health(MAX_LOADING, Duration::ZERO),
+            Health::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn slow_pull_with_progress_is_allowed_past_8_minutes() {
+        // Live: 560-868 Mbps hosts were still pulling the image at 8 min.
+        let i = info(
+            Some("loading"),
+            Some("running"),
+            Some("7e99b218d89c: Downloading"),
+        );
+        let ten_min = Duration::from_secs(10 * 60);
+        assert_eq!(i.health(ten_min, Duration::from_secs(20)), Health::Starting);
+    }
+
+    #[test]
+    fn stalled_loading_fails_early() {
+        let i = info(Some("loading"), Some("running"), None);
+        let six_min = Duration::from_secs(6 * 60);
+        assert!(matches!(i.health(six_min, MAX_STALL), Health::Failed(_)));
+        let almost = MAX_STALL - Duration::from_secs(1);
+        assert_eq!(i.health(six_min, almost), Health::Starting);
     }
 
     #[test]
     fn health_running() {
         let i = info(Some("running"), Some("running"), Some("success, running"));
-        assert_eq!(i.health(MAX_LOADING * 2), Health::Running);
+        assert_eq!(i.health(MAX_LOADING * 2, Duration::ZERO), Health::Running);
     }
 
     #[test]
     fn health_exited_fails() {
         let i = info(Some("exited"), Some("running"), None);
-        assert!(matches!(i.health(Duration::ZERO), Health::Failed(_)));
+        assert!(matches!(
+            i.health(Duration::ZERO, Duration::ZERO),
+            Health::Failed(_)
+        ));
     }
 
     #[test]

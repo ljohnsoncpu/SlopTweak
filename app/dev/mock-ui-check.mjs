@@ -102,7 +102,7 @@ function postClose(title) {
 
 async function main() {
   start("npx", ["vite", "--port", "1420", "--strictPort"], { cwd: APP, shell: true });
-  await waitFor(async () => (await fetch("http://localhost:1420/")).ok, 30000, "vite");
+  await waitFor(async () => (await fetch("http://127.0.0.1:1420/")).ok, 30000, "vite");
   const app = start(EXE, [], {
     env: {
       ...process.env,
