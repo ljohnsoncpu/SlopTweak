@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SlopTweak</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <header class="bar">
+      <span class="brand">SlopTweak</span>
+      <span id="mode" class="badge" hidden>MOCK</span>
+      <span class="spacer"></span>
+      <span id="credit" class="muted"></span>
+    </header>
+
+    <main>
+      <section id="orphans" class="card warn" hidden></section>
+
+      <section id="keys" class="card" hidden>
+        <h2>Connect your accounts</h2>
+        <div id="vast-key-row" class="row">
+          <label for="vast-key">Vast API key</label>
+          <input id="vast-key" type="password" autocomplete="off" spellcheck="false" />
+          <button id="vast-save">Save</button>
+        </div>
+        <div id="civitai-key-row" class="row">
+          <label for="civitai-key">CivitAI API key</label>
+          <input id="civitai-key" type="password" autocomplete="off" spellcheck="false" />
+          <button id="civitai-save">Save</button>
+        </div>
+        <p id="keys-msg" class="muted"></p>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <label for="model">Model</label>
+          <select id="model"></select>
+        </div>
+        <p id="model-desc" class="muted"></p>
+
+        <div id="status" class="status">
+          <p id="status-text">Ready to start.</p>
+          <div id="progress" class="progress" hidden><div id="progress-fill"></div></div>
+          <p id="status-sub" class="muted"></p>
+        </div>
+
+        <div class="actions">
+          <button id="start" class="primary">Start</button>
+          <button id="open" hidden>Open Invoke</button>
+          <button id="stop" class="danger" hidden>Stop</button>
+          <button id="dismiss" hidden>OK</button>
+        </div>
+      </section>
+
+      <details class="card">
+        <summary>Details</summary>
+        <pre id="log"></pre>
+      </details>
+    </main>
+
+    <div id="modal" class="modal" hidden>
+      <div class="dialog">
+        <h2>Shut down the GPU and close?</h2>
+        <p>Closing SlopTweak shuts down the rented GPU so it stops billing.</p>
+        <p id="modal-msg" class="muted"></p>
+        <div class="actions">
+          <button id="modal-cancel">Keep running</button>
+          <button id="modal-ok" class="danger">Shut down and close</button>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

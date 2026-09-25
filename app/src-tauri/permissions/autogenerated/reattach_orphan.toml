@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reattach-orphan"
+description = "Enables the reattach_orphan command without any pre-configured scope."
+commands.allow = ["reattach_orphan"]
+
+[[permission]]
+identifier = "deny-reattach-orphan"
+description = "Denies the reattach_orphan command without any pre-configured scope."
+commands.deny = ["reattach_orphan"]

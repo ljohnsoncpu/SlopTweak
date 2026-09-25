@@ -1,0 +1,303 @@
+//! GPU rental providers. Every Vast call goes through [`GpuProvider`] so the
+//! session logic can run against [`mock::MockProvider`] without spending money.
+
+pub mod mock;
+pub mod offers;
+pub mod vast;
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use url::Url;
+
+/// Label every SlopTweak instance carries. The instance rewrites it to
+/// `sloptweak:<tunnel host>` once its tunnel is up.
+pub const LABEL: &str = "sloptweak";
+
+/// A rentable machine, normalised from the provider's search results.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Offer {
+    pub id: u64,
+    pub gpu_name: String,
+    /// Per-GPU VRAM in MB (Vast reports MB).
+    pub gpu_ram_mb: f64,
+    pub num_gpus: u32,
+    /// $/hr for compute, excluding storage.
+    pub dph_total: f64,
+    /// $/GB/month of disk.
+    pub storage_cost: f64,
+    /// $/GB downloaded.
+    pub inet_down_cost: f64,
+    pub inet_down_mbps: f64,
+    pub reliability: f64,
+    pub verified: bool,
+    pub disk_space_gb: f64,
+    pub cuda_max_good: f64,
+    pub geolocation: Option<String>,
+    /// Physical machine; one machine can list several offers.
+    pub machine_id: Option<u64>,
+}
+
+/// Server-side search filters. [`offers::rank`] re-applies them client-side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OfferQuery {
+    pub min_vram_gb: f64,
+    pub min_disk_gb: f64,
+    pub min_reliability: f64,
+    pub min_inet_down_mbps: f64,
+    pub max_dph: f64,
+    pub min_cuda: f64,
+    pub limit: u32,
+}
+
+/// Everything needed to create an instance on a chosen offer.
+#[derive(Clone, PartialEq)]
+pub struct LaunchSpec {
+    pub image: String,
+    pub disk_gb: u32,
+    pub label: String,
+    /// Passed as `-e K=V`. Values must not contain whitespace or quotes.
+    pub env: Vec<(String, String)>,
+    pub onstart: String,
+}
+
+impl std::fmt::Debug for LaunchSpec {
+    // The env holds the CivitAI token; never print values.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchSpec")
+            .field("image", &self.image)
+            .field("disk_gb", &self.disk_gb)
+            .field("label", &self.label)
+            .field(
+                "env_keys",
+                &self.env.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct InstanceInfo {
+    pub id: u64,
+    pub actual_status: Option<String>,
+    pub intended_status: Option<String>,
+    pub cur_state: Option<String>,
+    pub status_msg: Option<String>,
+    pub label: Option<String>,
+    pub dph_total: Option<f64>,
+    pub gpu_name: Option<String>,
+}
+
+/// How an instance looks from the provider's side while we wait for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Health {
+    Starting,
+    Running,
+    /// Give up on this instance and try another offer.
+    Failed(String),
+}
+
+/// Cap on `loading` before we assume the host is stuck (findings §1).
+pub const MAX_LOADING: Duration = Duration::from_secs(8 * 60);
+
+impl InstanceInfo {
+    pub fn is_ours(&self) -> bool {
+        self.label
+            .as_deref()
+            .is_some_and(|l| l == LABEL || l.starts_with("sloptweak:"))
+    }
+
+    /// The raw host part of a `sloptweak:<host>` label, unvalidated.
+    pub fn label_host(&self) -> Option<&str> {
+        self.label.as_deref()?.strip_prefix("sloptweak:")
+    }
+
+    /// Classify the provider-side state. `waited` is how long we've been
+    /// waiting for this instance to start.
+    pub fn health(&self, waited: Duration) -> Health {
+        let msg = self.status_msg.as_deref().unwrap_or("");
+        if msg.contains("Error response from daemon") {
+            return Health::Failed("the GPU host could not start the app image".into());
+        }
+        let actual = self.actual_status.as_deref().unwrap_or("");
+        if actual == "running" {
+            return Health::Running;
+        }
+        if matches!(actual, "exited" | "offline" | "stopped") {
+            return Health::Failed(format!("the GPU host reported the machine as {actual}"));
+        }
+        if self.intended_status.as_deref() == Some("stopped") {
+            return Health::Failed("the GPU host stopped the machine before it started".into());
+        }
+        if waited >= MAX_LOADING {
+            return Health::Failed("the GPU host took too long to start the machine".into());
+        }
+        Health::Starting
+    }
+}
+
+/// Accept only `<name>.trycloudflare.com` from an instance label. The label is
+/// writable by the instance (and so by its host), and we send the launch
+/// secret to whatever it points at.
+pub fn trycloudflare_url(host: &str) -> Option<Url> {
+    let name = host.strip_suffix(".trycloudflare.com")?;
+    let ok = !name.is_empty()
+        && name.len() <= 63
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !ok {
+        return None;
+    }
+    Url::parse(&format!("https://{host}/")).ok()
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq)]
+pub enum ProviderError {
+    #[error("the Vast API key was rejected")]
+    Auth,
+    #[error("that GPU offer is no longer available")]
+    OfferUnavailable,
+    #[error("Vast API error (HTTP {status}): {message}")]
+    Http { status: u16, message: String },
+    #[error("could not reach Vast: {0}")]
+    Network(String),
+    #[error("unexpected response from Vast: {0}")]
+    Parse(String),
+}
+
+#[async_trait]
+pub trait GpuProvider: Send + Sync {
+    /// Prepaid credit in dollars (Vast: `credit`, not `balance`).
+    async fn credit(&self) -> Result<f64, ProviderError>;
+    async fn search_offers(&self, query: &OfferQuery) -> Result<Vec<Offer>, ProviderError>;
+    /// Returns the new instance id.
+    async fn create_instance(&self, offer_id: u64, spec: &LaunchSpec)
+        -> Result<u64, ProviderError>;
+    /// `None` once the instance is gone.
+    async fn instance(&self, id: u64) -> Result<Option<InstanceInfo>, ProviderError>;
+    async fn list_instances(&self) -> Result<Vec<InstanceInfo>, ProviderError>;
+    /// Succeeds if the instance is already gone.
+    async fn destroy(&self, id: u64) -> Result<(), ProviderError>;
+
+    /// Where the instance's sidecar can be reached, once published.
+    fn sidecar_url(&self, info: &InstanceInfo) -> Option<Url> {
+        trycloudflare_url(info.label_host()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(actual: Option<&str>, intended: Option<&str>, msg: Option<&str>) -> InstanceInfo {
+        InstanceInfo {
+            id: 1,
+            actual_status: actual.map(Into::into),
+            intended_status: intended.map(Into::into),
+            status_msg: msg.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn health_daemon_error_fails_immediately() {
+        let i = info(
+            Some("loading"),
+            Some("running"),
+            Some("Error response from daemon: manifest unknown"),
+        );
+        assert!(matches!(
+            i.health(Duration::from_secs(5)),
+            Health::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn health_dead_host_fails() {
+        // Findings §1: loading forever with intended_status=stopped.
+        let i = info(Some("loading"), Some("stopped"), None);
+        assert!(matches!(
+            i.health(Duration::from_secs(30)),
+            Health::Failed(_)
+        ));
+        let i = info(None, Some("stopped"), Some(""));
+        assert!(matches!(
+            i.health(Duration::from_secs(30)),
+            Health::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn health_loading_cap() {
+        let i = info(Some("loading"), Some("running"), None);
+        assert_eq!(i.health(Duration::from_secs(60)), Health::Starting);
+        assert!(matches!(i.health(MAX_LOADING), Health::Failed(_)));
+    }
+
+    #[test]
+    fn health_running() {
+        let i = info(Some("running"), Some("running"), Some("success, running"));
+        assert_eq!(i.health(MAX_LOADING * 2), Health::Running);
+    }
+
+    #[test]
+    fn health_exited_fails() {
+        let i = info(Some("exited"), Some("running"), None);
+        assert!(matches!(i.health(Duration::ZERO), Health::Failed(_)));
+    }
+
+    #[test]
+    fn tunnel_label_validation() {
+        assert_eq!(
+            trycloudflare_url("thunder-west-textile-brothers.trycloudflare.com")
+                .unwrap()
+                .as_str(),
+            "https://thunder-west-textile-brothers.trycloudflare.com/"
+        );
+        for bad in [
+            "evil.com",
+            "trycloudflare.com",
+            ".trycloudflare.com",
+            "a.b.trycloudflare.com",
+            "evil.com/x.trycloudflare.com",
+            "evil.com#.trycloudflare.com",
+            "user@x.trycloudflare.com",
+            "X.trycloudflare.com",
+            "-x.trycloudflare.com",
+            "x.trycloudflare.com:444",
+        ] {
+            assert!(trycloudflare_url(bad).is_none(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn ours_by_label() {
+        let mut i = InstanceInfo::default();
+        assert!(!i.is_ours());
+        i.label = Some("sloptweak".into());
+        assert!(i.is_ours());
+        i.label = Some("sloptweak:abc.trycloudflare.com".into());
+        assert!(i.is_ours());
+        assert_eq!(i.label_host(), Some("abc.trycloudflare.com"));
+        i.label = Some("sloptweakish".into());
+        assert!(!i.is_ours());
+    }
+
+    #[test]
+    fn launch_spec_debug_hides_env_values() {
+        let spec = LaunchSpec {
+            image: "img".into(),
+            disk_gb: 50,
+            label: LABEL.into(),
+            env: vec![("CIVITAI_TOKEN".into(), "supersecretvalue".into())],
+            onstart: String::new(),
+        };
+        let dbg = format!("{spec:?}");
+        assert!(dbg.contains("CIVITAI_TOKEN"));
+        assert!(!dbg.contains("supersecretvalue"));
+    }
+}

@@ -1,0 +1,208 @@
+:root {
+  --bg: #f6f4ef;
+  --card: #ffffff;
+  --text: #1f1c17;
+  --muted: #6b645a;
+  --line: #e2ddd3;
+  --accent: #c98f12;
+  --accent-text: #ffffff;
+  --danger: #b3261e;
+  --warn-bg: #fff4d6;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 15px;
+  color: var(--text);
+  background: var(--bg);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1b1916;
+    --card: #25221e;
+    --text: #efe9df;
+    --muted: #a39a8c;
+    --line: #3a352e;
+    --warn-bg: #3a2f14;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  font-weight: 700;
+  font-size: 17px;
+}
+
+.badge {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+.spacer {
+  flex: 1;
+}
+
+main {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 20px;
+  display: grid;
+  gap: 16px;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px 18px;
+}
+
+.card.warn {
+  background: var(--warn-bg);
+}
+
+h2 {
+  font-size: 16px;
+  margin: 0 0 12px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0;
+}
+
+.row label {
+  width: 130px;
+  flex: none;
+}
+
+.row input,
+.row select {
+  flex: 1;
+  min-width: 0;
+}
+
+input,
+select,
+button {
+  font: inherit;
+  color: inherit;
+  padding: 7px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--card);
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+button.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.status {
+  margin: 16px 0;
+}
+
+#status-text {
+  font-size: 17px;
+  margin: 0 0 8px;
+}
+
+.progress {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+#progress-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.4s;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+pre {
+  max-height: 260px;
+  overflow: auto;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgb(0 0 0 / 45%);
+  display: grid;
+  place-items: center;
+}
+
+.modal[hidden],
+[hidden] {
+  display: none !important;
+}
+
+.dialog {
+  background: var(--card);
+  border-radius: 12px;
+  padding: 20px 22px;
+  max-width: 420px;
+}
+
+.orphan {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.orphan span {
+  flex: 1;
+}

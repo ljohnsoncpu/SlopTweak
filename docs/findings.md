@@ -1,8 +1,8 @@
 # Phase 0 Findings
 
 Status: **complete (2026-09-24).** Docs pass plus a live Vast rental.
-Items 1–5 are verified live. Item 6 (Tauri) is verified from docs only, and
-its $0 local check is deferred to the start of Phase 2.
+Items 1–5 are verified live. Item 6 (Tauri) was verified locally at the
+start of Phase 2.
 
 Markers:
 - ✅ confirmed (docs/source, or **Live** = observed on a real rental)
@@ -153,17 +153,35 @@ the next offer, and cap `loading` at ~8 min regardless.
   hostname (✅ label write works with the instance key), and the launcher
   reads it via `GET /instances/{id}/`. No extra port needed.
 
-## 6. Tauri 2 remote webview ✅ docs / 🧪 local
+## 6. Tauri 2 remote webview ✅ Local (Phase 2)
 
-- `WebviewWindowBuilder::new(app, "remote", WebviewUrl::External(url))`.
-- Remote origins get no command access unless a capability lists them
-  under `remote.urls`. Give the `remote` window label **no capability**.
-  `__TAURI_INTERNALS__` is still injected, but ACL denies calls. (Advisory
-  GHSA-57fm-592m-34r7, iframe bypass, is fixed.)
-- Cookies: dedicated `data_directory` for the remote window, or
-  `incognito(true)`. `on_navigation` pins the window to the tunnel origin.
-- 🧪 Needs a local check ($0, no rental), but Rust isn't installed on this
-  PC. **First task of Phase 2.**
+- `WebviewWindowBuilder::new(app, "remote-N", WebviewUrl::External(url))`
+  with `.data_directory(<app_local_data>/remote-webview)`,
+  `.on_navigation(|u| u.origin() == tunnel_origin)`, and
+  `.on_new_window(|_, _| NewWindowResponse::Deny)` (all in tauri 2.11.6).
+- App commands are declared in `build.rs` via `AppManifest::commands`, so
+  each one needs an `allow-*` permission. Only `capabilities/main.json`
+  (windows: `["main"]`) grants them. Remote windows match no capability.
+- ✅ **Verified locally** by `app/dev/webview-check.mjs` (21/21). The check
+  runs the real `sidecar.py` on 127.0.0.1 and inspects the remote window
+  over a dev-only CDP port:
+  - `__TAURI_INTERNALS__` is injected, but every call is denied, both app
+    commands (`get_snapshot not allowed on window "remote-0" … allowed on:
+    [windows: "main"]`) and core ones (`window.close not allowed`).
+  - Ticket login → HttpOnly cookie; the ticket is single-use; the cookie
+    survives reload and isn't visible to page JS. Chromium accepts the
+    `Secure` cookie on `http://127.0.0.1`.
+  - `location.href = 'https://example.com/'` is blocked; `window.open` makes
+    no new target.
+  - Separate WebView2 user-data dirs: `%LOCALAPPDATA%\com.sloptweak.launcher\EBWebView`
+    (main) vs `…\remote-webview\EBWebView`.
+- ⚠️ `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` applies to every WebView2
+  environment in the process, so two windows can't each get a debug port
+  that way. Use per-window `additional_browser_args` instead. That's why
+  `main` is created in `setup()` (`"create": false` in the config), with
+  debug-only `SLOPTWEAK_MAIN_DEBUG_PORT` / `SLOPTWEAK_REMOTE_DEBUG_PORT`.
+- PowerShell P/Invoke gotcha (dev scripts only): `$null` passed to a `string`
+  parameter becomes `""`. Use `[NullString]::Value` for `FindWindow`.
 
 ---
 
@@ -222,6 +240,54 @@ Phase 1:
 | 52519537 | 48328454 (RTX A4000, US) | Full acceptance passed; **self-destroyed on heartbeat loss** | ~$0.17–0.20 incl. bandwidth |
 
 Phase 1 total ~$0.21 (credit $11.766 → $11.553).
+
+## Phase 2 acceptance (2026-09-25) ✅
+
+Driven by `app/dev/vast-acceptance.mjs` (debug build, real Vast, CDP on
+both windows; heartbeat timeout 3 min and max session 60 min for the run).
+**15/15 checks passed.**
+
+| Run | Result |
+| --- | --- |
+| R1 Start → Invoke → Stop | Instance 52531231 (RTX 3060, Connecticut, 2.4 Gbps). Cold host: create → `running` 355 s (image pull + SSH layer), then 159 s to Ready (download 6.94 GB + verify + register): **514 s total**. Invoke (v6.14.1, model registered) visible in the app window; IPC denied from the remote page; **Stop → gone in 5 s**, record cleared. |
+| R2 crash → relaunch | Instance 52532104, **Ready in 130 s** (same machine, image cached: `running` after 15 s). App killed; relaunch showed "A GPU from an earlier session is still running… Reconnect / Shut it down". **Reconnect** reattached (the stored launch secret worked, Invoke visible again). Killed again; relaunch → **Shut it down** → gone, banner cleared. |
+| R3 crash, no relaunch | Instance 52532417. App killed at Ready; **watchdog destroyed it 194 s after the kill** (3 min heartbeat + ≤15 s tick). Relaunch: no orphan, stale record cleared silently. |
+
+Findings from the run:
+- ⚠️ **Slow hosts miss the 8-minute `loading` cap because of the image
+  pull, not because they're dead.** First attempt (min 500 Mbps): three
+  hosts (two on the same KR machine, 560 Mbps; one VN, 868 Mbps) all hit
+  the cap. `status_msg` showed Docker pull progress
+  (`…: Download complete`), not an error. The app destroyed each one and
+  failed cleanly after 3 tries (~$0.007). Fixes:
+  - Default `min_inet_down_mbps` is now **2000**. 45 offers qualified at
+    ≤$0.50/hr.
+  - A failed attempt now excludes the whole `machine_id`, not only the
+    offer id (one machine lists several offers).
+  - Provisioning logs `actual_status`/`status_msg` changes, so the pull,
+    the SSH layer build, and `running` are visible in the log.
+- The provisioning `status_msg` sequence on a cold host is: layer pulls →
+  apt output from Vast's SSH wrapper build (`#7 DONE 31.8s`) →
+  `Successfully loaded <image>` → `success, running …/ssh`.
+- The offer's `dph_total` excludes storage. The app adds
+  `storage_cost × disk / 730`, and the result matched the instance's
+  `dph_total` to within ~$0.002.
+- Offers carry `machine_id` and `host_id`. There's still no field for
+  "image cached on this host" (🧪 unverified whether one exists).
+
+## Phase 2 rental log (all destroyed; none running)
+
+| Instance | Offer | Outcome |
+| --- | --- | --- |
+| 52527438 | 41437596 (RTX 3060, KR, 560 Mbps) | Loading cap (slow image pull); destroyed by the app |
+| 52528249 | 41678963 (same KR machine) | Loading cap; destroyed by the app |
+| 52529084 | 52063421 (RTX 2060, VN, 868 Mbps) | Loading cap; destroyed by the app → session Failed after 3 tries |
+| 52531231 | 47594081 (RTX 3060, US-CT, 2.4 Gbps) | R1 passed; destroyed by Stop |
+| 52532104 | 47594081 | R2 passed; destroyed via orphan "Shut it down" |
+| 52532417 | 47594090 (same machine) | R3 passed; self-destroyed by the watchdog |
+
+Phase 2 total **~$0.086** (credit $11.5389 → $11.4526; late charges may
+post).
 
 ## Decisions (user, 2026-09-24)
 

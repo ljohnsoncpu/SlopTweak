@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-check-credit"
+description = "Enables the check_credit command without any pre-configured scope."
+commands.allow = ["check_credit"]
+
+[[permission]]
+identifier = "deny-check-credit"
+description = "Denies the check_credit command without any pre-configured scope."
+commands.deny = ["check_credit"]

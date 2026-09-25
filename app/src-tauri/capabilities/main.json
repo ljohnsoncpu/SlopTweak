@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Local launcher UI only. The remote Invoke window gets no capability.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "allow-get-snapshot",
+    "allow-start-session",
+    "allow-stop-session",
+    "allow-open-invoke",
+    "allow-dismiss",
+    "allow-set-secret",
+    "allow-check-credit",
+    "allow-scan-orphans",
+    "allow-destroy-orphan",
+    "allow-reattach-orphan",
+    "allow-confirm-close"
+  ]
+}
