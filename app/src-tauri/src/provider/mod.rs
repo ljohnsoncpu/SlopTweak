@@ -1,6 +1,7 @@
 //! GPU rental providers. Every Vast call goes through [`GpuProvider`] so the
 //! session logic can run against [`mock::MockProvider`] without spending money.
 
+pub mod machines;
 pub mod mock;
 pub mod offers;
 pub mod vast;
@@ -30,6 +31,9 @@ pub struct Offer {
     /// $/GB downloaded.
     pub inet_down_cost: f64,
     pub inet_down_mbps: f64,
+    /// Disk write speed, MB/s (Vast `disk_bw`). Unpacking the image is
+    /// disk-bound on a cold host.
+    pub disk_bw_mbps: f64,
     pub reliability: f64,
     pub verified: bool,
     pub disk_space_gb: f64,
@@ -48,6 +52,7 @@ pub struct OfferQuery {
     pub min_disk_gb: f64,
     pub min_reliability: f64,
     pub min_inet_down_mbps: f64,
+    pub min_disk_bw_mbps: f64,
     pub max_dph: f64,
     pub min_cuda: f64,
     /// Vast units (750 = Turing / RTX 20-series).
@@ -108,8 +113,30 @@ pub enum Health {
 pub const MAX_LOADING: Duration = Duration::from_secs(12 * 60);
 
 /// Give up sooner if `loading` shows no progress (unchanged `status_msg`) for
-/// this long. Dead hosts sit silent; pulling hosts update it every few seconds.
+/// this long. Dead hosts sit silent with an empty `status_msg`.
 pub const MAX_STALL: Duration = Duration::from_secs(5 * 60);
+
+/// Stall limit once the host has shown Docker pull output. Live (Phase 3,
+/// two KR hosts): after `…: Pull complete` of an early layer, `status_msg`
+/// stayed unchanged for 5+ minutes while the big layer was unpacked, so the
+/// 5-minute rule killed working hosts. [`MAX_LOADING`] still caps the wait.
+pub const MAX_STALL_PULLING: Duration = Duration::from_secs(10 * 60);
+
+/// `status_msg` looks like `docker pull` progress.
+fn is_pull_output(msg: &str) -> bool {
+    [
+        ": Pull complete",
+        ": Download complete",
+        ": Downloading",
+        ": Extracting",
+        ": Verifying Checksum",
+        ": Waiting",
+        ": Pulling fs layer",
+        ": Already exists",
+    ]
+    .iter()
+    .any(|m| msg.contains(m))
+}
 
 impl InstanceInfo {
     pub fn is_ours(&self) -> bool {
@@ -144,7 +171,12 @@ impl InstanceInfo {
         if waited >= MAX_LOADING {
             return Health::Failed("the GPU host took too long to start the machine".into());
         }
-        if stalled >= MAX_STALL {
+        let stall_limit = if is_pull_output(msg) {
+            MAX_STALL_PULLING
+        } else {
+            MAX_STALL
+        };
+        if stalled >= stall_limit {
             return Health::Failed(
                 "the GPU host stopped making progress starting the machine".into(),
             );
@@ -279,6 +311,27 @@ mod tests {
         assert!(matches!(i.health(six_min, MAX_STALL), Health::Failed(_)));
         let almost = MAX_STALL - Duration::from_secs(1);
         assert_eq!(i.health(six_min, almost), Health::Starting);
+    }
+
+    #[test]
+    fn silent_unpacking_after_pull_output_is_not_a_stall() {
+        // Live: unchanged for 5+ min after this line on two working hosts.
+        let i = info(
+            Some("loading"),
+            Some("running"),
+            Some("6e2e642403ce: Pull complete"),
+        );
+        let seven = Duration::from_secs(7 * 60);
+        assert_eq!(i.health(seven, MAX_STALL), Health::Starting);
+        assert!(matches!(
+            i.health(seven + MAX_STALL, MAX_STALL_PULLING),
+            Health::Failed(_)
+        ));
+        // Still bounded by the hard cap.
+        assert!(matches!(
+            i.health(MAX_LOADING, MAX_STALL),
+            Health::Failed(_)
+        ));
     }
 
     #[test]

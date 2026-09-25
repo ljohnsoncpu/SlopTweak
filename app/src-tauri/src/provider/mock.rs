@@ -135,6 +135,12 @@ impl MockProvider {
         }
     }
 
+    /// Credit reported by `credit()` (for the low-balance gate in the UI).
+    pub fn with_credit(mut self, credit: f64) -> Self {
+        self.credit = credit;
+        self
+    }
+
     /// Page the remote window opens in mock mode.
     pub fn with_remote_base(mut self, base: Url) -> Self {
         self.remote_base = base;
@@ -240,7 +246,8 @@ fn default_offers() -> Vec<Offer> {
         dph_total: dph,
         storage_cost: 0.2,
         inet_down_cost: down,
-        inet_down_mbps: 900.0,
+        inet_down_mbps: 2500.0,
+        disk_bw_mbps: 3000.0,
         reliability: rel,
         verified: true,
         disk_space_gb: 120.0,
@@ -252,7 +259,7 @@ fn default_offers() -> Vec<Offer> {
     vec![
         mk(101, "RTX A4000", 0.0825, 0.039, 0.996),
         mk(102, "RTX 4060 Ti", 0.1489, 0.0026, 0.992),
-        mk(103, "RTX A4500", 0.1076, 0.0026, 0.987),
+        mk(103, "RTX A4500", 0.1076, 0.0026, 0.993),
         mk(104, "RTX 3090", 0.1907, 0.0, 0.995),
     ]
 }

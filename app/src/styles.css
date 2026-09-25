@@ -206,3 +206,155 @@ pre {
 .orphan span {
   flex: 1;
 }
+
+/* ----- Phase 3: views, wizard, settings, cost bar ----- */
+
+:root {
+  --ok: #2e7d32;
+  --low-bg: #fde7e4;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ok: #7bc47f;
+    --low-bg: #4a2320;
+  }
+}
+
+.view {
+  display: grid;
+  gap: 16px;
+}
+
+.small {
+  font-size: 12px;
+}
+
+.ok {
+  color: var(--ok);
+}
+
+.error {
+  color: var(--danger);
+}
+
+.key-msg {
+  min-height: 1.2em;
+  margin: 4px 0 0;
+}
+
+button.ghost {
+  background: transparent;
+}
+
+button.link {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+button.link.primary-link {
+  font-weight: 600;
+  font-size: 16px;
+}
+
+.costbar {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  padding: 3px 8px;
+  border-radius: 6px;
+}
+
+.costbar.low {
+  background: var(--low-bg);
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.estimate {
+  margin: 12px 0 0;
+}
+
+.notice {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--warn-bg);
+  font-size: 14px;
+}
+
+.notice.refuse {
+  background: var(--low-bg);
+  color: var(--danger);
+}
+
+.wizard ol {
+  padding-left: 22px;
+}
+
+.wizard li {
+  margin: 4px 0;
+}
+
+.shot {
+  display: block;
+  max-width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin: 10px 0;
+}
+
+.keyfield {
+  margin: 12px 0;
+}
+
+.keyfield label {
+  font-weight: 600;
+}
+
+.form {
+  display: grid;
+  grid-template-columns: 1fr 140px;
+  gap: 8px 12px;
+  align-items: center;
+}
+
+.form .actions {
+  grid-column: 1 / -1;
+  align-items: center;
+}
+
+.path {
+  font-family: Consolas, monospace;
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.list {
+  display: grid;
+  gap: 8px;
+}
+
+.lora {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.lora-name {
+  flex: 1 1 60%;
+}
+
+.lora-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.lora .small {
+  flex-basis: 100%;
+}

@@ -343,11 +343,138 @@ the app shouldn't over-filter on link speed.
   allows use on rented GPUs. The user's link was on civitai.red, which
   serves the same model data as civitai.com; the catalog uses civitai.com
   URLs.
-- **§9.5 app name → SlopTweak.** GitHub org/repo not chosen yet; needed
-  before the catalog URL is hard-coded (Phase 3), not before.
+- **§9.5 app name → SlopTweak.** Repo `ljohnsoncpu/SlopTweak`; catalog URL
+  decided 2026-09-25 (see Phase 3).
 - **§9.6 signing → deferred to Phase 5.** It doesn't block anything
   earlier.
 
+## Phase 3 findings (2026-09-25)
+
+- **Catalog URL (user decision):** raw `main` of this repo,
+  `https://raw.githubusercontent.com/ljohnsoncpu/SlopTweak/main/catalog/catalog.json`
+  (200 live). Fetched on launch (10 s timeout, 1 MB cap), validated, cached
+  in `%LOCALAPPDATA%\com.sloptweak.launcher\catalog-cache.json`; falls back
+  to the cache, then to the bundled copy. GitHub's CDN caches raw files for
+  ~5 min, so an upstream edit can take that long to show up.
+- ⚠️ **Divergence from PLAN §4 schema:** `files[].sha256` and `size_bytes`
+  are **required**, not optional. provision.sh verifies both, and CivitAI
+  supplies them. The app also skips (and reports) entries that point the
+  CivitAI key at a non-civitai.com URL, have unsafe file names, lack a
+  `main` file, or need a newer Invoke (`invoke_min_version` > 6.14.1).
+- **CivitAI key check ✅ Live:** `GET https://civitai.com/api/v1/me` with
+  `Authorization: Bearer` → 200 `{id, username, email, tokenScope, …}`; bad
+  or missing key → 401 `{"error":"Unauthorized"}`. The app keeps only
+  `username` (the reply includes the email).
+- **LoRA metadata ✅ Live:** `GET /api/v1/model-versions/{id}` is public and
+  has `model.type` (`LORA`), `baseModel` ("SDXL 1.0", "Illustrious", …),
+  `trainedWords`, and `files[]` with `hashes.SHA256`, `sizeKB`,
+  `downloadUrl`, `primary`, `metadata.format`. **`sizeKB × 1024` is the
+  exact byte count** (Detail Tweaker XL: 223097.9921875 → 228,452,344,
+  matching a ranged GET's `Content-Range`). So LoRAs go through the
+  existing download + size + SHA-256 path in provision.sh unchanged, and
+  the instance asset bundle didn't need a new release.
+  `GET /api/v1/models/{id}` → `modelVersions[0]` is the newest version.
+  Downloads 307-redirect to a presigned R2 URL (HEAD on it → 403, so use a
+  ranged GET to probe sizes). Only `.safetensors` LoRAs are accepted.
+- A LoRA that fails to download, verify, or register ends the session
+  instead of retrying on another GPU (it would fail the same way and cost
+  money); the message tells the user to turn it off in Settings.
+- **Vast deep links:** `https://cloud.vast.ai/` (sign up),
+  `https://cloud.vast.ai/billing/` (Add Credit), and
+  `https://cloud.vast.ai/manage-keys/` (API keys, from the Vast quickstart
+  docs). Logged out, all of them redirect to `/create/`. Vast's minimum
+  deposit is **$5**, and email verification is required before renting.
+  CivitAI: `https://civitai.com/login` and `https://civitai.com/user/account`
+  (API Keys section).
+- Low-balance gate: default floor **$1.00** (Settings). Start is refused
+  below it (checked in Rust, not only the UI). The home screen warns when
+  credit − download < 1 h at the cheapest offer's price. The cost bar
+  counts from instance **creation** (billing starts then, not at Ready),
+  refreshes credit every 3 min, and also shows in the Invoke window's
+  title, since that window can't show app UI.
+- **Mock mode is isolated:** Credential Manager service `SlopTweak-mock`
+  and `…\mock` folders, so mock checks never touch real keys or settings.
+  (Before this, a mock-mode key check would have overwritten the real
+  CivitAI key.)
+- Dev harness: launching the app before vite is serving leaves the main
+  window blank (main.ts never runs); the scripts wait for vite first.
+
+- **Reliability floor → 99% (user decision, 2026-09-25)**, up from 98%.
+  Live that day: 53 offers passed at 0.99 vs 58 at 0.98. The cheapest
+  stayed at ~$0.061/hr (RTX 3060, PL, 0.999), so it costs almost nothing.
+
+## Phase 3 acceptance (2026-09-25) ✅
+
+`app/dev/fresh-profile-acceptance.mjs`, debug build, real Vast.
+**Approximation of "fresh Windows user profile":** the app's Credential
+Manager entries (`*.SlopTweak`) and its whole `%APPDATA%` and
+`%LOCALAPPDATA%` folders (settings, catalog cache, both WebView2 profiles)
+were deleted. The user's Windows profile itself wasn't new, and "install"
+was the debug exe, not the NSIS installer.
+
+| Step | Result |
+| --- | --- |
+| Wiped profile → launch | wizard shown, no keys stored ✅ |
+| User pasted both keys in the wizard (checked on paste) | both stored ✅; catalog fetched from GitHub (`online`) ✅ |
+| Add LoRA from a CivitAI link (Detail Tweaker XL) | real metadata, 228,452,344 B ✅ |
+| Start (run 1, old build) | 3 attempts all dropped by the 5-min stall rule (see below); run stopped, all destroyed |
+| Start (run 2, `--keep-profile`, 99% floor + pull-aware stall) | TH RTX 3060 and NV RTX 2080 Ti hit the 12-min loading cap; KR RTX 2060 (image cached from run 1) `running` in 26 s, **Ready 642 s after create (10.7 min)** ✅ |
+| Invoke registered model **and LoRA** | `main:bananaSplitzXXL_121`, `lora:add-detail-xl` ✅ |
+| First image (user prompt "A potted plant on a desk") | ✅ 1024² |
+| Cost bar | `$0.063/hr · 24 min · ≈$0.05 so far · $11.35 left` ✅ |
+| Stop | instance destroyed ✅ |
+| App restart | keys still there, no wizard ✅; the stale record from the killed run 1 was cleared on launch ✅ |
+
+Run 2: 9/9 checks. Both runs: credit $11.4149 → $11.3444 (~$0.07).
+
+Findings from the run:
+- ⚠️ **Cold image pulls are the startup bottleneck, and `status_msg`
+  goes silent while they unpack.** On four cold hosts (KR 2060 ×2, KR
+  3060, TH 3060, NV 2080 Ti) `status_msg` froze for 5–10+ min after the
+  last `…: Download complete`/`Pull complete`. The 5-min stall rule killed
+  working hosts, so it now allows 10 min once Docker pull output has been
+  seen (dead hosts show an empty `status_msg` and keep 5 min). The 12-min
+  cap still applies.
+- **A host with the image cached starts in ~30 s.** Failed attempts leave
+  the image cached on the host.
+- **Host floor raised (user decision, 2026-09-25):** `inet_down ≥ 2000`
+  Mbps (was 500) and a new `disk_bw ≥ 2000` MB/s (Vast `disk_bw` is in the
+  offer). Price barely predicts speed. Live median `disk_bw` was 1,754 MB/s
+  under $0.10/hr vs ~2,200–3,000 above, and median `inet_down` was ~900
+  Mbps in every price band. So filter on specs, not price. 25 of 150
+  offers passed both; the cheapest was ~$0.083/hr (+$0.02 over the
+  cheapest overall). Live estimate after the change: RTX 3060,
+  $0.107/hr incl. storage.
+- **Machine memory (user decision):** `machines.json` in app data. Skip a
+  machine for 7 days after it fails (unless it has worked since). Prefer a
+  machine that reached Ready before when its expected session cost is
+  within $0.05 of the cheapest. Stops, bad LoRAs, and key errors aren't
+  counted against the machine.
+- ⚠️ **Phase 2 bug fixed:** provision.sh reports `progress` as a fraction
+  (0–1); the app treated it as percent, so the download bar showed 0% on
+  real Vast. The sidecar client now converts it.
+- The 7 GB CivitAI download on the 589 Mbps KR host took ~6 min (vs ~1 min
+  on 2+ Gbps hosts), which is another reason for the link floor.
+- Dev harness: killing the app mid-run left the old script retrying
+  instead of cleaning up; it now aborts when the app exits. Instance
+  52605435 was destroyed by hand via the API.
+
+## Phase 3 rental log (all destroyed; none running)
+
+| Instance | Offer | Outcome |
+| --- | --- | --- |
+| 52603419 | 35050679 (RTX 2060, KR) | Run 1: stall rule after `Pull complete`; destroyed by the app |
+| 52604442 | 49698940 (RTX 2060, KR) | Run 1: same; destroyed by the app |
+| 52605435 | 41437590 (RTX 3060, KR) | Run 1: stopped for the rebuild; destroyed via API |
+| 52606728 | 51708220 (RTX 3060, TH) | Run 2: 12-min loading cap; destroyed by the app |
+| 52607839 | 49623260 (RTX 2080 Ti, NV) | Run 2: 12-min loading cap; destroyed by the app |
+| 52609457 | 35050679 (RTX 2060, KR, image cached) | Run 2: **acceptance passed**; destroyed by Stop |
+
+Phase 3 total **~$0.07** (credit $11.4149 → $11.3444; late charges may post).
+
 ## Still open
 
-- GitHub org/repo for releases and `catalog.json` (needed by Phase 3).
+- Wizard screenshots of the logged-in Vast/CivitAI pages (Claude in Chrome
+  wasn't connected during Phase 3). Drop PNGs into `app/src/wizard/`
+  (`vast-signup`, `vast-billing`, `vast-keys`, `civitai-signup`,
+  `civitai-keys`); the wizard shows them automatically.

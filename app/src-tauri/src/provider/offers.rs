@@ -11,6 +11,7 @@ use std::collections::HashSet;
 
 use serde::Serialize;
 
+use super::machines::{Memory, KNOWN_GOOD_BONUS};
 use super::{Offer, OfferQuery};
 
 const HOURS_PER_MONTH: f64 = 730.0;
@@ -30,8 +31,10 @@ pub struct RankedOffer {
     pub hourly: f64,
     /// One-off model download cost.
     pub download_cost: f64,
-    /// Expected cost of the session; the ranking key.
+    /// Expected cost of the session.
     pub expected_cost: f64,
+    /// This machine reached Ready in an earlier session.
+    pub known_good: bool,
 }
 
 pub fn passes(offer: &Offer, q: &OfferQuery) -> bool {
@@ -39,6 +42,7 @@ pub fn passes(offer: &Offer, q: &OfferQuery) -> bool {
         && offer.num_gpus == 1
         && offer.reliability >= q.min_reliability
         && offer.inet_down_mbps >= q.min_inet_down_mbps
+        && offer.disk_bw_mbps >= q.min_disk_bw_mbps
         // Vast reports MB; 12 GB cards show up as ~12,000-12,288.
         && offer.gpu_ram_mb >= q.min_vram_gb * 1000.0
         && offer.dph_total <= q.max_dph
@@ -59,19 +63,35 @@ pub fn cost(offer: &Offer, c: &CostInputs) -> RankedOffer {
         hourly,
         download_cost,
         expected_cost: hourly * c.expected_hours + download_cost,
+        known_good: false,
     }
 }
 
 /// Offers and machines already tried this session. A machine that failed
 /// once is skipped entirely: it often lists several offers (seen live: two
 /// offers on one stuck host cost two 8-minute timeouts).
+/// Also carries what earlier sessions learned about machines.
 #[derive(Debug, Default, Clone)]
 pub struct Tried {
     offers: HashSet<u64>,
     machines: HashSet<u64>,
+    memory: Memory,
+    now: u64,
 }
 
 impl Tried {
+    pub fn with_memory(memory: Memory, now: u64) -> Self {
+        Self {
+            memory,
+            now,
+            ..Self::default()
+        }
+    }
+
+    fn known_good(&self, o: &Offer) -> bool {
+        o.machine_id.is_some_and(|m| self.memory.known_good(m))
+    }
+
     pub fn add(&mut self, o: &Offer) {
         self.offers.insert(o.id);
         if let Some(m) = o.machine_id {
@@ -80,21 +100,28 @@ impl Tried {
     }
 
     pub fn contains(&self, o: &Offer) -> bool {
-        self.offers.contains(&o.id) || o.machine_id.is_some_and(|m| self.machines.contains(&m))
+        self.offers.contains(&o.id)
+            || o.machine_id
+                .is_some_and(|m| self.machines.contains(&m) || self.memory.avoid(m, self.now))
     }
 }
 
-/// Filter, drop already-tried offers/machines, and sort cheapest expected
-/// session first. Ties go to the more reliable host.
+/// Filter, drop already-tried or recently failed machines, and sort cheapest
+/// expected session first, with a [`KNOWN_GOOD_BONUS`] for machines that
+/// worked before. Ties go to the more reliable host.
 pub fn rank(offers: &[Offer], q: &OfferQuery, c: &CostInputs, tried: &Tried) -> Vec<RankedOffer> {
     let mut ranked: Vec<RankedOffer> = offers
         .iter()
         .filter(|o| !tried.contains(o) && passes(o, q))
-        .map(|o| cost(o, c))
+        .map(|o| RankedOffer {
+            known_good: tried.known_good(o),
+            ..cost(o, c)
+        })
         .collect();
+    let key = |r: &RankedOffer| r.expected_cost - if r.known_good { KNOWN_GOOD_BONUS } else { 0.0 };
     ranked.sort_by(|a, b| {
-        a.expected_cost
-            .total_cmp(&b.expected_cost)
+        key(a)
+            .total_cmp(&key(b))
             .then(b.offer.reliability.total_cmp(&a.offer.reliability))
             .then(a.offer.id.cmp(&b.offer.id))
     });
@@ -114,7 +141,8 @@ mod tests {
             dph_total: dph,
             storage_cost: 0.2,
             inet_down_cost: down_cost,
-            inet_down_mbps: 900.0,
+            inet_down_mbps: 2500.0,
+            disk_bw_mbps: 3000.0,
             reliability: 0.995,
             verified: true,
             disk_space_gb: 100.0,
@@ -130,7 +158,8 @@ mod tests {
             min_vram_gb: 12.0,
             min_disk_gb: 50.0,
             min_reliability: 0.98,
-            min_inet_down_mbps: 500.0,
+            min_inet_down_mbps: 2000.0,
+            min_disk_bw_mbps: 2000.0,
             max_dph: 0.5,
             min_cuda: 12.4,
             min_compute_cap: 750,
@@ -192,7 +221,8 @@ mod tests {
             ("unverified", Box::new(|o| o.verified = false)),
             ("multi-gpu", Box::new(|o| o.num_gpus = 2)),
             ("unreliable", Box::new(|o| o.reliability = 0.97)),
-            ("slow link", Box::new(|o| o.inet_down_mbps = 499.0)),
+            ("slow link", Box::new(|o| o.inet_down_mbps = 1999.0)),
+            ("slow disk", Box::new(|o| o.disk_bw_mbps = 1999.0)),
             ("small vram", Box::new(|o| o.gpu_ram_mb = 8192.0)),
             ("too pricey", Box::new(|o| o.dph_total = 0.51)),
             ("small disk", Box::new(|o| o.disk_space_gb = 40.0)),
@@ -232,6 +262,29 @@ mod tests {
         tried.add(&a);
         let r = rank(&[a, same_machine, other], &query(), &inputs(), &tried);
         assert_eq!(r.iter().map(|r| r.offer.id).collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[test]
+    fn machine_memory_skips_failures_and_prefers_known_good() {
+        let mut mem = Memory::default();
+        let cheapest = offer(1, 0.10, 0.0);
+        let failed = offer(2, 0.09, 0.0);
+        let good = offer(3, 0.13, 0.0); // +$0.03 over the cheapest: wins
+        let good_but_pricey = offer(4, 0.20, 0.0); // +$0.10: doesn't
+        mem.record(failed.machine_id.unwrap(), false, 100);
+        mem.record(good.machine_id.unwrap(), true, 100);
+        mem.record(good_but_pricey.machine_id.unwrap(), true, 100);
+        let r = rank(
+            &[cheapest, failed, good, good_but_pricey],
+            &query(),
+            &inputs(),
+            &Tried::with_memory(mem, 200),
+        );
+        assert_eq!(
+            r.iter().map(|r| r.offer.id).collect::<Vec<_>>(),
+            vec![3, 1, 4]
+        );
+        assert!(r[0].known_good);
     }
 
     #[test]

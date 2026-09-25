@@ -28,6 +28,7 @@ use url::Url;
 use crate::catalog::Model;
 use crate::config::{self, Settings};
 use crate::persist::{now_unix, ActiveRecord, RecordFile};
+use crate::provider::machines::MachineFile;
 use crate::provider::offers::{self, RankedOffer};
 use crate::provider::{GpuProvider, Health, InstanceInfo, ProviderError};
 use crate::redact::redact;
@@ -366,6 +367,8 @@ pub struct Deps {
     pub sidecar: Arc<dyn SidecarApi>,
     pub secrets: Arc<dyn SecretStore>,
     pub records: RecordFile,
+    /// Per-machine history across sessions.
+    pub machines: MachineFile,
     pub ui: Arc<dyn Ui>,
 }
 
@@ -383,6 +386,8 @@ struct Active {
     instance_id: u64,
     base: Option<Url>,
     secret: String,
+    /// When the instance was created: billing starts there, not at Ready.
+    created_unix: u64,
 }
 
 struct Inner {
@@ -422,6 +427,22 @@ pub fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
+/// A setup failure caused by one of the user's LoRAs. Retrying on another
+/// GPU would fail the same way and cost money, so it ends the session.
+pub fn lora_failure(model: &Model, reason: &str) -> Option<String> {
+    model
+        .files
+        .iter()
+        .filter(|f| f.kind == "lora")
+        .find(|f| reason.contains(&f.filename))
+        .map(|f| {
+            format!(
+                "The LoRA file {} couldn't be set up ({reason}).                  Turn it off in Settings, then try again",
+                f.filename
+            )
+        })
+}
+
 fn friendly_destroy_reason(r: &str) -> &str {
     match r {
         "idle" => "it was idle too long",
@@ -452,6 +473,13 @@ impl SessionManager {
 
     pub fn log_lines(&self) -> Vec<String> {
         self.inner.lock().unwrap().log.iter().cloned().collect()
+    }
+
+    /// When the current instance started billing, if there is one.
+    pub fn billing_since(&self) -> Option<u64> {
+        let inner = self.inner.lock().unwrap();
+        inner.state.instance_id()?;
+        inner.active.as_ref().map(|a| a.created_unix)
     }
 
     pub fn is_busy(&self) -> bool {
@@ -692,11 +720,18 @@ impl SessionManager {
             download_cost: 0.0,
             location: None,
         };
+        let created_unix = self
+            .deps
+            .records
+            .load()
+            .filter(|r| r.instance_id == instance_id)
+            .map_or_else(now_unix, |r| r.created_unix);
         self.stop.send_replace(false);
         self.inner.lock().unwrap().active = Some(Active {
             instance_id,
             base: None,
             secret: secret.clone(),
+            created_unix,
         });
         if !self.apply(Event::Reattach { instance_id, offer }) {
             self.inner.lock().unwrap().active = None;
@@ -722,7 +757,7 @@ impl SessionManager {
         let query = config::offer_query(&model, &settings);
         let costs = config::cost_inputs(&model, &settings);
         let ready_timeout = Duration::from_secs(u64::from(settings.ready_timeout_minutes) * 60);
-        let mut tried = offers::Tried::default();
+        let mut tried = offers::Tried::with_memory(self.deps.machines.load(), now_unix());
         loop {
             if self.stopped() {
                 return self.finish_stop(None).await;
@@ -808,9 +843,30 @@ impl SessionManager {
                 return self.finish_stop(Some(instance_id)).await;
             }
 
-            let outcome = self
+            let outcome = match self
                 .provision(instance_id, &secret, ready_timeout, &mut rx)
-                .await;
+                .await
+            {
+                Provisioned::Retry(r) => match lora_failure(&model, &r) {
+                    Some(msg) => Provisioned::Fatal(msg),
+                    None => Provisioned::Retry(r),
+                },
+                other => other,
+            };
+            // Remember how this machine did (not for our own problems, like a
+            // bad LoRA or a rejected key, and not for a stop).
+            if let Some(m) = best.offer.machine_id {
+                let ok = match &outcome {
+                    Provisioned::Ready(_) => Some(true),
+                    Provisioned::Retry(_) | Provisioned::Gone(_) => Some(false),
+                    Provisioned::Fatal(_) | Provisioned::Stopped => None,
+                };
+                if let Some(ok) = ok {
+                    if let Err(e) = self.deps.machines.record(m, ok, now_unix()) {
+                        self.log(format!("couldn't save machine history: {e}"));
+                    }
+                }
+            }
             if !self
                 .after_provision(instance_id, &secret, outcome, &mut rx)
                 .await
@@ -1130,6 +1186,7 @@ impl SessionManager {
             instance_id,
             base: None,
             secret: secret.to_string(),
+            created_unix: rec.created_unix,
         });
     }
 

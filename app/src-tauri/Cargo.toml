@@ -27,6 +27,8 @@ base64 = "0.22"
 url = "2"
 keyring = { version = "3", features = ["windows-native"] }
 log = "0.4"
+tauri-plugin-opener = "2.5"
+tauri-plugin-dialog = "2.7"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

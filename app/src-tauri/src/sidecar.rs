@@ -101,11 +101,23 @@ impl HttpSidecar {
     }
 }
 
+/// provision.sh writes `progress` as a fraction (0..1); the app uses percent.
+/// (Phase 2 assumed percent, so the real download bar sat at 0%.)
+pub fn parse_status(body: &str) -> Result<SidecarStatus, SidecarError> {
+    let mut st: SidecarStatus =
+        serde_json::from_str(body).map_err(|e| SidecarError::Parse(e.to_string()))?;
+    st.progress = st
+        .progress
+        .filter(|p| p.is_finite())
+        .map(|p| (p * 100.0).clamp(0.0, 100.0));
+    Ok(st)
+}
+
 #[async_trait]
 impl SidecarApi for HttpSidecar {
     async fn heartbeat(&self, base: &Url, secret: &str) -> Result<SidecarStatus, SidecarError> {
         let body = self.post(base, "/__heartbeat", secret).await?;
-        serde_json::from_str(&body).map_err(|e| SidecarError::Parse(e.to_string()))
+        parse_status(&body)
     }
 
     async fn ticket(&self, base: &Url, secret: &str) -> Result<String, SidecarError> {
@@ -126,14 +138,14 @@ mod tests {
 
     #[test]
     fn parses_sidecar_payload() {
-        let s: SidecarStatus = serde_json::from_str(
-            r#"{"stage":"downloading","detail":"bananaSplitzXXL_121.safetensors","progress":41.5,
+        let s = parse_status(
+            r#"{"stage":"downloading","detail":"bananaSplitzXXL_121.safetensors","progress":0.415,
                 "updated":1727000000,"destroying":null,
                 "deadlines":{"heartbeat_s":598.2,"idle_s":null,"max_session_s":14000}}"#,
         )
         .unwrap();
         assert_eq!(s.stage, "downloading");
-        assert_eq!(s.progress, Some(41.5));
+        assert!((s.progress.unwrap() - 41.5).abs() < 1e-9);
         assert_eq!(s.deadlines.unwrap().idle_s, None);
         let booting: SidecarStatus =
             serde_json::from_str(r#"{"stage":"booting","destroying":null,"deadlines":{}}"#)

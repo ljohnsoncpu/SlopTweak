@@ -113,6 +113,7 @@ pub fn search_body(q: &OfferQuery) -> Value {
         "num_gpus": {"eq": 1},
         "reliability": {"gte": q.min_reliability},
         "inet_down": {"gte": q.min_inet_down_mbps},
+        "disk_bw": {"gte": q.min_disk_bw_mbps},
         // gpu_ram is MB; see offers::passes for the 12 GB rounding.
         "gpu_ram": {"gte": q.min_vram_gb * 1000.0},
         "disk_space": {"gte": q.min_disk_gb},
@@ -173,6 +174,8 @@ struct RawOffer {
     #[serde(default)]
     inet_down: f64,
     #[serde(default)]
+    disk_bw: f64,
+    #[serde(default)]
     reliability2: Option<f64>,
     #[serde(default)]
     reliability: Option<f64>,
@@ -210,6 +213,7 @@ pub fn parse_offers(v: &Value) -> Result<Vec<Offer>, ProviderError> {
             // Unknown bandwidth price: assume the worst seen live ($0.04/GB).
             inet_down_cost: o.inet_down_cost.unwrap_or(0.04),
             inet_down_mbps: o.inet_down,
+            disk_bw_mbps: o.disk_bw,
             reliability: o.reliability2.or(o.reliability).unwrap_or(0.0),
             verified: o.verified.unwrap_or(false) || o.verification.as_deref() == Some("verified"),
             disk_space_gb: o.disk_space,
@@ -391,7 +395,8 @@ mod tests {
             min_vram_gb: 12.0,
             min_disk_gb: 50.0,
             min_reliability: 0.98,
-            min_inet_down_mbps: 500.0,
+            min_inet_down_mbps: 2000.0,
+            min_disk_bw_mbps: 2000.0,
             max_dph: 0.5,
             min_cuda: 12.4,
             min_compute_cap: 750,
@@ -402,6 +407,7 @@ mod tests {
         assert_eq!(b["gpu_ram"]["gte"], 12000.0);
         assert_eq!(b["dph_total"]["lte"], 0.5);
         assert_eq!(b["compute_cap"]["gte"], 750);
+        assert_eq!(b["disk_bw"]["gte"], 2000.0);
         assert_eq!(b["type"], "ondemand");
         // Never filter by id (findings: false negatives).
         assert!(b.get("id").is_none());

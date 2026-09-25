@@ -294,6 +294,7 @@ fn rebuild(
         sidecar: Arc::new(mock.sidecar()),
         secrets,
         records: RecordFile::new(dir),
+        machines: crate::provider::machines::MachineFile::new(dir),
         ui: ui.clone(),
     };
     (SessionManager::new(deps, Timing::default()), ui)
@@ -582,4 +583,79 @@ async fn no_matching_offer_fails_without_renting() {
     };
     assert!(reason.contains("No GPU matches"), "{reason}");
     assert!(h.mock.created_offers().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn lora_setup_failure_is_final_and_destroys() {
+    let lora = crate::civitai::lora_from_version(&crate::civitai::mock_version(135867)).unwrap();
+    let m = crate::config::with_loras(&model(), &[lora]);
+    let h = harness(vec![MockBehavior::ProvisionFails(
+        "checksum mismatch: add-detail-xl.safetensors".into(),
+    )]);
+    h.mgr
+        .start(m, Settings::default(), Some("civitai-test".into()))
+        .unwrap();
+    let s = wait_for(&h.mgr, |s| matches!(s, SessionState::Failed { .. })).await;
+    let SessionState::Failed { reason } = s else {
+        panic!()
+    };
+    assert!(reason.contains("add-detail-xl.safetensors"), "{reason}");
+    assert!(reason.contains("Settings"), "{reason}");
+    assert_eq!(h.mock.created_offers().len(), 1, "no retry on another GPU");
+    assert!(h.mock.live_ids().is_empty());
+    assert_eq!(RecordFile::new(h.dir.path()).load(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn billing_starts_at_create() {
+    let h = harness(vec![]);
+    assert_eq!(h.mgr.billing_since(), None);
+    start(&h);
+    wait_for(&h.mgr, is_ready).await;
+    let since = h.mgr.billing_since().unwrap();
+    let rec = RecordFile::new(h.dir.path()).load().unwrap();
+    assert_eq!(since, rec.created_unix);
+    h.mgr.stop_and_wait(Duration::from_secs(300)).await;
+    assert_eq!(h.mgr.billing_since(), None);
+}
+
+#[test]
+fn lora_failure_matching() {
+    let lora = crate::civitai::lora_from_version(&crate::civitai::mock_version(135867)).unwrap();
+    let m = crate::config::with_loras(&model(), &[lora]);
+    assert!(lora_failure(
+        &m,
+        "setup failed (download failed: add-detail-xl.safetensors)"
+    )
+    .is_some());
+    // The main model failing is a host problem: retry elsewhere.
+    assert!(lora_failure(
+        &m,
+        "setup failed (download failed: bananaSplitzXXL_121.safetensors)"
+    )
+    .is_none());
+    assert!(lora_failure(&model(), "setup failed (x)").is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn machine_history_carries_across_sessions() {
+    let h = harness(vec![MockBehavior::DaemonError]);
+    start(&h);
+    wait_for(&h.mgr, is_ready).await;
+    let first = h.mock.created_offers();
+    assert_eq!(first.len(), 2);
+    let (failed, worked) = (first[0], first[1]);
+    h.mgr.stop_and_wait(Duration::from_secs(300)).await;
+
+    // Next session: skip the machine that failed, go back to the one that worked.
+    start(&h);
+    wait_for(&h.mgr, is_ready).await;
+    let second = h.mock.created_offers()[2];
+    assert_ne!(second, failed);
+    assert_eq!(second, worked);
+    h.mgr.stop_and_wait(Duration::from_secs(300)).await;
+
+    let mem = crate::provider::machines::MachineFile::new(h.dir.path()).load();
+    assert!(mem.avoid(failed * 10, now_unix()));
+    assert!(mem.known_good(worked * 10));
 }

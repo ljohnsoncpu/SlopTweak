@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reset-output-folder"
+description = "Enables the reset_output_folder command without any pre-configured scope."
+commands.allow = ["reset_output_folder"]
+
+[[permission]]
+identifier = "deny-reset-output-folder"
+description = "Denies the reset_output_folder command without any pre-configured scope."
+commands.deny = ["reset_output_folder"]

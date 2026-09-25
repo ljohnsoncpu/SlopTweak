@@ -100,6 +100,15 @@ impl RemoteWindows {
         Ok(())
     }
 
+    /// The remote page can't show app UI, so the cost bar goes in its title.
+    pub fn set_title(&self, title: &str) {
+        if let Some((label, _)) = self.current.lock().unwrap().as_ref() {
+            if let Some(w) = self.app.get_webview_window(label) {
+                let _ = w.set_title(title);
+            }
+        }
+    }
+
     pub fn close(&self) {
         if let Some((label, _)) = self.current.lock().unwrap().take() {
             if let Some(w) = self.app.get_webview_window(&label) {

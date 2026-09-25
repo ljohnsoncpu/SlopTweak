@@ -1,5 +1,6 @@
 //! Pinned instance inputs, user settings, and the create-call spec.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -7,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::catalog::Model;
+use crate::civitai::{compatible, Lora};
 use crate::provider::{offers::CostInputs, LaunchSpec, OfferQuery, LABEL};
 
 /// Official InvokeAI image, pinned by digest (findings §3; never below 6.13.8).
@@ -17,6 +19,8 @@ pub const ASSETS_URL: &str =
 pub const ASSETS_SHA256: &str = "2ff1ecf68f2766a2c75b16e069670b8caca64405195313fd4439b1d619693811";
 /// Vast limit on `onstart` (findings §1).
 pub const ONSTART_LIMIT: usize = 4048;
+/// Invoke version in [`IMAGE`]; catalog entries needing newer are skipped.
+pub const INVOKE_VERSION: &str = "6.14.1";
 /// The Invoke CUDA image needs a driver that supports at least this.
 pub const MIN_CUDA: f64 = 12.4;
 
@@ -33,6 +37,8 @@ pub struct Settings {
     pub expected_hours: f64,
     pub min_reliability: f64,
     pub min_inet_down_mbps: f64,
+    /// Disk write speed floor, MB/s.
+    pub min_disk_bw_mbps: f64,
     /// GPU architecture floor, Vast units. 750 = Turing (RTX 20xx) and newer:
     /// fp16 tensor cores for SDXL, and still supported after the torch 2.8
     /// drop of Maxwell/Pascal. Live, a GTX TITAN X (520) was the cheapest pick.
@@ -43,6 +49,13 @@ pub struct Settings {
     /// Per attempt: destroy and try the next offer if not ready by then.
     pub ready_timeout_minutes: u32,
     pub max_attempts: u32,
+    /// Last model picked on the home screen.
+    pub model_id: Option<String>,
+    /// Low-balance gate: refuse to start below this much Vast credit ($).
+    pub min_credit: f64,
+    /// Where images are saved (Phase 4). `None` = Pictures\SlopTweak.
+    pub output_dir: Option<String>,
+    pub loras: Vec<Lora>,
 }
 
 impl Default for Settings {
@@ -50,17 +63,62 @@ impl Default for Settings {
         Self {
             max_dph: 0.50,
             expected_hours: 1.0,
-            min_reliability: 0.98,
-            // Cheap over fast: slow hosts pull the image slowly, but loading may
-            // run up to 12 min while it shows progress (15 min per attempt).
-            min_inet_down_mbps: 500.0,
+            // User decision 2026-09-25: only hosts with 99%+ reliability.
+            min_reliability: 0.99,
+            // User decision 2026-09-25 (Phase 3): cold hosts below ~2 Gbps /
+            // 2 GB/s often couldn't pull + unpack the image inside the 12-min
+            // loading cap. Costs ~$0.02/hr over the absolute cheapest.
+            min_inet_down_mbps: 2000.0,
+            min_disk_bw_mbps: 2000.0,
             min_compute_cap: 750,
             idle_minutes: 20,
             heartbeat_minutes: 10,
             max_session_minutes: 240,
             ready_timeout_minutes: 15,
             max_attempts: 3,
+            model_id: None,
+            min_credit: 1.0,
+            output_dir: None,
+            loras: Vec::new(),
         }
+    }
+}
+
+/// The settings a user can change in the app. Only these are written to
+/// settings.json, so the internal defaults above can still change in later
+/// versions (a hand-edited file may still set the others).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserSettings {
+    pub model_id: Option<String>,
+    pub max_dph: f64,
+    pub idle_minutes: u32,
+    pub max_session_minutes: u32,
+    pub min_credit: f64,
+    pub output_dir: Option<String>,
+    pub loras: Vec<Lora>,
+}
+
+impl UserSettings {
+    /// Range checks, in plain language.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(0.05..=5.0).contains(&self.max_dph) {
+            return Err("Max price must be between $0.05 and $5.00 per hour.".into());
+        }
+        if !(5..=240).contains(&self.idle_minutes) {
+            return Err("Idle shutdown must be between 5 and 240 minutes.".into());
+        }
+        if !(30..=24 * 60).contains(&self.max_session_minutes) {
+            return Err("Max session length must be between 0.5 and 24 hours.".into());
+        }
+        if !(0.0..=1000.0).contains(&self.min_credit) {
+            return Err("Minimum credit must be between $0 and $1000.".into());
+        }
+        if let Some(d) = &self.output_dir {
+            if d.trim().is_empty() || !Path::new(d).is_absolute() {
+                return Err("Pick an output folder.".into());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -75,6 +133,66 @@ impl Settings {
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default()
     }
+
+    pub fn user(&self) -> UserSettings {
+        UserSettings {
+            model_id: self.model_id.clone(),
+            max_dph: self.max_dph,
+            idle_minutes: self.idle_minutes,
+            max_session_minutes: self.max_session_minutes,
+            min_credit: self.min_credit,
+            output_dir: self.output_dir.clone(),
+            loras: self.loras.clone(),
+        }
+    }
+
+    /// Validate `u`, then write it (merged over any hand-set advanced keys).
+    /// Atomic: temp file then rename.
+    pub fn save_user(dir: &Path, u: &UserSettings) -> Result<Settings, String> {
+        u.validate()?;
+        let path = Self::path(dir);
+        let mut obj = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        let patch = serde_json::to_value(u).map_err(|e| e.to_string())?;
+        for (k, v) in patch.as_object().expect("struct serializes to object") {
+            obj[k] = v.clone();
+        }
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&obj).expect("json"))
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .map_err(|e| format!("Couldn't save settings: {e}"))?;
+        Ok(Self::load(dir))
+    }
+}
+
+/// The model plus the user's enabled LoRAs that fit its base. File names are
+/// made unique so nothing overwrites anything on the instance.
+pub fn with_loras(model: &Model, loras: &[Lora]) -> Model {
+    let mut out = model.clone();
+    let mut names: HashSet<String> = out
+        .files
+        .iter()
+        .map(|f| f.filename.to_ascii_lowercase())
+        .collect();
+    for l in loras
+        .iter()
+        .filter(|l| l.enabled && compatible(l, &model.base))
+    {
+        let mut f = l.file.clone();
+        if !names.insert(f.filename.to_ascii_lowercase()) {
+            let stem = f.filename.trim_end_matches(".safetensors");
+            f.filename = format!("{stem}-{}.safetensors", l.version_id);
+            if !names.insert(f.filename.to_ascii_lowercase()) {
+                continue;
+            }
+        }
+        out.files.push(f);
+    }
+    out
 }
 
 /// Room for the model plus Invoke's own files, caches, and outputs.
@@ -89,6 +207,7 @@ pub fn offer_query(model: &Model, s: &Settings) -> OfferQuery {
         min_disk_gb: disk_gb(model) as f64,
         min_reliability: s.min_reliability,
         min_inet_down_mbps: s.min_inet_down_mbps,
+        min_disk_bw_mbps: s.min_disk_bw_mbps,
         max_dph: s.max_dph,
         min_cuda: MIN_CUDA,
         min_compute_cap: s.min_compute_cap,
@@ -175,7 +294,93 @@ mod tests {
     #[test]
     fn image_is_pinned_by_digest() {
         assert!(IMAGE.contains("-cuda@sha256:"));
+        assert!(IMAGE.contains(&format!(":v{INVOKE_VERSION}-cuda@")));
         assert_eq!(ASSETS_SHA256.len(), 64);
+    }
+
+    fn lora(id: u64, base: &str, filename: &str) -> Lora {
+        let mut l = crate::civitai::lora_from_version(&crate::civitai::mock_version(id)).unwrap();
+        l.base_model = base.into();
+        l.file.filename = filename.into();
+        l
+    }
+
+    #[test]
+    fn user_settings_save_keeps_advanced_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            Settings::path(dir.path()),
+            r#"{"min_inet_down_mbps": 900, "max_dph": 0.3}"#,
+        )
+        .unwrap();
+        let mut u = Settings::load(dir.path()).user();
+        u.max_dph = 0.2;
+        u.idle_minutes = 30;
+        u.model_id = Some("m".into());
+        u.loras = vec![lora(1, "SDXL 1.0", "a.safetensors")];
+        let s = Settings::save_user(dir.path(), &u).unwrap();
+        assert_eq!(s.max_dph, 0.2);
+        assert_eq!(s.idle_minutes, 30);
+        assert_eq!(s.min_inet_down_mbps, 900.0);
+        assert_eq!(s.loras.len(), 1);
+        let raw = std::fs::read_to_string(Settings::path(dir.path())).unwrap();
+        // Internal defaults aren't frozen into the file.
+        assert!(!raw.contains("min_compute_cap"));
+        assert!(!raw.contains("heartbeat_minutes"));
+    }
+
+    #[test]
+    fn user_settings_ranges() {
+        let ok = Settings::default().user();
+        assert!(ok.validate().is_ok());
+        type Mutation = Box<dyn Fn(&mut UserSettings)>;
+        let cases: Vec<Mutation> = vec![
+            Box::new(|u| u.max_dph = 0.0),
+            Box::new(|u| u.max_dph = f64::NAN),
+            Box::new(|u| u.idle_minutes = 1),
+            Box::new(|u| u.max_session_minutes = 10),
+            Box::new(|u| u.min_credit = -1.0),
+            Box::new(|u| u.output_dir = Some("relative-dir".into())),
+        ];
+        for mutate in cases {
+            let mut u = ok.clone();
+            mutate(&mut u);
+            assert!(u.validate().is_err(), "{u:?}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut bad = ok.clone();
+        bad.max_dph = 99.0;
+        assert!(Settings::save_user(dir.path(), &bad).is_err());
+        assert!(!Settings::path(dir.path()).exists());
+    }
+
+    #[test]
+    fn loras_join_only_matching_models() {
+        let model = catalog::bundled()[0].clone(); // sdxl
+        let mut off = lora(4, "SDXL 1.0", "off.safetensors");
+        off.enabled = false;
+        let clash = lora(5, "Illustrious", &model.files[0].filename);
+        let loras = vec![
+            lora(1, "SDXL 1.0", "a.safetensors"),
+            lora(6, "SD 1.5", "b.safetensors"),
+            off,
+            clash,
+        ];
+        let m = with_loras(&model, &loras);
+        let names: Vec<&str> = m.files.iter().map(|f| f.filename.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "bananaSplitzXXL_121.safetensors",
+                "a.safetensors",
+                "bananaSplitzXXL_121-5.safetensors"
+            ]
+        );
+        assert_eq!(m.total_bytes(), model.total_bytes() + 2 * 228_452_344);
+        // LoRA files carry the CivitAI key requirement into the launch spec.
+        let spec = launch_spec(&m, &Settings::default(), &"a".repeat(64), Some("tok"));
+        assert!(spec.env.iter().any(|(k, _)| k == "CIVITAI_TOKEN"));
+        crate::provider::vast::env_string(&spec.env).unwrap();
     }
 
     #[test]

@@ -1,22 +1,34 @@
-// Drive the launcher UI against MockProvider ($0): Start -> Ready -> Stop,
-// then Start again and close the window to exercise the confirm-and-destroy
-// path. Screenshots go to $SHOTS (default: a temp dir).
+// Drive the launcher UI against MockProvider + MockCivitai ($0, no network
+// besides a local catalog server). Covers Phase 2 and 3:
+//   fresh mock profile -> wizard (key checks on paste) -> home estimate ->
+//   settings + validation -> LoRAs -> upstream catalog edit without rebuild ->
+//   Start -> cost bar -> Stop -> restart (keys, settings, cached catalog
+//   survive) -> low-balance gate -> close-while-running confirm + destroy.
+// Mock mode uses its own Credential Manager service ("SlopTweak-mock") and
+// its own folders, so the real profile is never touched.
 //
 // Usage (from app/):  node dev/mock-ui-check.mjs
-// Needs a debug build. Starts vite on :1420 itself.
+// Needs a debug build. Starts vite on :1420 itself. Screenshots go to $SHOTS.
 
 import { spawn, execSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const APP = resolve(import.meta.dirname, "..");
 const EXE = join(APP, "src-tauri", "target", "debug", "sloptweak.exe");
 const CDP_PORT = 9334;
+const CATALOG_PORT = 18431;
 const SHOTS = process.env.SHOTS ?? mkdtempSync(join(tmpdir(), "sloptweak-shots-"));
 const procs = [];
 const results = [];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Fake keys for the mock only. The mock rejects all-zero Vast keys and
+// CivitAI keys starting with "bad".
+const FAKE_VAST = "ab".repeat(32);
+const FAKE_CIVITAI = "mockcivitaikey0123456789abcdef";
 
 function start(cmd, args, opts = {}) {
   const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, ...opts });
@@ -26,6 +38,14 @@ function start(cmd, args, opts = {}) {
   p.output = () => out;
   procs.push(p);
   return p;
+}
+
+function kill(p) {
+  try {
+    execSync(`taskkill /T /F /PID ${p.pid}`, { stdio: "ignore" });
+  } catch {
+    /* gone */
+  }
 }
 
 function check(name, ok, detail = "") {
@@ -46,6 +66,22 @@ async function waitFor(fn, ms, what) {
   }
   throw new Error(`timed out waiting for ${what}`);
 }
+
+// ----- local "upstream" catalog ---------------------------------------------------
+
+const bundled = JSON.parse(readFileSync(join(APP, "..", "catalog", "catalog.json"), "utf8"));
+let catalogText = JSON.stringify(bundled);
+let catalogUp = true;
+const catalogServer = createServer((req, res) => {
+  if (!catalogUp) {
+    res.writeHead(503).end();
+    return;
+  }
+  res.writeHead(200, { "Content-Type": "application/json" }).end(catalogText);
+});
+await new Promise((r) => catalogServer.listen(CATALOG_PORT, "127.0.0.1", r));
+
+// ----- CDP -------------------------------------------------------------------------
 
 async function connect() {
   const page = await waitFor(async () => {
@@ -78,8 +114,198 @@ async function connect() {
   return { ws, evaluate, shot };
 }
 
-const text = (id) => `document.getElementById(${JSON.stringify(id)}).textContent`;
-const visible = (id) => `!document.getElementById(${JSON.stringify(id)}).hidden`;
+const q = (id) => `document.getElementById(${JSON.stringify(id)})`;
+const text = (id) => `${q(id)}.textContent`;
+const visible = (id) => `!${q(id)}.hidden`;
+const click = (id) => `${q(id)}.click()`;
+const setValue = (id, v) =>
+  `(() => { const i = ${q(id)}; i.value = ${JSON.stringify(v)}; i.dispatchEvent(new Event('input')); })()`;
+
+async function launch(extraEnv = {}) {
+  const app = start(EXE, [], {
+    env: {
+      ...process.env,
+      SLOPTWEAK_PROVIDER: "mock",
+      SLOPTWEAK_CATALOG_URL: `http://127.0.0.1:${CATALOG_PORT}/catalog.json`,
+      SLOPTWEAK_MAIN_DEBUG_PORT: String(CDP_PORT),
+      ...extraEnv,
+    },
+  });
+  const c = await connect();
+  // Loaded once the snapshot has filled the model list.
+  await waitFor(async () => (await c.evaluate(`${q("model")}.options.length`)) > 0, 30000, "ui");
+  await sleep(800);
+  return { app, ...c };
+}
+
+async function closeIdle(s) {
+  s.ws.close();
+  kill(s.app);
+  await sleep(1500);
+}
+
+// ----- the run ---------------------------------------------------------------------
+
+async function wizardAndHome() {
+  const s = await launch({ SLOPTWEAK_DEV_RESET: "1" });
+  const { evaluate, shot } = s;
+  const step = () => evaluate(`${q("view-wizard")}.dataset.step`);
+  const next = async () => {
+    await evaluate(click("wizard-next"));
+    await sleep(200);
+  };
+
+  check("fresh profile opens the wizard", (await evaluate(visible("view-wizard"))) && (await step()) === "welcome");
+  const welcome = await evaluate(text("view-wizard"));
+  check("wizard links Vast and CivitAI terms", welcome.includes("Vast.ai terms") && welcome.includes("CivitAI terms"));
+  await shot("w1-welcome");
+  await next();
+  check("step: Vast account", (await step()) === "vast-account");
+  await shot("w2-vast-account");
+  await next();
+  check("step: Vast credit", (await step()) === "vast-credit");
+  await shot("w3-vast-credit");
+  await next();
+  check("step: Vast key", (await step()) === "vast-key");
+  check("Next is blocked until the Vast key is checked", await evaluate(`${q("wizard-next")}.disabled`));
+
+  await evaluate(setValue("key-vast", "0".repeat(64)));
+  await waitFor(async () => (await evaluate(text("key-vast-msg"))).includes("didn't accept"), 10000, "bad key message");
+  check("a rejected Vast key is refused on paste", true);
+  await evaluate(setValue("key-vast", FAKE_VAST));
+  await waitFor(async () => (await evaluate(text("key-vast-msg"))).includes("Connected"), 10000, "vast ok");
+  check("a good Vast key shows the credit", (await evaluate(text("key-vast-msg"))).includes("$11.55"));
+  check("Next unlocks after the Vast key", !(await evaluate(`${q("wizard-next")}.disabled`)));
+  await shot("w4-vast-key");
+  await next();
+  check("step: CivitAI account", (await step()) === "civitai-account");
+  await next();
+  check("step: CivitAI key", (await step()) === "civitai-key");
+  const vis = await evaluate(text("civitai-visibility"));
+  check("wizard says the CivitAI key is visible to the host", /host/.test(vis) && /see it/.test(vis));
+  await evaluate(setValue("key-civitai", "bad" + "x".repeat(30)));
+  await evaluate(`${q("key-civitai")}.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter'}))`);
+  await waitFor(async () => (await evaluate(text("key-civitai-msg"))).includes("didn't accept"), 10000, "bad civitai");
+  check("a rejected CivitAI key is refused", true);
+  await evaluate(setValue("key-civitai", FAKE_CIVITAI));
+  await evaluate(`${q("key-civitai")}.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter'}))`);
+  await waitFor(async () => (await evaluate(text("key-civitai-msg"))).includes("mock-user"), 10000, "civitai ok");
+  check("a good CivitAI key shows the account", true);
+  await shot("w5-civitai-key");
+  await next();
+  check("step: done", (await step()) === "done");
+  await next();
+  check("wizard ends on the home screen", await evaluate(visible("view-home")));
+
+  // Home: estimate, credit, catalog source.
+  await waitFor(async () => (await evaluate(text("estimate"))).includes("Cheapest GPU"), 15000, "estimate");
+  const est = await evaluate(text("estimate"));
+  check("home shows the cheapest offer incl. download cost", est.includes("/hr") && est.includes("download"), est);
+  check("no balance warning at $11.55", !(await evaluate(visible("gate"))));
+  check("header shows the credit", (await evaluate(text("costbar"))).includes("$11.55"));
+  await waitFor(async () => (await evaluate(text("catalog-info"))).includes("updated"), 15000, "online catalog");
+  check("catalog fetched on launch", true);
+  await shot("h1-home");
+
+  // Settings: validation, save, LoRAs.
+  await evaluate(click("nav-settings"));
+  await sleep(300);
+  await evaluate(`${q("s-max-dph")}.value = '99'`);
+  await evaluate(`${q("settings-form")}.requestSubmit()`);
+  await sleep(300);
+  // The browser's own range check blocks 99 before it reaches Rust; bypass it
+  // to make sure Rust validates too.
+  const rustMsg = await evaluate(
+    "window.__TAURI_INTERNALS__.invoke('save_settings', {form: {max_dph: 99, idle_minutes: 20, max_session_minutes: 240, min_credit: 1}}).then(() => 'saved', e => String(e))",
+  );
+  check("settings out of range are rejected by Rust", rustMsg.includes("between"), rustMsg);
+  await evaluate(`${q("s-max-dph")}.value = '0.4'; ${q("s-idle")}.value = '30'`);
+  await evaluate(`${q("settings-form")}.requestSubmit()`);
+  await waitFor(async () => (await evaluate(text("settings-msg"))) === "Saved.", 5000, "saved");
+  check("settings save", true);
+
+  const addLora = async (link) => {
+    await evaluate(`${q("lora-link")}.value = ${JSON.stringify(link)}`);
+    await evaluate(click("lora-add"));
+    await waitFor(async () => !(await evaluate(text("lora-msg"))).startsWith("Checking"), 10000, "lora add");
+    return evaluate(text("lora-msg"));
+  };
+  check("LoRA link added", (await addLora("https://civitai.com/models/122359/detail-tweaker-xl")) === "Added.");
+  const notLora = await addLora("https://civitai.com/models/122359?modelVersionId=2");
+  check("a checkpoint link is refused as a LoRA", notLora.includes("not a LoRA"), notLora);
+  check("a bad link is refused", (await addLora("https://example.com/x")).includes("civitai.com"));
+  await addLora("https://civitai.com/models/122359?modelVersionId=3");
+  const list = await evaluate(text("lora-list"));
+  check("LoRA list shows both, with the SD 1.5 one flagged", list.includes("Mock LoRA 135867") && list.includes("Only used with SD 1.5"));
+  await shot("s1-settings");
+
+  // Upstream catalog edit, picked up without a rebuild.
+  const edited = structuredClone(bundled);
+  edited.models.push({ ...bundled.models[0], id: "upstream-test", name: "Upstream Test Model" });
+  catalogText = JSON.stringify(edited);
+  await evaluate(click("catalog-refresh"));
+  await waitFor(async () => (await evaluate(`${q("model")}.options.length`)) === 2, 10000, "2 models");
+  check("editing the upstream catalog changes the model list", (await evaluate(text("model"))).includes("Upstream Test Model"));
+
+  await evaluate(click("nav-home"));
+  await sleep(300);
+  const loraSummary = await evaluate(text("lora-summary"));
+  check("home lists the LoRAs that will load and those that won't",
+    loraSummary.includes("With LoRA: Mock LoRA 135867") && loraSummary.includes("Not used with this model: Mock LoRA 3"),
+    loraSummary);
+
+  // Start -> cost bar -> Stop.
+  await waitFor(async () => !(await evaluate(`${q("start")}.disabled`)), 15000, "start enabled");
+  await evaluate(click("start"));
+  await waitFor(async () => (await evaluate(text("status-text"))).startsWith("Downloading"), 30000, "downloading");
+  await waitFor(async () => (await evaluate(text("costbar"))).includes("so far"), 30000, "cost bar");
+  check("cost bar runs while provisioning", (await evaluate(text("costbar"))).includes("/hr"));
+  await shot("h2-downloading");
+  await waitFor(async () => await evaluate(visible("open")), 60000, "ready");
+  await sleep(16000); // one cost-loop tick after Ready
+  const bar = await evaluate(text("costbar"));
+  check("cost bar shows $/hr, elapsed, spend, and credit left", /\/hr · \d+ min · ≈\$[\d.]+ so far · \$[\d.]+ left/.test(bar), bar);
+  await shot("h3-ready");
+  await evaluate(click("stop"));
+  await waitFor(async () => (await evaluate(text("status-text"))) === "Ready to start.", 60000, "idle");
+  check("Stop returns to idle", true);
+  await closeIdle(s);
+}
+
+async function restart() {
+  catalogUp = false; // upstream unreachable: the cached copy must be used
+  const s = await launch();
+  const { evaluate, shot } = s;
+  check("keys survive a restart (no wizard)", (await evaluate(visible("view-home"))) && !(await evaluate(visible("view-wizard"))));
+  check("cached catalog used when upstream is down", (await evaluate(`${q("model")}.options.length`)) === 2);
+  check("catalog source says saved copy", (await evaluate(text("catalog-info"))).includes("saved copy"));
+  const snap = await evaluate("window.__TAURI_INTERNALS__.invoke('get_snapshot')");
+  check("settings survive a restart", snap.settings.max_dph === 0.4 && snap.settings.idle_minutes === 30);
+  check("LoRAs survive a restart", snap.settings.loras.length === 2);
+  await shot("r1-restart");
+  await closeIdle(s);
+  catalogUp = true;
+}
+
+async function lowBalance() {
+  const s = await launch({ SLOPTWEAK_MOCK_CREDIT: "0.10" });
+  const { evaluate, shot } = s;
+  await waitFor(async () => await evaluate(visible("gate")), 15000, "gate");
+  check("below the floor: refusal shown", (await evaluate(text("gate"))).includes("won't start below $1.00"));
+  check("below the floor: Start disabled", await evaluate(`${q("start")}.disabled`));
+  const forced = await evaluate("window.__TAURI_INTERNALS__.invoke('start_session', {modelId: 'banana-splitz-xxl'}).then(() => 'started', e => String(e))");
+  check("below the floor: Rust refuses to start too", forced.includes("won't start"), forced);
+  await shot("g1-refuse");
+  // Floor 0: $0.10 covers less than an hour on the cheapest mock GPU -> warn.
+  await evaluate("window.__TAURI_INTERNALS__.invoke('save_settings', {form: {max_dph: 0.4, idle_minutes: 30, max_session_minutes: 240, min_credit: 0}})");
+  await evaluate(click("nav-settings"));
+  await evaluate(click("nav-home"));
+  await waitFor(async () => (await evaluate(text("gate"))).includes("covers only about"), 15000, "warn");
+  check("under an hour of credit: warning, Start allowed", !(await evaluate(`${q("start")}.disabled`)));
+  await shot("g2-warn");
+  await evaluate("window.__TAURI_INTERNALS__.invoke('save_settings', {form: {max_dph: 0.4, idle_minutes: 30, max_session_minutes: 240, min_credit: 1}})");
+  await closeIdle(s);
+}
 
 // Send WM_CLOSE to a top-level window, like clicking its X.
 const CLOSE_PS1 = join(mkdtempSync(join(tmpdir(), "sloptweak-ps-")), "close.ps1");
@@ -100,80 +326,40 @@ function postClose(title) {
   execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${CLOSE_PS1}" -Title "${title}"`);
 }
 
-async function main() {
-  start("npx", ["vite", "--port", "1420", "--strictPort"], { cwd: APP, shell: true });
-  await waitFor(async () => (await fetch("http://127.0.0.1:1420/")).ok, 30000, "vite");
-  const app = start(EXE, [], {
-    env: {
-      ...process.env,
-      SLOPTWEAK_PROVIDER: "mock",
-      SLOPTWEAK_DEV_IMPORT_KEYS: "1",
-      SLOPTWEAK_MAIN_DEBUG_PORT: String(CDP_PORT),
-    },
-  });
-  const { ws, evaluate, shot } = await connect();
-  // main.ts has loaded once the model list is filled from get_snapshot.
-  await waitFor(async () => (await evaluate("document.getElementById('model').options.length")) > 0, 30000, "ui");
-  await sleep(1500);
-  await shot("01-idle");
-
-  const snap = await evaluate("window.__TAURI_INTERNALS__.invoke('get_snapshot').then(s => s.mode)");
-  check("main window can call app commands", snap === "mock", `mode=${snap}`);
-  check("mock badge shown", await evaluate(visible("mode")));
-  check("Start enabled", await evaluate("!document.getElementById('start').disabled"));
-
-  await evaluate("document.getElementById('start').click()");
-  await waitFor(async () => (await evaluate(text("status-text"))).startsWith("Downloading"), 30000, "downloading").catch(async (e) => {
-    console.log("status:", await evaluate(text("status-text")), "|", await evaluate(text("status-sub")));
-    console.log("log:", await evaluate(text("log")));
-    throw e;
-  });
-  await shot("02-downloading");
-  check("progress bar shown while downloading", await evaluate(visible("progress")));
-  await waitFor(async () => await evaluate(visible("open")), 60000, "ready");
-  await sleep(500);
-  await shot("03-ready");
-  check("Ready shows cost line", (await evaluate(text("status-sub"))).includes("/hr"));
-
-  await evaluate("document.getElementById('stop').click()");
-  await waitFor(async () => (await evaluate(text("status-text"))) === "Ready to start.", 60000, "idle");
-  check("Stop returns to idle", true);
-  await shot("04-stopped");
-
-  // Close while running: confirm dialog, then destroy and exit.
-  await evaluate("document.getElementById('start').click()");
-  await waitFor(async () => (await evaluate(text("status-text"))).includes("GPU machine") ||
-    (await evaluate(text("status-text"))).startsWith("Starting") ||
-    (await evaluate(text("status-text"))).startsWith("Downloading"), 30000, "provisioning");
+async function closeWhileRunning() {
+  const s = await launch();
+  const { evaluate, shot } = s;
+  await waitFor(async () => !(await evaluate(`${q("start")}.disabled`)), 15000, "start enabled");
+  await evaluate(click("start"));
+  await waitFor(async () => await evaluate(visible("stop")), 30000, "running");
   postClose("SlopTweak");
   await waitFor(async () => await evaluate(visible("modal")), 10000, "confirm dialog");
-  await shot("05-confirm-close");
+  await shot("c1-confirm-close");
   check("closing while active asks first", true);
-  await evaluate("document.getElementById('modal-cancel').click()");
+  await evaluate(click("modal-cancel"));
   await sleep(500);
-  check("cancel keeps the session", (await evaluate(`${visible("stop")}`)) === true);
+  check("cancel keeps the session", await evaluate(visible("stop")));
   postClose("SlopTweak");
   await waitFor(async () => await evaluate(visible("modal")), 10000, "confirm dialog again");
-  await evaluate("document.getElementById('modal-ok').click()");
-  ws.close();
-  const exited = await waitFor(async () => app.exitCode !== null, 60000, "app exit").catch(() => false);
-  check("confirm destroys and exits", !!exited, `exit=${app.exitCode}`);
-  const log = app.output();
-  check("log shows instance destroyed before exit", /instance \d+ destroyed/.test(log));
+  await evaluate(click("modal-ok"));
+  s.ws.close();
+  const exited = await waitFor(async () => s.app.exitCode !== null, 60000, "app exit").catch(() => false);
+  check("confirm destroys and exits", !!exited, `exit=${s.app.exitCode}`);
+  check("log shows instance destroyed before exit", /instance \d+ destroyed/.test(s.app.output()));
 }
 
 try {
-  await main();
+  start("npx", ["vite", "--port", "1420", "--strictPort"], { cwd: APP, shell: true });
+  await waitFor(async () => (await fetch("http://127.0.0.1:1420/")).ok, 30000, "vite");
+  await wizardAndHome();
+  await restart();
+  await lowBalance();
+  await closeWhileRunning();
 } catch (e) {
   check("harness", false, String(e));
 } finally {
-  for (const p of procs.reverse()) {
-    try {
-      execSync(`taskkill /T /F /PID ${p.pid}`, { stdio: "ignore" });
-    } catch {
-      /* gone */
-    }
-  }
+  for (const p of procs.reverse()) kill(p);
+  catalogServer.close();
 }
 const failed = results.filter((r) => !r.ok).length;
 console.log(`\n${results.length - failed}/${results.length} passed`);

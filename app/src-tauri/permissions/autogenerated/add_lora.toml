@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-add-lora"
+description = "Enables the add_lora command without any pre-configured scope."
+commands.allow = ["add_lora"]
+
+[[permission]]
+identifier = "deny-add-lora"
+description = "Denies the add_lora command without any pre-configured scope."
+commands.deny = ["add_lora"]

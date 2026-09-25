@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub const SERVICE: &str = "SlopTweak";
+/// Mock mode keeps its fake keys apart from the real ones.
+pub const MOCK_SERVICE: &str = "SlopTweak-mock";
 pub const VAST_API_KEY: &str = "vast_api_key";
 pub const CIVITAI_TOKEN: &str = "civitai_token";
 
@@ -27,17 +29,23 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, name: &str) -> Result<(), SecretError>;
 }
 
-pub struct KeyringStore;
+pub struct KeyringStore {
+    service: &'static str,
+}
 
 impl KeyringStore {
-    fn entry(name: &str) -> Result<keyring::Entry, SecretError> {
-        keyring::Entry::new(SERVICE, name).map_err(|e| SecretError(e.to_string()))
+    pub fn new(service: &'static str) -> Self {
+        Self { service }
+    }
+
+    fn entry(&self, name: &str) -> Result<keyring::Entry, SecretError> {
+        keyring::Entry::new(self.service, name).map_err(|e| SecretError(e.to_string()))
     }
 }
 
 impl SecretStore for KeyringStore {
     fn get(&self, name: &str) -> Result<Option<String>, SecretError> {
-        match Self::entry(name)?.get_password() {
+        match self.entry(name)?.get_password() {
             Ok(v) => Ok(Some(v)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(SecretError(e.to_string())),
@@ -45,13 +53,13 @@ impl SecretStore for KeyringStore {
     }
 
     fn set(&self, name: &str, value: &str) -> Result<(), SecretError> {
-        Self::entry(name)?
+        self.entry(name)?
             .set_password(value)
             .map_err(|e| SecretError(e.to_string()))
     }
 
     fn delete(&self, name: &str) -> Result<(), SecretError> {
-        match Self::entry(name)?.delete_credential() {
+        match self.entry(name)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(SecretError(e.to_string())),
         }
