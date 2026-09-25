@@ -15,6 +15,7 @@ import { createServer } from "node:http";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { COST_TITLE, windowTitles } from "./win-titles.mjs";
 
 const APP = resolve(import.meta.dirname, "..");
 const EXE = join(APP, "src-tauri", "target", "debug", "sloptweak.exe");
@@ -266,6 +267,8 @@ async function wizardAndHome() {
   const bar = await evaluate(text("costbar"));
   check("cost bar shows $/hr, elapsed, spend, and credit left", /\/hr · \d+ min · ≈\$[\d.]+ so far · \$[\d.]+ left/.test(bar), bar);
   await shot("h3-ready");
+  const titles = windowTitles(s.app.pid);
+  check("Invoke window title shows the running cost", titles.some((t) => COST_TITLE.test(t)), titles.find((t) => t.includes("Invoke")) ?? JSON.stringify(titles));
   await evaluate(click("stop"));
   await waitFor(async () => (await evaluate(text("status-text"))) === "Ready to start.", 60000, "idle");
   check("Stop returns to idle", true);
