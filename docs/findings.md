@@ -534,12 +534,13 @@ Spend ~$0.018 (credit $11.3423 → $11.3247). The title check is also in
 
 ## Still open
 
-- **Live upstream catalog edit.** Fetching from GitHub works live, and an
-  upstream edit shows up without a rebuild against a local server
-  (mock-ui-check). Pushing a test edit to `main` was blocked by the agent's
-  permission policy (it changes what every install sees), so the user does
-  that step: edit `catalog/catalog.json` on `main`, wait ≤5 min for GitHub's
-  CDN, then press Settings → "Check for new models".
+- ~~Live upstream catalog edit~~ **done (2026-09-25).** Merging PR #3
+  (Anima) changed `catalog.json` on `main`. The next launch logged
+  `catalog: 3 models from https://raw.githubusercontent.com/…/main/…` and
+  showed all three models ("updated just now"); earlier the same fetch
+  returned 1. The "no rebuild needed" part is covered by mock-ui-check (an
+  upstream edit shows up in a running app without a rebuild), because the
+  live build also bundles the new catalog.
 - Wizard screenshots of the logged-in Vast/CivitAI pages. Claude in Chrome
   now connects, but that Chrome profile isn't signed in to Vast or CivitAI
   (and the agent won't sign in). Drop PNGs into `app/src/wizard/`
