@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "id": "banana-splitz-xxl",
+      "name": "Banana Splitz XXL",
+      "description": "Illustrious-based SDXL checkpoint for stylized illustration.",
+      "base": "sdxl",
+      "base_variant": "illustrious",
+      "source": {
+        "civitai_model_id": 1261882,
+        "civitai_version_id": 3114420,
+        "version_name": "1.2.1",
+        "page": "https://civitai.com/models/1261882/banana-splitz-xxl"
+      },
+      "files": [
+        {
+          "url": "https://civitai.com/api/download/models/3114420",
+          "filename": "bananaSplitzXXL_121.safetensors",
+          "sha256": "18A579ED116FDDA19ECE5509BED29D012B5C255347DFB65087140543497D221F",
+          "size_bytes": 6938043264,
+          "kind": "main",
+          "requires_civitai_token": true
+        }
+      ],
+      "min_vram_gb": 12,
+      "nsfw": true,
+      "license_note": "CivitAI license: running on rented GPUs allowed (Rent, RentCivit); derivatives allowed; credit not required.",
+      "invoke_min_version": "6.13.8"
+    }
+  ]
+}
