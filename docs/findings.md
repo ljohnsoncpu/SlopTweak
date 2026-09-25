@@ -348,7 +348,21 @@ the app shouldn't over-filter on link speed.
 - **§9.5 app name → SlopTweak.** Repo `ljohnsoncpu/SlopTweak`; catalog URL
   decided 2026-09-25 (see Phase 3).
 - **§9.6 signing → deferred to Phase 5.** It doesn't block anything
-  earlier.
+  earlier. **Decided 2026-09-25:** free signing only, via the **SignPath
+  Foundation** open-source program (the certificate is issued to SignPath
+  Foundation, which Windows shows as the publisher; the user accepted
+  that). No paid options (Azure Artifact Signing is $9.99/month; the user
+  has no Azure credit). The Microsoft Store (free for individuals since Sept
+  2025, Store-signed MSIX) is the fallback, at the cost of the GitHub
+  updater and a Store content review. SignPath needs an OSI licence (done:
+  MIT, below), a published release, a download page describing the app,
+  and 2FA on GitHub; the user applies at signpath.org/apply. Risk: an OV
+  certificate still builds SmartScreen reputation over downloads, so early
+  installs may warn.
+- **Licence → MIT (user decision, 2026-09-25).** Copyright holder "The
+  SlopTweak contributors" (the user preferred it to their GitHub handle).
+  `LICENSE` at the repo root; `license = "MIT"` in `app/package.json`,
+  `app/src-tauri/Cargo.toml`, and `instance/pyproject.toml`.
 
 ## Phase 3 findings (2026-09-25)
 
