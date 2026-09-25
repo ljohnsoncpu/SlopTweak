@@ -472,9 +472,38 @@ Findings from the run:
 
 Phase 3 total **~$0.07** (credit $11.4149 → $11.3444; late charges may post).
 
+## Phase 3 follow-up: live filter check (2026-09-25) ✅
+
+`vast-acceptance.mjs r1`, with the 99% / 2 Gbps / 2000 MB/s filters and
+machine memory. It now backs up and restores the user's `settings.json`.
+
+| Check | Result |
+| --- | --- |
+| Pick | offer 44022327, RTX 3060, New Jersey, $0.1066/hr + $0.018 download; instance 52614236 |
+| Host | disk_bw 3755 MB/s ✅, reliability 0.997 ✅, inet_down **1969** Mbps on the instance (the offer passed the ≥2000 filter; Vast re-measures, so the check allows 5% drift) |
+| Cold start → Ready | **336 s (5.6 min)**, vs 10.7 min or failures on sub-2 Gbps hosts earlier |
+| Invoke visible, remote IPC denied, model registered | ✅ |
+| Invoke window title | ✅ `SlopTweak — Invoke · $0.107/hr · 6 min · ≈$0.03 so far · $11.33 left` (read via EnumWindows; PowerShell must output UTF-8 or "—"/"·" get mangled) |
+| Stop → destroyed, record cleared, `machines.json` marks the machine good | ✅ |
+
+Spend ~$0.018 (credit $11.3423 → $11.3247). The title check is also in
+`mock-ui-check.mjs` now (45/45).
+
+## Phase 3 rental log, follow-up
+
+| Instance | Offer | Outcome |
+| --- | --- | --- |
+| 52614236 | 44022327 (RTX 3060, NJ, 3755 MB/s) | Filter check passed; destroyed by Stop |
+
 ## Still open
 
-- Wizard screenshots of the logged-in Vast/CivitAI pages (Claude in Chrome
-  wasn't connected during Phase 3). Drop PNGs into `app/src/wizard/`
+- **Live upstream catalog edit.** Fetching from GitHub works live, and an
+  upstream edit shows up without a rebuild against a local server
+  (mock-ui-check). Pushing a test edit to `main` was blocked by the agent's
+  permission policy (it changes what every install sees), so the user does
+  that step: edit `catalog/catalog.json` on `main`, wait ≤5 min for GitHub's
+  CDN, then press Settings → "Check for new models".
+- Wizard screenshots of the logged-in Vast/CivitAI pages. Claude in Chrome
+  showed no connected browser. Drop PNGs into `app/src/wizard/`
   (`vast-signup`, `vast-billing`, `vast-keys`, `civitai-signup`,
   `civitai-keys`); the wizard shows them automatically.

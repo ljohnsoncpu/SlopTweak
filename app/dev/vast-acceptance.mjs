@@ -14,8 +14,9 @@
 // Usage (from app/):  node dev/vast-acceptance.mjs [r1] [r2] [r3]
 
 import { spawn, execSync } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync, existsSync, appendFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, appendFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { COST_TITLE, windowTitles } from "./win-titles.mjs";
 
 const APP = resolve(import.meta.dirname, "..");
 const EXE = join(APP, "src-tauri", "target", "debug", "sloptweak.exe");
@@ -239,11 +240,27 @@ async function r1() {
   launch("r1");
   const m = await mainWindow();
   const s = await startAndWaitReady(m, "R1");
+  // Phase 3 host filters (user decision): reliability >= 0.99, inet_down >=
+  // 2000 Mbps, disk_bw >= 2000 MB/s.
+  const inst = (await vast("GET", `/instances/${s.instance_id}/`)).body?.instances ?? {};
+  say(`R1 host: machine ${inst.machine_id}, ${inst.geolocation}, inet_down ${inst.inet_down}, disk_bw ${inst.disk_bw}, reliability ${inst.reliability2 ?? inst.reliability}`);
+  // Vast re-measures hosts; the instance figure drifts a few % from the
+  // offer the filter saw (live: offer >= 2000, instance 1969.3).
+  check("R1: host meets the network floor (5% drift allowed)", inst.inet_down >= 2000 * 0.95, `${inst.inet_down} Mbps`);
+  check("R1: host meets the disk floor", inst.disk_bw >= 2000, `${inst.disk_bw} MB/s`);
+  check("R1: host meets the reliability floor", (inst.reliability2 ?? inst.reliability) >= 0.99);
   await invokeVisible("R1");
+  await sleep(20000); // at least one cost-bar tick
+  const titles = windowTitles(app.pid);
+  const costTitle = titles.find((t) => COST_TITLE.test(t));
+  check("R1: Invoke window title shows the running cost", !!costTitle, costTitle ?? JSON.stringify(titles));
   await m.eval("document.getElementById('stop').click()");
   await follow(m, (s) => s.kind === "idle", 5 * 60000, "R1 idle");
   check("R1: Stop destroys the instance", await instanceGone(s.instance_id), `instance ${s.instance_id}`);
   check("R1: record cleared", !existsSync(join(DATA_DIR, "active_instance.json")));
+  const machines = JSON.parse(readFileSync(join(DATA_DIR, "machines.json"), "utf8")).machines ?? {};
+  const entry = machines[String(inst.machine_id)];
+  check("R1: machine remembered as good", !!entry?.ok_unix, JSON.stringify(entry));
   m.ws.close();
   crash(); // idle; just close it
 }
@@ -316,6 +333,8 @@ const creditBefore = await credit();
 say(`credit before: $${creditBefore?.toFixed(4)}`);
 mkdirSync(CONFIG_DIR, { recursive: true });
 const settingsFile = join(CONFIG_DIR, "settings.json");
+// Keep the user's own settings (LoRAs, output folder) and put them back after.
+const settingsBackup = existsSync(settingsFile) ? readFileSync(settingsFile, "utf8") : null;
 writeFileSync(
   settingsFile,
   JSON.stringify({ heartbeat_minutes: HEARTBEAT_MINUTES, max_session_minutes: 60, max_dph: 0.5 }, null, 2),
@@ -368,7 +387,8 @@ try {
       await vast("DELETE", `/instances/${i.id}/`);
     }
   }
-  rmSync(settingsFile, { force: true });
+  if (settingsBackup !== null) writeFileSync(settingsFile, settingsBackup);
+  else rmSync(settingsFile, { force: true });
   await sleep(10000);
   const left = (await ourInstances()).filter((i) => !before.has(i.id));
   say(`instances left: ${left.length ? left.map((i) => i.id).join(", ") : "none"}`);
