@@ -4,3 +4,9 @@ rental-logs/
 target/
 node_modules/
 __pycache__/
+.venv/
+.dev/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
