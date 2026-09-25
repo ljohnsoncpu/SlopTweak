@@ -11,6 +11,9 @@
 //! * Every path that gives up on an instance destroys it first. If destroy
 //!   can't be confirmed the record is kept, so a relaunch retries, and the
 //!   instance watchdog destroys it anyway once heartbeats stop.
+//! * Output sync never delays a destroy by more than `Timing::final_sync`:
+//!   the last pass runs under a timeout, and the destroy follows whatever
+//!   the pass did.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -20,7 +23,7 @@ use base64::Engine;
 use rand::RngCore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use url::Url;
@@ -34,6 +37,7 @@ use crate::provider::{GpuProvider, Health, InstanceInfo, ProviderError};
 use crate::redact::redact;
 use crate::secrets::{self, SecretStore};
 use crate::sidecar::{auth_url, Deadlines, SidecarApi, SidecarError, SidecarStatus};
+use crate::sync::{OutputDir, OutputSync, Phase, SyncReport, SyncStore};
 
 // ---------------------------------------------------------------------------
 // Pure state machine
@@ -335,6 +339,7 @@ pub trait Ui: Send + Sync {
     fn log(&self, line: &str);
     fn open_remote(&self, url: Url);
     fn close_remote(&self);
+    fn sync_changed(&self, report: &SyncReport);
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +352,19 @@ pub struct Timing {
     pub instance_check: Duration,
     /// How long Stop waits for the provider to confirm the instance is gone.
     pub destroy_confirm: Duration,
+    /// Output sync polling period while Ready.
+    pub sync_every: Duration,
+    /// Most a Stop waits for the last sync pass before destroying.
+    pub final_sync: Duration,
+    /// Same, when the instance is already shutting itself down.
+    pub final_sync_gone: Duration,
+}
+
+impl Timing {
+    /// Upper bound for a Stop: last sync pass, then destroy + confirm.
+    pub fn stop_budget(&self) -> Duration {
+        self.final_sync + self.destroy_confirm + Duration::from_secs(60)
+    }
 }
 
 impl Default for Timing {
@@ -356,6 +374,9 @@ impl Default for Timing {
             heartbeat: Duration::from_secs(60),
             instance_check: Duration::from_secs(120),
             destroy_confirm: Duration::from_secs(90),
+            sync_every: Duration::from_secs(10),
+            final_sync: Duration::from_secs(60),
+            final_sync_gone: Duration::from_secs(15),
         }
     }
 }
@@ -369,6 +390,10 @@ pub struct Deps {
     pub records: RecordFile,
     /// Per-machine history across sessions.
     pub machines: MachineFile,
+    /// Which images each instance has already saved.
+    pub syncs: SyncStore,
+    /// Where images go; read on every pass so a folder change applies at once.
+    pub output_dir: OutputDir,
     pub ui: Arc<dyn Ui>,
 }
 
@@ -395,6 +420,11 @@ struct Inner {
     active: Option<Active>,
     task: Option<JoinHandle<()>>,
     log: VecDeque<String>,
+    /// Output sync for the Ready instance, and its polling task.
+    sync: Option<Arc<AsyncMutex<OutputSync>>>,
+    sync_task: Option<JoinHandle<()>>,
+    /// Last sync report; kept after the session so the UI can say what was saved.
+    sync_report: Option<SyncReport>,
 }
 
 enum Provisioned {
@@ -462,6 +492,9 @@ impl SessionManager {
                 active: None,
                 task: None,
                 log: VecDeque::new(),
+                sync: None,
+                sync_task: None,
+                sync_report: None,
             }),
             stop: watch::channel(false).0,
         })
@@ -469,6 +502,35 @@ impl SessionManager {
 
     pub fn state(&self) -> SessionState {
         self.inner.lock().unwrap().state.clone()
+    }
+
+    /// A fresh launch secret. Debug builds with the mock provider only:
+    /// `SLOPTWEAK_DEV_LAUNCH_SECRET` fixes it, so a local sidecar.py
+    /// (dev/sync-check.mjs) accepts the app's calls.
+    fn launch_secret(&self) -> String {
+        #[cfg(debug_assertions)]
+        if self.deps.provider_name == "mock" {
+            if let Some(s) = std::env::var("SLOPTWEAK_DEV_LAUNCH_SECRET")
+                .ok()
+                .filter(|s| s.len() >= 32)
+            {
+                return s;
+            }
+        }
+        new_launch_secret()
+    }
+
+    pub fn timing(&self) -> &Timing {
+        &self.timing
+    }
+
+    pub fn sync_report(&self) -> Option<SyncReport> {
+        self.inner.lock().unwrap().sync_report.clone()
+    }
+
+    fn publish_sync(&self, report: SyncReport) {
+        self.inner.lock().unwrap().sync_report = Some(report.clone());
+        self.deps.ui.sync_changed(&report);
     }
 
     pub fn log_lines(&self) -> Vec<String> {
@@ -565,6 +627,7 @@ impl SessionManager {
             return Err("This model needs your CivitAI key.".into());
         }
         self.stop.send_replace(false);
+        self.inner.lock().unwrap().sync_report = None;
         if !self.apply(Event::Start {
             max_attempts: settings.max_attempts,
         }) {
@@ -678,8 +741,10 @@ impl SessionManager {
         if !self.apply(Event::DestroyOrphan { instance_id }) {
             return Err("Can't do that right now.".into());
         }
+        self.inner.lock().unwrap().sync_report = None;
         let me = self.clone();
         self.spawn(async move {
+            me.rescue_images(instance_id).await;
             me.log(format!("destroying leftover instance {instance_id}"));
             if me.destroy_confirmed(instance_id).await {
                 me.forget(instance_id);
@@ -727,6 +792,7 @@ impl SessionManager {
             .filter(|r| r.instance_id == instance_id)
             .map_or_else(now_unix, |r| r.created_unix);
         self.stop.send_replace(false);
+        self.inner.lock().unwrap().sync_report = None;
         self.inner.lock().unwrap().active = Some(Active {
             instance_id,
             base: None,
@@ -806,7 +872,7 @@ impl SessionManager {
                 return self.finish_stop(None).await;
             }
 
-            let secret = new_launch_secret();
+            let secret = self.launch_secret();
             let spec =
                 config::launch_spec(&model, &settings, &sha256_hex(&secret), civitai.as_deref());
             let instance_id = match self
@@ -878,7 +944,7 @@ impl SessionManager {
 
     /// Returns true if the run loop should try the next offer.
     async fn after_provision(
-        &self,
+        self: &Arc<Self>,
         instance_id: u64,
         secret: &str,
         outcome: Provisioned,
@@ -1034,7 +1100,7 @@ impl SessionManager {
     }
 
     async fn ready_loop(
-        &self,
+        self: &Arc<Self>,
         instance_id: u64,
         base: Url,
         secret: &str,
@@ -1046,6 +1112,7 @@ impl SessionManager {
             return self.finish_stop(Some(instance_id)).await;
         }
         self.log(format!("instance {instance_id} is ready"));
+        self.start_sync(instance_id, &base, secret);
         let mut opened = false;
         for _ in 0..5 {
             match self.deps.sidecar.ticket(&base, secret).await {
@@ -1097,6 +1164,160 @@ impl SessionManager {
         }
     }
 
+    // ----- output sync ----------------------------------------------------------
+
+    fn start_sync(self: &Arc<Self>, instance_id: u64, base: &Url, secret: &str) {
+        let sync = Arc::new(AsyncMutex::new(OutputSync::new(
+            self.deps.sidecar.clone(),
+            base.clone(),
+            secret.to_string(),
+            instance_id,
+            self.deps.syncs.clone(),
+            self.deps.output_dir.clone(),
+        )));
+        let task = tokio::spawn(self.clone().sync_loop(sync.clone()));
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(old) = inner.sync_task.replace(task) {
+            old.abort();
+        }
+        inner.sync = Some(sync);
+    }
+
+    /// Poll Invoke every `sync_every` until a stop is requested. A pass that
+    /// is running when Stop comes finishes (the final pass waits for it,
+    /// inside its own timeout).
+    async fn sync_loop(self: Arc<Self>, sync: Arc<AsyncMutex<OutputSync>>) {
+        let mut rx = self.stop.subscribe();
+        let mut failures = 0u32;
+        let mut last_error: Option<String> = None;
+        loop {
+            let (result, report) = {
+                let mut s = sync.lock().await;
+                let r = s.pass(false).await;
+                (r, s.report())
+            };
+            match result {
+                Ok(n) => {
+                    failures = 0;
+                    if n > 0 {
+                        self.log(format!("saved {n} image(s) to {}", report.folder));
+                    }
+                }
+                Err(e) => {
+                    failures += 1;
+                    if failures == 1 || failures.is_multiple_of(30) {
+                        self.log(format!("image sync failed ({failures}): {e}"));
+                    }
+                }
+            }
+            if report.last_error != last_error {
+                if let Some(e) = &report.last_error {
+                    self.log(format!("image sync: {e}"));
+                }
+                last_error = report.last_error.clone();
+            }
+            self.publish_sync(report);
+            if self.wait(&mut rx, self.timing.sync_every).await {
+                return;
+            }
+        }
+    }
+
+    /// A leftover instance from a crash is about to be destroyed: if we still
+    /// have its launch secret and its tunnel, save what it made since the
+    /// last pass (same ledger, so nothing is fetched twice).
+    async fn rescue_images(&self, instance_id: u64) {
+        let Ok(Some(secret)) = self
+            .deps
+            .secrets
+            .get(&secrets::launch_secret_name(instance_id))
+        else {
+            return;
+        };
+        let Ok(Some(info)) = self.deps.provider.instance(instance_id).await else {
+            return;
+        };
+        let Some(base) = self.deps.provider.sidecar_url(&info) else {
+            return;
+        };
+        self.inner.lock().unwrap().sync = Some(Arc::new(AsyncMutex::new(OutputSync::new(
+            self.deps.sidecar.clone(),
+            base,
+            secret,
+            instance_id,
+            self.deps.syncs.clone(),
+            self.deps.output_dir.clone(),
+        ))));
+        self.final_sync(self.timing.final_sync).await;
+    }
+
+    /// The last pass before the instance goes, bounded by `limit`. It can't
+    /// fail: whatever happens, the caller destroys next.
+    async fn final_sync(&self, limit: Duration) {
+        let (sync, task) = {
+            let mut inner = self.inner.lock().unwrap();
+            (inner.sync.take(), inner.sync_task.take())
+        };
+        let Some(sync) = sync else { return };
+        let abort = task.as_ref().map(JoinHandle::abort_handle);
+        let current = match sync.try_lock() {
+            Ok(s) => Some(s.report()),
+            Err(_) => self.sync_report(),
+        };
+        if let Some(mut r) = current {
+            r.phase = Phase::Finishing;
+            self.publish_sync(r);
+        }
+        self.log("saving the last images before shutdown");
+        let work = async {
+            if let Some(t) = task {
+                // After a Stop the loop ends by itself once its pass is done;
+                // otherwise (the instance is going away) don't wait for it.
+                if !self.stopped() {
+                    t.abort();
+                }
+                let _ = t.await;
+            }
+            let mut s = sync.lock().await;
+            s.set_phase(Phase::Finishing);
+            s.pass(true).await
+        };
+        let outcome = tokio::time::timeout(limit, work).await;
+        if let Some(a) = abort {
+            a.abort();
+        }
+        let mut report = match tokio::time::timeout(Duration::from_secs(1), sync.lock()).await {
+            Ok(s) => s.report(),
+            Err(_) => match self.sync_report() {
+                Some(r) => r,
+                None => return,
+            },
+        };
+        report.phase = match &outcome {
+            Ok(Ok(_)) if report.missing == 0 => Phase::Done,
+            _ => Phase::Incomplete,
+        };
+        match outcome {
+            Ok(Ok(n)) => self.log(format!(
+                "final sync: {n} new; {} gallery + {} canvas saved; {} missing",
+                report.saved, report.canvas_saved, report.missing
+            )),
+            Ok(Err(e)) => {
+                report.last_error =
+                    Some(format!("Couldn't reach the GPU for the last images: {e}"));
+                self.log(format!("final sync failed: {e}"));
+            }
+            Err(_) => {
+                report.last_error = Some(format!(
+                    "Stopped waiting for the last images after {} seconds.",
+                    limit.as_secs()
+                ));
+                self.log(format!("final sync timed out after {} s", limit.as_secs()));
+            }
+        }
+        self.publish_sync(report);
+    }
+
     /// A stop that raced with the end of a run must still finish.
     async fn settle(&self) {
         if matches!(self.state(), SessionState::Stopping { .. }) {
@@ -1112,6 +1333,7 @@ impl SessionManager {
             self.apply(Event::Destroyed);
             return;
         };
+        self.final_sync(self.timing.final_sync).await;
         self.log(format!("stopping: destroying instance {id}"));
         if self.destroy_confirmed(id).await {
             self.forget(id);
@@ -1130,6 +1352,8 @@ impl SessionManager {
     /// The instance went away (or is going) on its own while in use.
     async fn gone(&self, instance_id: u64, reason: String) {
         self.log(format!("instance {instance_id}: {reason}"));
+        // It may still answer for a few seconds: grab the last images.
+        self.final_sync(self.timing.final_sync_gone).await;
         // Belt and braces: destroy is idempotent and stops billing now.
         let _ = self.deps.provider.destroy(instance_id).await;
         self.forget(instance_id);
@@ -1198,6 +1422,7 @@ impl SessionManager {
 
     /// Drop everything we know about an instance that is confirmed gone.
     fn forget(&self, instance_id: u64) {
+        self.deps.syncs.remove(instance_id);
         let _ = self
             .deps
             .secrets

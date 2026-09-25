@@ -56,6 +56,8 @@ pub struct Settings {
     /// Where images are saved (Phase 4). `None` = Pictures\SlopTweak.
     pub output_dir: Option<String>,
     pub loras: Vec<Lora>,
+    /// The Invoke-window tutorial was finished or skipped (Phase 4).
+    pub tutorial_done: bool,
 }
 
 impl Default for Settings {
@@ -80,6 +82,7 @@ impl Default for Settings {
             min_credit: 1.0,
             output_dir: None,
             loras: Vec::new(),
+            tutorial_done: false,
         }
     }
 }
@@ -96,6 +99,8 @@ pub struct UserSettings {
     pub min_credit: f64,
     pub output_dir: Option<String>,
     pub loras: Vec<Lora>,
+    #[serde(default)]
+    pub tutorial_done: bool,
 }
 
 impl UserSettings {
@@ -143,6 +148,7 @@ impl Settings {
             min_credit: self.min_credit,
             output_dir: self.output_dir.clone(),
             loras: self.loras.clone(),
+            tutorial_done: self.tutorial_done,
         }
     }
 

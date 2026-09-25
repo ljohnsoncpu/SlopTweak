@@ -29,8 +29,9 @@ so the retry and failure paths can be seen in the UI.
 | `provider/mock.rs` | `MockProvider` + `MockSidecar` with scripted stages |
 | `provider/offers.rs` | Offer filtering and session-cost ranking (incl. bandwidth) |
 | `session.rs` | Pure state machine (`next`) and the `SessionManager` driver |
-| `sidecar.rs` | Client for `instance/sidecar.py` (heartbeat, status, ticket) |
-| `remote.rs` | The isolated Invoke window |
+| `sidecar.rs` | Client for `instance/sidecar.py` (heartbeat, status, ticket, Invoke image list + full-res download) |
+| `sync.rs` | Output sync: gallery → output folder, Canvas tries → `Canvas\`, per-instance ledger |
+| `remote.rs` | The isolated Invoke window, plus the injected tutorial overlay (`tutorial.js`, `assets/tutorial-sample.jpg`) |
 | `secrets.rs` | Credential Manager via `keyring` |
 | `persist.rs` | Active-instance record for crash recovery |
 | `redact.rs` | Secret redaction for logs |
@@ -50,10 +51,19 @@ so the retry and failure paths can be seen in the UI.
 | `SLOPTWEAK_DEV_IMPORT_KEYS=1` | Vast mode only: copy `VAST_API_KEY`/`CIVITAI_TOKEN` from env or `HKCU\Environment` into Credential Manager if missing |
 | `SLOPTWEAK_MAIN_DEBUG_PORT`, `SLOPTWEAK_REMOTE_DEBUG_PORT` | CDP port for the main / remote window |
 | `SLOPTWEAK_DEV_REMOTE_URL` | Open the remote window at this URL on startup |
+| `SLOPTWEAK_MOCK_IMAGES=N` | Mock mode: after Ready, the fake sidecar makes N gallery images (one per 3 s) plus Canvas tries and scratch intermediates |
+| `SLOPTWEAK_MOCK_SIDECAR=http` + `SLOPTWEAK_DEV_LAUNCH_SECRET` | Mock mode: talk to a real `sidecar.py` at `SLOPTWEAK_MOCK_REMOTE` with this fixed launch secret (`dev/sync-check.mjs`) |
+
+Mock mode saves its fake images to `%LOCALAPPDATA%\com.sloptweak.launcher\mock\output`,
+not to Pictures.
 
 ## Checks in `dev/`
 
 - `webview-check.mjs`: $0. Remote-window isolation against a local sidecar.
+- `sync-check.mjs`: $0. Phase 4 end to end: the real app + real `sidecar.py` in
+  front of `fake_invoke.py`. Tutorial (auto-show, sample upload, steps,
+  auto-advance, Done recorded, re-open), sync while running, and images made
+  right before Stop on disk after it.
 - `mock-ui-check.mjs`: $0. Wizard, estimate, low-balance gate, settings, LoRAs,
   upstream catalog edit (local server), restart persistence, cost bar,
   close-to-destroy. All against the mock.
@@ -62,6 +72,14 @@ so the retry and failure paths can be seen in the UI.
 - `fresh-profile-acceptance.mjs`: **spends money, and wipes this app's real
   keys and folders.** Phase 3 acceptance: a person completes the wizard and
   makes the first image; the script checks, stops, and restarts.
+- `phase4-acceptance.mjs`: **spends money.** Phase 4 acceptance: the tutorial
+  on a clean tutorial state (driven in the real Invoke UI; falls back to a
+  person), then 10 images, Stop, and all 10 on disk.
+- `fake_invoke.py`: the stand-in Invoke API those checks use.
+  `make-tutorial-sample.py` redraws the tutorial picture.
+
+All scripts refuse to run if :1420 serves another checkout's UI (a vite left
+running elsewhere keeps the port despite `--strictPort`).
 
 ## Wizard screenshots
 

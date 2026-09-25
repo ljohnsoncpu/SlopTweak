@@ -88,6 +88,16 @@ interface CostBar {
   shutdown: [string, number] | null;
 }
 
+interface SyncReport {
+  folder: string;
+  phase: "running" | "finishing" | "done" | "incomplete";
+  saved: number;
+  canvas_saved: number;
+  missing: number;
+  last_error: string | null;
+  last_sync_unix: number | null;
+}
+
 interface Snapshot {
   mode: "vast" | "mock";
   state: SessionState;
@@ -99,6 +109,7 @@ interface Snapshot {
   settings: SettingsView;
   credit: number | null;
   cost: CostBar | null;
+  sync: SyncReport | null;
 }
 
 type Gate = { kind: "ok" } | { kind: "warn"; message: string } | { kind: "refuse"; message: string };
@@ -197,6 +208,10 @@ const ui = {
   progressFill: el("progress-fill"),
   start: el<HTMLButtonElement>("start"),
   open: el<HTMLButtonElement>("open"),
+  tutorial: el<HTMLButtonElement>("tutorial"),
+  openFolder: el<HTMLButtonElement>("open-folder"),
+  outOpen: el<HTMLButtonElement>("out-open"),
+  sync: el("sync"),
   stop: el<HTMLButtonElement>("stop"),
   dismiss: el<HTMLButtonElement>("dismiss"),
   catalogInfo: el("catalog-info"),
@@ -229,6 +244,7 @@ const ui = {
 let snapshot: Snapshot | null = null;
 let state: SessionState = { kind: "idle", notice: null };
 let cost: CostBar | null = null;
+let sync: SyncReport | null = null;
 let credit: number | null = null;
 let estimate: Estimate | null = null;
 let view: "wizard" | "home" | "settings" = "home";
@@ -348,6 +364,7 @@ function render(): void {
   ui.start.disabled = !keysOk || refused || !currentModel();
   ui.stop.hidden = !active() || s.kind === "stopping";
   ui.open.hidden = s.kind !== "ready";
+  ui.tutorial.hidden = s.kind !== "ready";
   ui.dismiss.hidden = !(s.kind === "failed" || (s.kind === "idle" && s.notice));
   ui.model.disabled = active();
   ui.progress.hidden = true;
@@ -386,14 +403,59 @@ function render(): void {
       break;
     }
     case "stopping":
-      ui.statusText.textContent = "Shutting down the GPU…";
+      ui.statusText.textContent =
+        sync?.phase === "finishing" ? "Saving your last images, then shutting down the GPU…" : "Shutting down the GPU…";
       break;
     case "failed":
       ui.statusText.textContent = s.reason;
       ui.start.textContent = "Try again";
       break;
   }
+  renderSync();
   renderCostBar();
+}
+
+function images(n: number): string {
+  return `${n} image${n === 1 ? "" : "s"}`;
+}
+
+/** What output sync saved: while running, while finishing, and after Stop. */
+function renderSync(): void {
+  const r = sync;
+  ui.sync.hidden = !r;
+  if (!r) return;
+  const canvas = r.canvas_saved ? ` and ${r.canvas_saved} Canvas tr${r.canvas_saved === 1 ? "y" : "ies"}` : "";
+  const where = ` to ${r.folder}`;
+  let text: string;
+  let cls = "muted";
+  switch (r.phase) {
+    case "running":
+      text =
+        r.saved + r.canvas_saved === 0
+          ? `New images are saved${where} as you make them.`
+          : `Saved ${images(r.saved)}${canvas}${where}.`;
+      if (r.missing && r.last_error) {
+        text += ` ${images(r.missing)} not saved yet: ${r.last_error}`;
+        cls = "warn";
+      }
+      break;
+    case "finishing":
+      text = `Saving your last images${where}…`;
+      break;
+    case "done":
+      text = `Saved ${images(r.saved)}${canvas}${where}.`;
+      cls = "ok";
+      break;
+    case "incomplete":
+      text =
+        `Saved ${images(r.saved)}${canvas}${where}, but some may be missing` +
+        (r.missing ? ` (${r.missing} couldn't be downloaded)` : "") +
+        (r.last_error ? `: ${r.last_error}` : ".");
+      cls = "warn";
+      break;
+  }
+  ui.sync.textContent = text;
+  ui.sync.className = `sync small ${cls}`;
 }
 
 /** Plain words for a model's GPU architecture floor (Vast compute_cap units). */
@@ -859,6 +921,7 @@ async function load(): Promise<void> {
   ui.mode.hidden = snapshot.mode !== "mock";
   state = snapshot.state;
   cost = snapshot.cost;
+  sync = snapshot.sync;
   if (snapshot.credit !== null) credit = snapshot.credit;
   ui.log.textContent = snapshot.log.map((l) => `${l}\n`).join("");
   renderModels();
@@ -881,6 +944,15 @@ ui.model.onchange = () => {
 ui.start.onclick = () => act(invoke("start_session", { modelId: ui.model.value }));
 ui.stop.onclick = () => act(invoke("stop_session"));
 ui.open.onclick = () => act(invoke("open_invoke"));
+ui.tutorial.onclick = () => act(invoke("show_tutorial"));
+ui.openFolder.onclick = () => act(invoke("open_output_folder"));
+ui.outOpen.onclick = async () => {
+  try {
+    await invoke("open_output_folder");
+  } catch (e) {
+    ui.outDir.textContent = String(e);
+  }
+};
 ui.dismiss.onclick = () => act(invoke("dismiss"));
 
 ui.form.onsubmit = async (e) => {
@@ -949,7 +1021,7 @@ ui.modalCancel.onclick = () => {
 ui.modalOk.onclick = async () => {
   ui.modalOk.disabled = true;
   ui.modalCancel.disabled = true;
-  ui.modalMsg.textContent = "Shutting down the GPU… this can take up to a minute.";
+  ui.modalMsg.textContent = "Saving your last images and shutting down the GPU… this can take up to two minutes.";
   try {
     await invoke("confirm_close");
   } catch (e) {
@@ -970,6 +1042,10 @@ await listen<SessionState>("session-state", (e) => {
   }
 });
 await listen<string>("session-log", (e) => appendLog(e.payload));
+await listen<SyncReport>("sync-status", (e) => {
+  sync = e.payload;
+  render();
+});
 await listen<CostBar>("cost-bar", (e) => {
   cost = e.payload;
   if (cost.credit !== null) credit = cost.credit;

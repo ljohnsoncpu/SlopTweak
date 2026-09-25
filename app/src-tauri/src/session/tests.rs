@@ -241,6 +241,7 @@ struct Recorder {
     opened: Mutex<Vec<Url>>,
     closed: Mutex<u32>,
     lines: Mutex<Vec<String>>,
+    syncs: Mutex<Vec<SyncReport>>,
 }
 
 impl Ui for Recorder {
@@ -255,6 +256,9 @@ impl Ui for Recorder {
     }
     fn close_remote(&self) {
         *self.closed.lock().unwrap() += 1;
+    }
+    fn sync_changed(&self, r: &SyncReport) {
+        self.syncs.lock().unwrap().push(r.clone());
     }
 }
 
@@ -295,9 +299,18 @@ fn rebuild(
         secrets,
         records: RecordFile::new(dir),
         machines: crate::provider::machines::MachineFile::new(dir),
+        syncs: SyncStore::new(dir),
+        output_dir: {
+            let out = out_dir(dir);
+            Arc::new(move || out.clone())
+        },
         ui: ui.clone(),
     };
     (SessionManager::new(deps, Timing::default()), ui)
+}
+
+fn out_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("out")
 }
 
 fn model() -> Model {
@@ -658,4 +671,215 @@ async fn machine_history_carries_across_sessions() {
     let mem = crate::provider::machines::MachineFile::new(h.dir.path()).load();
     assert!(mem.avoid(failed * 10, now_unix()));
     assert!(mem.known_good(worked * 10));
+}
+
+// ----- output sync -------------------------------------------------------------
+
+fn gallery(name: &str) -> crate::sidecar::InvokeImage {
+    crate::sidecar::InvokeImage {
+        image_name: name.into(),
+        created_at: Some("2026-09-25 14:03:22.5".into()),
+        is_intermediate: false,
+    }
+}
+
+/// Image files in a folder (not recursive), sorted.
+fn pngs(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter(|e| e.path().is_file())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+async fn ready_instance(h: &Harness) -> u64 {
+    start(h);
+    let SessionState::Ready { instance_id, .. } = wait_for(&h.mgr, is_ready).await else {
+        panic!()
+    };
+    instance_id
+}
+
+/// Phase 4 acceptance against the mock: 10 images made just before Stop are
+/// all on disk after it, Canvas tries go to their own folder, and the GPU is
+/// still destroyed.
+#[tokio::test(start_paused = true)]
+async fn stop_saves_every_image_then_destroys() {
+    let h = harness(vec![]);
+    let id = ready_instance(&h).await;
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    for k in 0..10 {
+        h.mock.add_image(id, gallery(&format!("g{k:02}.png")));
+    }
+    // Canvas runs: each also leaves a scratch intermediate, which isn't saved.
+    h.mock.add_canvas_result(id, "c1.png", "completed");
+    h.mock.add_canvas_result(id, "c2.png", "completed");
+    // Stop right away: only the final pass can have saved them.
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+    let out = out_dir(h.dir.path());
+    let files = pngs(&out);
+    assert_eq!(files.len(), 10, "{files:?}");
+    assert!(files
+        .iter()
+        .all(|f| f.ends_with(".png") && f.contains("_g")));
+    let canvas = pngs(&out.join(crate::sync::CANVAS_DIR));
+    assert_eq!(canvas.len(), 2, "{canvas:?}");
+    assert!(!files.iter().chain(&canvas).any(|f| f.contains("scratch")));
+    assert_eq!(
+        std::fs::read(out.join(&files[0])).unwrap(),
+        crate::provider::mock::MOCK_PNG
+    );
+    assert!(h.mock.live_ids().is_empty(), "still destroyed");
+    let r = h.mgr.sync_report().unwrap();
+    assert_eq!(
+        (r.phase, r.saved, r.canvas_saved, r.missing),
+        (Phase::Done, 10, 2, 0)
+    );
+    // What the UI saw: running, then finishing, then done.
+    let phases: Vec<Phase> = h.ui.syncs.lock().unwrap().iter().map(|r| r.phase).collect();
+    let fin = phases.iter().position(|p| *p == Phase::Finishing).unwrap();
+    assert!(phases[..fin].contains(&Phase::Running));
+    assert_eq!(phases.last(), Some(&Phase::Done));
+    // The instance is gone, so its ledger is too.
+    assert_eq!(SyncStore::new(h.dir.path()).load(id), Default::default());
+}
+
+#[tokio::test(start_paused = true)]
+async fn images_sync_while_running_and_only_once() {
+    let h = harness(vec![]);
+    let id = ready_instance(&h).await;
+    h.mock.add_image(id, gallery("a.png"));
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    let out = out_dir(h.dir.path());
+    assert_eq!(pngs(&out).len(), 1);
+    // Deleting the copy doesn't bring it back: it was already saved once.
+    std::fs::remove_file(out.join(&pngs(&out)[0])).unwrap();
+    h.mock.add_image(id, gallery("b.png"));
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    let files = pngs(&out);
+    assert_eq!(files.len(), 1);
+    assert!(files[0].ends_with("_b.png"));
+    assert_eq!(SyncStore::new(h.dir.path()).load(id).gallery.len(), 2);
+    h.mgr.stop_and_wait(Duration::from_secs(300)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn canvas_tries_are_saved_once_their_queue_item_finishes() {
+    let h = harness(vec![]);
+    let id = ready_instance(&h).await;
+    h.mock.add_canvas_result(id, "c1.png", "in_progress");
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    let canvas = out_dir(h.dir.path()).join(crate::sync::CANVAS_DIR);
+    assert!(pngs(&canvas).is_empty(), "not while it runs");
+    h.mock.set_queue_status(id, "c1.png", "completed");
+    h.mock.add_canvas_result(id, "c2.png", "completed");
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    let files = pngs(&canvas);
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert!(!files.iter().any(|f| f.contains("scratch")));
+    assert!(
+        pngs(&out_dir(h.dir.path())).is_empty(),
+        "nothing in the gallery folder"
+    );
+    let ledger = SyncStore::new(h.dir.path()).load(id);
+    assert_eq!(ledger.queue_done.len(), 2);
+    h.mgr.stop_and_wait(Duration::from_secs(300)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_downloads_are_retried() {
+    let h = harness(vec![]);
+    let id = ready_instance(&h).await;
+    h.mock.fail_image("a.png", 2);
+    h.mock.add_image(id, gallery("a.png"));
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    let r = h.mgr.sync_report().unwrap();
+    assert_eq!(r.missing, 1);
+    assert!(r.last_error.unwrap().contains("mock download failure"));
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    let r = h.mgr.sync_report().unwrap();
+    assert_eq!((r.saved, r.missing, r.last_error), (1, 0, None));
+    h.mgr.stop_and_wait(Duration::from_secs(300)).await;
+}
+
+/// Money rule: a stuck final sync never keeps the GPU alive.
+#[tokio::test(start_paused = true)]
+async fn slow_final_sync_times_out_and_still_destroys() {
+    let h = harness(vec![]);
+    let id = ready_instance(&h).await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    h.mock.set_image_delay(Duration::from_secs(3600));
+    h.mock.add_image(id, gallery("slow.png"));
+    let t0 = tokio::time::Instant::now();
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(600)).await);
+    let took = t0.elapsed();
+    let t = Timing::default();
+    assert!(took >= t.final_sync, "{took:?}");
+    assert!(took <= t.final_sync + t.destroy_confirm, "{took:?}");
+    assert!(h.mock.live_ids().is_empty());
+    assert_eq!(h.mgr.state(), SessionState::idle());
+    let r = h.mgr.sync_report().unwrap();
+    assert_eq!(r.phase, Phase::Incomplete);
+    assert!(r.last_error.unwrap().contains("Stopped waiting"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn reattach_keeps_the_ledger() {
+    let h = harness(vec![]);
+    let id = ready_instance(&h).await;
+    h.mock.add_image(id, gallery("a.png"));
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    h.mgr.crash();
+    let out = out_dir(h.dir.path());
+    std::fs::remove_file(out.join(&pngs(&out)[0])).unwrap();
+    h.mock.add_image(id, gallery("b.png"));
+
+    let (mgr2, _) = rebuild(&h.mock, h.dir.path(), h.secrets.clone());
+    mgr2.reattach(id).await.unwrap();
+    wait_for(&mgr2, is_ready).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let files = pngs(&out);
+    assert_eq!(files.len(), 1, "only the new one: {files:?}");
+    assert!(files[0].ends_with("_b.png"));
+    assert!(mgr2.stop_and_wait(Duration::from_secs(300)).await);
+    assert!(h.mock.live_ids().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutting_down_a_leftover_saves_its_images_first() {
+    let h = harness(vec![]);
+    let id = ready_instance(&h).await;
+    h.mock.add_image(id, gallery("a.png"));
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    h.mgr.crash();
+    // Made after the last pass, before the crash was noticed.
+    h.mock.add_image(id, gallery("b.png"));
+    h.mock.add_canvas_result(id, "c.png", "completed");
+
+    let (mgr2, _) = rebuild(&h.mock, h.dir.path(), h.secrets.clone());
+    mgr2.destroy_orphan(id).unwrap();
+    wait_for(&mgr2, |s| *s == SessionState::idle()).await;
+    let out = out_dir(h.dir.path());
+    assert_eq!(pngs(&out).len(), 2, "a (before) + b (rescued)");
+    assert_eq!(pngs(&out.join(crate::sync::CANVAS_DIR)).len(), 1);
+    assert_eq!(mgr2.sync_report().unwrap().phase, Phase::Done);
+    assert!(h.mock.live_ids().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn self_destruct_still_saves_the_last_images() {
+    let h = harness(vec![MockBehavior::SelfDestructAfterReady(
+        Duration::from_secs(90),
+    )]);
+    let id = ready_instance(&h).await;
+    tokio::time::sleep(Duration::from_secs(85)).await;
+    h.mock.add_image(id, gallery("late.png"));
+    wait_for(&h.mgr, |s| matches!(s, SessionState::Idle { .. })).await;
+    assert_eq!(pngs(&out_dir(h.dir.path())).len(), 1);
+    assert!(h.mock.live_ids().is_empty());
 }

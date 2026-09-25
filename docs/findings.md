@@ -217,6 +217,8 @@ Notes for later phases:
 - Canvas results stay **staged** (not in the gallery or the images list)
   until the user accepts them. → Phase 4 sync needs to decide whether to
   also pull staged/intermediate canvas outputs, or rely on acceptance.
+  ⚠️ **Corrected in Phase 4:** accepting doesn't put them in the gallery
+  either. See "Phase 4 findings".
 - Idle timeout was verified by unit tests only (20 min live would have
   cost more for little new information).
 - Invoke's `/api/v1/queue/default/status` returns
@@ -532,6 +534,122 @@ Spend ~$0.018 (credit $11.3423 → $11.3247). The title check is also in
   change and a new instance-asset release.
 - CivitAI's `baseModel` "Anima" maps to the `anima` family for LoRAs.
 
+## Phase 4 findings (2026-09-25)
+
+### Canvas results and the gallery (Invoke 6.14.1, source + live)
+
+- ⚠️ **Canvas "Accept" never saves to the gallery.** `onAccept` in
+  `StagingArea/context.tsx` only adds the result as a raster layer and resets
+  the staging session. A canvas result reaches the gallery only via the
+  staging toolbar's **Save To Gallery** (floppy; it re-uploads a copy as
+  `general`, non-intermediate), the canvas right-click **Save To Gallery →
+  Save Canvas To Gallery / Save Bbox To Gallery**, or the **Send To Gallery**
+  mode (`saveAllImagesToGallery`: outputs are non-intermediate and skip
+  staging).
+- Staged canvas outputs are `general` + `is_intermediate=true`
+  (`selectCanvasOutputFields`), made by a node whose *source* id is
+  `canvas_output:<id>`.
+- ⚠️ **An image record's `node_id` is the prepared node id (a uuid), not
+  the source id**, so `canvas_output` can't be found in the image list.
+  (The first live run synced 0 Canvas files because of this.) The
+  session queue has the mapping: `GET /api/v1/queue/default/i/{id}` →
+  `session.prepared_source_mapping` (prepared → source) and
+  `session.results[prepared].image.image_name`. ✅ **Live** (instance
+  52630531): a canvas inpaint item had 16 nodes, one `canvas_output` source
+  with a uuid prepared id, and its image was `is_intermediate: true`,
+  `general`. `GET /api/v1/queue/default/item_ids?order_dir=DESC` →
+  `{item_ids, total_count}` is a cheap way to see new items.
+- **User decision:** save gallery images to the output folder and *every*
+  Canvas try (accepted or not) to its `Canvas` subfolder. A canvas result
+  that's already non-intermediate (Send To Gallery mode) is left to the
+  gallery sync.
+- Images list API: without `board_id` it lists all boards; `categories=general`
+  leaves out uploads (`user`) and masks; `limit` ≤ 1000 (`MAX_PAGE_SIZE`);
+  `created_at` is SQLite UTC (`YYYY-MM-DD HH:MM:SS.fff`).
+- Invoke has no URL or deep link for "open this image in Canvas"
+  (`main.tsx` takes no parameters), so the tutorial gives instructions
+  instead of scripting it.
+
+### Output sync (as built)
+
+- Rust, through the sidecar with the launch secret (bearer); never through
+  the remote webview. Polls every 10 s while Ready: the gallery (newest
+  first, stops at the first page with nothing new), then queue item ids
+  (stops at the first item already handled; only finished items are read).
+- Bearer requests don't count as activity in the sidecar's idle timer, so
+  polling never keeps an idle GPU alive.
+- Files: `<output>\YYYY-MM-DD_HH-MM-SS_<invoke name>.png` (local time) and
+  `<output>\Canvas\…`. Names are validated (`[A-Za-z0-9._-]`, image
+  extension); bytes must look like PNG/JPEG/WebP; writes are temp file +
+  rename. The per-instance ledger `%LOCALAPPDATA%\com.sloptweak.launcher\synced\<id>.json`
+  survives a restart/reattach and is deleted with the instance.
+- **Stop / close / shutting down a leftover GPU:** one last full pass,
+  bounded at 60 s (15 s when the GPU is already shutting itself down), then
+  destroy regardless. Close waits up to final sync + destroy confirm + 60 s.
+  Unit test: a download that hangs for an hour still destroys after 60 s.
+- Mock mode saves its 1-pixel fakes to `…\mock\output`, not Pictures.
+
+### Tutorial (as built)
+
+- An overlay injected into the Invoke window as a Tauri initialization
+  script (`remote.rs`, `tutorial.js`). It's plain page JS in a shadow DOM:
+  the window still has no capability (webview-check 21/21 with it
+  injected). It uploads the bundled sample (a room with a vase, drawn by
+  `dev/make-tutorial-sample.py`) with Invoke's own upload API as a `user`
+  asset, then reloads once. ✅ **Live:** Invoke's gallery doesn't show
+  uploads made outside its UI until a reload; after it, the sample is in
+  Assets.
+- Steps: Assets → right-click → **New Canvas from Image → As Raster Layer
+  (Resize)** → select **Inpaint Mask** (new canvases have an empty one) →
+  **B** → paint → prompt → **Invoke** (the card moves on by itself when
+  `queue.completed` goes up) → **✓ Accept**, with a pointer to Save To
+  Gallery. All labels were checked against 6.14.1's `en.json` and live.
+- Skip/Done reach the app only as a navigation to
+  `/__sloptweak/tutorial/<done|skipped>`, which `on_navigation` intercepts
+  and blocks. A page could fake it, but all it does is set
+  `tutorial_done`. The overlay auto-shows until then; **Show tutorial**
+  reopens it (Rust `eval` into the page if the window is open, else it
+  opens with the tutorial forced once). Its per-page state is in the remote
+  profile's `localStorage`, which is per tunnel origin, so it's fresh on
+  every new GPU.
+- ✅ **Live:** Invoke 6.14.1 registers one `beforeunload` listener, but the
+  blocked signal navigation raised no "leave site?" prompt; the page stayed.
+
+### Phase 4 acceptance (2026-09-25) ✅
+
+`app/dev/phase4-acceptance.mjs`, debug build, real Vast, Banana Splitz XXL.
+"Clean install" means a clean tutorial state (`tutorial_done=false`, a new
+tunnel origin); the keys stayed, as in Phase 3.
+
+| Run | Result |
+| --- | --- |
+| 1 (instance 52627339) | Ready in 124 s. The tutorial showed by itself and the sample uploaded. The script's submenu click missed, so it stopped; the agent finished the tutorial through CDP (right-click → New Canvas from Image → As Raster Layer (Resize), mask, typed prompt, Invoke → the card moved on in 15 s → Accept → Done → app recorded it). 10 images → Stop → **10/10 on disk** (9 synced while running, the last by the final pass; Stop took 3 s). ❌ The Canvas try wasn't saved (the `node_id` finding above). |
+| 2 (instance 52630531) | Fixed sync + script. **Fully automated, 13/13:** tutorial shown, sample uploaded, mask painted, moved on 23 s after Invoke, completed and recorded; the Canvas try saved to `Canvas\`; **10/10 images on disk after Stop** (1.09–1.24 MB PNGs; 9 while running + 1 in the final pass; Stop took 3 s); report `done`, nothing missing; instance destroyed; record cleared. |
+
+$0 checks: `cargo test` 117 passed; clippy -D warnings clean; `sync-check.mjs`
+18/18 (real app + real sidecar.py + `fake_invoke.py`); `mock-ui-check.mjs`
+50/50; `webview-check.mjs` 21/21.
+
+Dev harness notes:
+- A vite left running from another worktree kept :1420 despite
+  `--strictPort`, so the dev scripts silently loaded that checkout's UI. The
+  scripts now check that :1420 serves this checkout's `index.html`.
+- `sync-check` flaked once right after a rebuild (the mock session didn't
+  reach Ready in 2 min), then passed. Same cold-WebView2 pattern as
+  webview-check in Phase 2.
+- ⚠️ The Vast billing page shows **auto top-up enabled** ($10 when credit
+  drops below $5). Test spend never got near that; noted because the money
+  rule is "existing credit only".
+
+## Phase 4 rental log (all destroyed; none running)
+
+| Instance | Offer | Outcome |
+| --- | --- | --- |
+| 52627339 | 49992718 (RTX 3060, Utah, $0.1012/hr) | Run 1: 10/10 synced; Canvas sync bug found; destroyed by Stop |
+| 52630531 | 49992718 (same machine) | Run 2: 13/13; destroyed by Stop |
+
+Phase 4 total **~$0.084** (credit $11.2925 → $11.2089; late charges may post).
+
 ## Still open
 
 - ~~Live upstream catalog edit~~ **done (2026-09-25).** Merging PR #3
@@ -541,8 +659,13 @@ Spend ~$0.018 (credit $11.3423 → $11.3247). The title check is also in
   returned 1. The "no rebuild needed" part is covered by mock-ui-check (an
   upstream edit shows up in a running app without a rebuild), because the
   live build also bundles the new catalog.
-- Wizard screenshots of the logged-in Vast/CivitAI pages. Claude in Chrome
-  now connects, but that Chrome profile isn't signed in to Vast or CivitAI
-  (and the agent won't sign in). Drop PNGs into `app/src/wizard/`
-  (`vast-signup`, `vast-billing`, `vast-keys`, `civitai-signup`,
-  `civitai-keys`), or sign in and ask again.
+- Wizard screenshots of the logged-in Vast/CivitAI pages. The Chrome profile
+  is signed in now (2026-09-25), but Claude in Chrome's screenshots here only
+  come back to the agent; `save_to_disk` wrote no file anywhere findable, so
+  nothing could be cropped/blurred into the repo. Drop PNGs into
+  `app/src/wizard/` (`vast-signup`, `vast-billing`, `vast-keys`,
+  `civitai-signup`, `civitai-keys`) by hand. Blur the credit, card digits,
+  email, and any key.
+- Tutorial copy was checked against Invoke 6.14.1. A future image bump must
+  re-check the labels (`tutorial.js` header) and the queue/image API shapes
+  (`sync.rs`).

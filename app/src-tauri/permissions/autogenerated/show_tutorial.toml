@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-show-tutorial"
+description = "Enables the show_tutorial command without any pre-configured scope."
+commands.allow = ["show_tutorial"]
+
+[[permission]]
+identifier = "deny-show-tutorial"
+description = "Denies the show_tutorial command without any pre-configured scope."
+commands.deny = ["show_tutorial"]

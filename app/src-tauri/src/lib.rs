@@ -11,6 +11,7 @@ mod remote;
 mod secrets;
 mod session;
 mod sidecar;
+mod sync;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -32,10 +33,11 @@ use crate::provider::mock::{parse_script, MockProvider, MockTimings};
 use crate::provider::offers;
 use crate::provider::vast::VastProvider;
 use crate::provider::GpuProvider;
-use crate::remote::RemoteWindows;
+use crate::remote::{RemoteWindows, TutorialSignal};
 use crate::secrets::{KeyringStore, SecretStore};
 use crate::session::{Deps, Orphan, SessionManager, SessionState, Timing, Ui};
 use crate::sidecar::HttpSidecar;
+use crate::sync::{SyncReport, SyncStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -59,13 +61,19 @@ impl Ui for TauriUi {
     }
 
     fn open_remote(&self, url: Url) {
-        if let Err(e) = self.remote.open(url) {
+        // First sessions get the tutorial until it's finished or skipped.
+        let tutorial = !self.app.state::<AppState>().settings().tutorial_done;
+        if let Err(e) = self.remote.open(url, tutorial) {
             eprintln!("[sloptweak] couldn't open the Invoke window: {e}");
         }
     }
 
     fn close_remote(&self) {
         self.remote.close();
+    }
+
+    fn sync_changed(&self, report: &SyncReport) {
+        let _ = self.app.emit_to("main", "sync-status", report);
     }
 }
 
@@ -88,6 +96,13 @@ struct AppState {
     settings_lock: Mutex<()>,
 }
 
+fn output_dir(config_dir: &std::path::Path, default: &std::path::Path) -> PathBuf {
+    Settings::load(config_dir)
+        .output_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default.to_path_buf())
+}
+
 /// Mock-mode credit; `SLOPTWEAK_MOCK_CREDIT` lets the UI check exercise the
 /// low-balance gate.
 fn mock_credit() -> f64 {
@@ -104,6 +119,11 @@ impl AppState {
 
     fn settings(&self) -> Settings {
         Settings::load(&self.config_dir)
+    }
+
+    /// The output folder: the user's pick, or Pictures\SlopTweak.
+    fn output_dir(&self) -> PathBuf {
+        output_dir(&self.config_dir, &self.default_output_dir)
     }
 
     fn remember_credit(&self, credit: f64) {
@@ -151,7 +171,21 @@ impl AppState {
                 {
                     mock = mock.with_remote_base(base);
                 }
-                let sidecar = Arc::new(mock.sidecar());
+                if let Some(n) = std::env::var("SLOPTWEAK_MOCK_IMAGES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                {
+                    mock = mock.with_auto_images(n, Duration::from_secs(3));
+                }
+                // Dev: a real sidecar.py at SLOPTWEAK_MOCK_REMOTE (with
+                // SLOPTWEAK_DEV_LAUNCH_SECRET) instead of the fake one.
+                let sidecar: Arc<dyn sidecar::SidecarApi> = if cfg!(debug_assertions)
+                    && std::env::var("SLOPTWEAK_MOCK_SIDECAR").as_deref() == Ok("http")
+                {
+                    Arc::new(HttpSidecar::default())
+                } else {
+                    Arc::new(mock.sidecar())
+                };
                 Ok((Arc::new(mock), sidecar))
             }
             Mode::Vast => {
@@ -183,6 +217,11 @@ impl AppState {
             secrets: self.secrets.clone(),
             records: RecordFile::new(&self.data_dir),
             machines: MachineFile::new(&self.data_dir),
+            syncs: SyncStore::new(&self.data_dir),
+            output_dir: {
+                let (config, default) = (self.config_dir.clone(), self.default_output_dir.clone());
+                Arc::new(move || output_dir(&config, &default))
+            },
             ui: self.ui.clone(),
         };
         let m = SessionManager::new(deps, Timing::default());
@@ -288,6 +327,8 @@ struct Snapshot {
     settings: SettingsView,
     credit: Option<f64>,
     cost: Option<CostBar>,
+    /// What output sync saved (this or the last session).
+    sync: Option<SyncReport>,
 }
 
 fn settings_view(st: &AppState, s: &Settings) -> SettingsView {
@@ -311,9 +352,9 @@ fn settings_view(st: &AppState, s: &Settings) -> SettingsView {
 
 #[tauri::command]
 async fn get_snapshot(st: State<'_, AppState>) -> Result<Snapshot, String> {
-    let (state, log) = match st.manager() {
-        Ok(m) => (m.state(), m.log_lines()),
-        Err(_) => (SessionState::idle(), vec![]),
+    let (state, log, sync) = match st.manager() {
+        Ok(m) => (m.state(), m.log_lines(), m.sync_report()),
+        Err(_) => (SessionState::idle(), vec![], None),
     };
     let catalog = st.catalog.lock().unwrap().clone();
     let settings = st.settings();
@@ -332,6 +373,7 @@ async fn get_snapshot(st: State<'_, AppState>) -> Result<Snapshot, String> {
         },
         settings: settings_view(&st, &settings),
         credit: st.credit.lock().unwrap().map(|(c, _)| c),
+        sync,
     })
 }
 
@@ -590,11 +632,7 @@ async fn pick_output_folder(
     app: AppHandle,
     st: State<'_, AppState>,
 ) -> Result<SettingsView, String> {
-    let current = st
-        .settings()
-        .output_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| st.default_output_dir.clone());
+    let current = st.output_dir();
     let mut dialog = app
         .dialog()
         .file()
@@ -626,6 +664,25 @@ async fn reset_output_folder(st: State<'_, AppState>) -> Result<SettingsView, St
         u.output_dir = None;
         Ok(())
     })
+}
+
+/// Show the output folder in Explorer (created first, so it always opens).
+#[tauri::command]
+async fn open_output_folder(app: AppHandle, st: State<'_, AppState>) -> Result<(), String> {
+    let dir = st.output_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't create {}: {e}", dir.display()))?;
+    app.opener()
+        .open_path(dir.to_string_lossy(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// Show the Invoke-window tutorial again (in the open window, or by opening it).
+#[tauri::command]
+async fn show_tutorial(st: State<'_, AppState>) -> Result<(), String> {
+    if st.ui.remote.show_tutorial() {
+        return Ok(());
+    }
+    st.manager()?.open_invoke().await
 }
 
 #[tauri::command]
@@ -728,7 +785,8 @@ async fn reattach_orphan(st: State<'_, AppState>, instance_id: u64) -> Result<()
 #[tauri::command]
 async fn confirm_close(app: AppHandle, st: State<'_, AppState>) -> Result<(), String> {
     let m = st.manager()?;
-    if !m.stop_and_wait(Duration::from_secs(180)).await {
+    // The last image sync, then destroy + confirm; both are bounded.
+    if !m.stop_and_wait(m.timing().stop_budget()).await {
         return Err(
             "Couldn't confirm the GPU was shut down. Not closing, so you can try again.".into(),
         );
@@ -797,9 +855,22 @@ pub fn run() {
                 Mode::Vast => Arc::new(HttpCivitai::default()),
             };
             let handle = app.handle().clone();
+            let on_tutorial = {
+                let h = handle.clone();
+                Arc::new(move |sig: TutorialSignal| {
+                    eprintln!("[sloptweak] tutorial {sig:?}");
+                    let st = h.state::<AppState>();
+                    if let Err(e) = update_settings(&st, |u| {
+                        u.tutorial_done = true;
+                        Ok(())
+                    }) {
+                        eprintln!("[sloptweak] couldn't save the tutorial state: {e}");
+                    }
+                })
+            };
             let ui = Arc::new(TauriUi {
                 app: handle.clone(),
-                remote: RemoteWindows::new(handle.clone()),
+                remote: RemoteWindows::new(handle.clone(), on_tutorial),
             });
             let data_dir = app.path().app_local_data_dir()?.join(sub);
             let config_dir = app.path().app_config_dir()?.join(sub);
@@ -813,11 +884,15 @@ pub fn run() {
                 let _ = std::fs::remove_dir_all(&config_dir);
                 eprintln!("[sloptweak] dev: reset the mock profile");
             }
-            let default_output_dir = app
-                .path()
-                .picture_dir()
-                .or_else(|_| app.path().home_dir())?
-                .join("SlopTweak");
+            // Mock images are 1-pixel fakes: keep them out of Pictures.
+            let default_output_dir = match mode {
+                Mode::Vast => app
+                    .path()
+                    .picture_dir()
+                    .or_else(|_| app.path().home_dir())?
+                    .join("SlopTweak"),
+                Mode::Mock => data_dir.join("output"),
+            };
             app.manage(AppState {
                 mode,
                 secrets,
@@ -898,6 +973,8 @@ pub fn run() {
             select_model,
             pick_output_folder,
             reset_output_folder,
+            open_output_folder,
+            show_tutorial,
             add_lora,
             remove_lora,
             set_lora_enabled,

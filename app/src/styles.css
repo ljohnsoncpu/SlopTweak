@@ -358,3 +358,12 @@ button.link.primary-link {
 .lora .small {
   flex-basis: 100%;
 }
+
+.sync {
+  margin: 6px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.sync.warn {
+  color: var(--danger);
+}

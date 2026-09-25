@@ -17,6 +17,8 @@ fn main() {
             "select_model",
             "pick_output_folder",
             "reset_output_folder",
+            "open_output_folder",
+            "show_tutorial",
             "add_lora",
             "remove_lora",
             "set_lora_enabled",
