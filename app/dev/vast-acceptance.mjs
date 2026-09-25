@@ -18,6 +18,7 @@
 import { spawn, execSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, appendFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { servesThisCheckout } from "./vite-check.mjs";
 import { COST_TITLE, windowTitles } from "./win-titles.mjs";
 
 const APP = resolve(import.meta.dirname, "..");
@@ -386,7 +387,7 @@ if (existsSync(join(DATA_DIR, "active_instance.json"))) {
 }
 
 vite = spawn("npx", ["vite", "--port", "1420", "--strictPort"], { cwd: APP, shell: true, windowsHide: true, stdio: "ignore" });
-await waitFor(async () => (await fetch("http://127.0.0.1:1420/")).ok, 30000, "vite");
+await waitFor(() => servesThisCheckout(APP), 30000, "vite");
 
 const created = new Set();
 const tracker = setInterval(async () => {

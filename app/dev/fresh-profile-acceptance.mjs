@@ -20,6 +20,7 @@
 import { spawn, execSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { servesThisCheckout } from "./vite-check.mjs";
 
 const APP = resolve(import.meta.dirname, "..");
 const EXE = join(APP, "src-tauri", "target", "debug", "sloptweak.exe");
@@ -300,7 +301,7 @@ if (existsSync(RECORD)) {
 const creditStart = await credit();
 say(`credit at start: $${creditStart?.toFixed(4)}`);
 const vite = spawn("npx", ["vite", "--port", "1420", "--strictPort"], { cwd: APP, shell: true, windowsHide: true, stdio: "ignore" });
-await waitFor(async () => (await fetch("http://127.0.0.1:1420/")).ok, 30000, "vite");
+await waitFor(() => servesThisCheckout(APP), 30000, "vite");
 const seen = new Set();
 const tracker = setInterval(async () => {
   try {

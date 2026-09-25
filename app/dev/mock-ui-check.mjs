@@ -2,8 +2,9 @@
 // besides a local catalog server). Covers Phase 2 and 3:
 //   fresh mock profile -> wizard (key checks on paste) -> home estimate ->
 //   settings + validation -> LoRAs -> upstream catalog edit without rebuild ->
-//   Start -> cost bar -> Stop -> restart (keys, settings, cached catalog
-//   survive) -> low-balance gate -> close-while-running confirm + destroy.
+//   Start -> cost bar -> image sync line + buttons -> Stop saves the rest ->
+//   restart (keys, settings, cached catalog survive) -> low-balance gate ->
+//   close-while-running confirm + last sync + destroy.
 // Mock mode uses its own Credential Manager service ("SlopTweak-mock") and
 // its own folders, so the real profile is never touched.
 //
@@ -12,15 +13,19 @@
 
 import { spawn, execSync } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { servesThisCheckout } from "./vite-check.mjs";
 import { COST_TITLE, windowTitles } from "./win-titles.mjs";
 
 const APP = resolve(import.meta.dirname, "..");
 const EXE = join(APP, "src-tauri", "target", "debug", "sloptweak.exe");
 const CDP_PORT = 9334;
 const CATALOG_PORT = 18431;
+// Mock mode's default output folder (fake 1-pixel images, kept out of Pictures).
+const MOCK_OUT = join(process.env.LOCALAPPDATA ?? "", "com.sloptweak.launcher", "mock", "output");
+const filesIn = (dir) => (existsSync(dir) ? readdirSync(dir, { withFileTypes: true }).filter((d) => d.isFile()).length : 0);
 const SHOTS = process.env.SHOTS ?? mkdtempSync(join(tmpdir(), "sloptweak-shots-"));
 const procs = [];
 const results = [];
@@ -129,6 +134,9 @@ async function launch(extraEnv = {}) {
       SLOPTWEAK_PROVIDER: "mock",
       SLOPTWEAK_CATALOG_URL: `http://127.0.0.1:${CATALOG_PORT}/catalog.json`,
       SLOPTWEAK_MAIN_DEBUG_PORT: String(CDP_PORT),
+      // After Ready, MockSidecar makes 6 gallery images (one per 3 s), plus
+      // 3 Canvas tries and 3 scratch intermediates.
+      SLOPTWEAK_MOCK_IMAGES: "6",
       ...extraEnv,
     },
   });
@@ -269,9 +277,16 @@ async function wizardAndHome() {
   await shot("h3-ready");
   const titles = windowTitles(s.app.pid);
   check("Invoke window title shows the running cost", titles.some((t) => COST_TITLE.test(t)), titles.find((t) => t.includes("Invoke")) ?? JSON.stringify(titles));
+  const syncLine = await evaluate(text("sync"));
+  check("home screen shows images being saved", /^Saved \d+ images? .*to .*mock.output\.$/.test(syncLine), syncLine);
+  check("Ready shows Show tutorial and Open output folder", (await evaluate(visible("tutorial"))) && (await evaluate(visible("open-folder"))));
   await evaluate(click("stop"));
   await waitFor(async () => (await evaluate(text("status-text"))) === "Ready to start.", 60000, "idle");
   check("Stop returns to idle", true);
+  const done = await evaluate(text("sync"));
+  check("after Stop: all fake images saved", done.startsWith("Saved 6 images and 3 Canvas tries"), done);
+  check("files on disk: 6 gallery, 3 Canvas", filesIn(MOCK_OUT) === 6 && filesIn(join(MOCK_OUT, "Canvas")) === 3, `${filesIn(MOCK_OUT)} + ${filesIn(join(MOCK_OUT, "Canvas"))}`);
+  await shot("h4-stopped-saved");
   await closeIdle(s);
 }
 
@@ -334,7 +349,7 @@ async function closeWhileRunning() {
   const { evaluate, shot } = s;
   await waitFor(async () => !(await evaluate(`${q("start")}.disabled`)), 15000, "start enabled");
   await evaluate(click("start"));
-  await waitFor(async () => await evaluate(visible("stop")), 30000, "running");
+  await waitFor(async () => await evaluate(visible("open")), 60000, "ready");
   postClose("SlopTweak");
   await waitFor(async () => await evaluate(visible("modal")), 10000, "confirm dialog");
   await shot("c1-confirm-close");
@@ -349,11 +364,13 @@ async function closeWhileRunning() {
   const exited = await waitFor(async () => s.app.exitCode !== null, 60000, "app exit").catch(() => false);
   check("confirm destroys and exits", !!exited, `exit=${s.app.exitCode}`);
   check("log shows instance destroyed before exit", /instance \d+ destroyed/.test(s.app.output()));
+  const out = s.app.output();
+  check("closing ran the last image sync before the destroy", out.indexOf("final sync:") >= 0 && out.indexOf("final sync:") < out.search(/instance \d+ destroyed/));
 }
 
 try {
   start("npx", ["vite", "--port", "1420", "--strictPort"], { cwd: APP, shell: true });
-  await waitFor(async () => (await fetch("http://127.0.0.1:1420/")).ok, 30000, "vite");
+  await waitFor(() => servesThisCheckout(APP), 30000, "vite");
   await wizardAndHome();
   await restart();
   await lowBalance();

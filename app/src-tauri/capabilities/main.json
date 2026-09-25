@@ -20,6 +20,8 @@
     "allow-select-model",
     "allow-pick-output-folder",
     "allow-reset-output-folder",
+    "allow-open-output-folder",
+    "allow-show-tutorial",
     "allow-add-lora",
     "allow-remove-lora",
     "allow-set-lora-enabled",

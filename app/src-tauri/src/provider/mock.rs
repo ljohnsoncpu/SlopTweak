@@ -11,7 +11,16 @@ use tokio::time::Instant;
 use url::Url;
 
 use super::{GpuProvider, InstanceInfo, LaunchSpec, Offer, OfferQuery, ProviderError};
-use crate::sidecar::{Deadlines, SidecarApi, SidecarError, SidecarStatus};
+use crate::sidecar::{Deadlines, ImagePage, InvokeImage, SidecarApi, SidecarError, SidecarStatus};
+
+/// A 1×1 PNG: what every mock image downloads as.
+pub const MOCK_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
 
 /// What a created instance does. Consumed one per create call; `Normal` after.
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +98,42 @@ struct MockInstance {
     heartbeats: u32,
     destroyed: bool,
     ready_at: Option<Instant>,
+    /// Invoke's images (gallery and intermediates), oldest first.
+    images: Vec<InvokeImage>,
+    /// Invoke's session queue, oldest first.
+    queue: Vec<MockQueueItem>,
+    /// Auto-generated gallery images so far (see `MockImages::auto`).
+    auto_made: usize,
+}
+
+/// A queue item that ran a canvas graph: its `canvas_output` image, plus a
+/// scratch image from another node (which sync must not save).
+#[derive(Debug, Clone)]
+struct MockQueueItem {
+    item_id: u64,
+    status: &'static str,
+    canvas_image: String,
+    scratch_image: String,
+}
+
+impl MockQueueItem {
+    /// Shaped like Invoke 6.14.1's `GET /api/v1/queue/default/i/{id}`.
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "item_id": self.item_id,
+            "status": self.status,
+            "session": {
+                "prepared_source_mapping": {
+                    format!("prep-{}-a", self.item_id): format!("canvas_output:{}", self.item_id),
+                    format!("prep-{}-b", self.item_id): format!("l2i:{}", self.item_id),
+                },
+                "results": {
+                    format!("prep-{}-a", self.item_id): {"image": {"image_name": self.canvas_image}},
+                    format!("prep-{}-b", self.item_id): {"image": {"image_name": self.scratch_image}},
+                }
+            }
+        })
+    }
 }
 
 impl MockInstance {
@@ -102,12 +147,27 @@ impl MockInstance {
     }
 }
 
+/// Fake Invoke images, for output sync without a GPU.
+#[derive(Debug, Default)]
+struct MockImages {
+    /// After Ready, one gallery image every `every` up to this many. Every
+    /// second one also brings a staged Canvas result and a scratch
+    /// intermediate (which sync must ignore).
+    auto: usize,
+    every: Duration,
+    /// Each download takes this long.
+    delay: Duration,
+    /// Image name -> downloads that fail before one succeeds.
+    fail: HashMap<String, u32>,
+}
+
 #[derive(Debug, Default)]
 struct State {
     next_id: u64,
     instances: HashMap<u64, MockInstance>,
     behaviors: VecDeque<MockBehavior>,
     created_offers: Vec<u64>,
+    images: MockImages,
 }
 
 #[derive(Clone)]
@@ -139,6 +199,64 @@ impl MockProvider {
     pub fn with_credit(mut self, credit: f64) -> Self {
         self.credit = credit;
         self
+    }
+
+    /// After Ready, make up to `n` gallery images, one every `every`, plus
+    /// Canvas results and scratch intermediates.
+    pub fn with_auto_images(self, n: usize, every: Duration) -> Self {
+        {
+            let mut s = self.state.lock().unwrap();
+            s.images.auto = n;
+            s.images.every = every;
+        }
+        self
+    }
+
+    /// Add one gallery image to an instance's Invoke (newest).
+    #[cfg(test)]
+    pub fn add_image(&self, id: u64, img: InvokeImage) {
+        if let Some(i) = self.state.lock().unwrap().instances.get_mut(&id) {
+            i.images.push(img);
+        }
+    }
+
+    /// Run a canvas generation on an instance: a staged (intermediate)
+    /// result and a scratch image, via a queue item with this status.
+    #[cfg(test)]
+    pub fn add_canvas_result(&self, id: u64, name: &str, status: &'static str) {
+        if let Some(i) = self.state.lock().unwrap().instances.get_mut(&id) {
+            push_canvas(i, name, status);
+        }
+    }
+
+    /// Change a queue item's status (e.g. in_progress -> completed).
+    #[cfg(test)]
+    pub fn set_queue_status(&self, id: u64, canvas_image: &str, status: &'static str) {
+        if let Some(i) = self.state.lock().unwrap().instances.get_mut(&id) {
+            for q in i
+                .queue
+                .iter_mut()
+                .filter(|q| q.canvas_image == canvas_image)
+            {
+                q.status = status;
+            }
+        }
+    }
+
+    /// The next `times` downloads of `name` fail.
+    #[cfg(test)]
+    pub fn fail_image(&self, name: &str, times: u32) {
+        self.state
+            .lock()
+            .unwrap()
+            .images
+            .fail
+            .insert(name.into(), times);
+    }
+
+    #[cfg(test)]
+    pub fn set_image_delay(&self, d: Duration) {
+        self.state.lock().unwrap().images.delay = d;
     }
 
     /// Page the remote window opens in mock mode.
@@ -309,6 +427,9 @@ impl GpuProvider for MockProvider {
                 heartbeats: 0,
                 destroyed: false,
                 ready_at: None,
+                images: Vec::new(),
+                queue: Vec::new(),
+                auto_made: 0,
             },
         );
         Ok(id)
@@ -437,6 +558,155 @@ impl SidecarApi for MockSidecar {
 
     async fn ticket(&self, _base: &Url, secret: &str) -> Result<String, SidecarError> {
         self.with_instance(secret, |_, _| Ok("mock-ticket".into()))
+    }
+
+    async fn list_images(
+        &self,
+        _base: &Url,
+        secret: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<ImagePage, SidecarError> {
+        self.with_images(secret, |inst| {
+            let matching: Vec<&InvokeImage> = inst
+                .images
+                .iter()
+                .rev()
+                .filter(|i| !i.is_intermediate)
+                .collect();
+            Ok(ImagePage {
+                total: matching.len() as u64,
+                items: matching
+                    .into_iter()
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .cloned()
+                    .collect(),
+            })
+        })
+    }
+
+    async fn image_file(
+        &self,
+        _base: &Url,
+        secret: &str,
+        image_name: &str,
+    ) -> Result<Vec<u8>, SidecarError> {
+        let delay = self.state.lock().unwrap().images.delay;
+        tokio::time::sleep(delay).await;
+        self.with_instance(secret, |inst, _| {
+            if inst.images.iter().any(|i| i.image_name == image_name) {
+                Ok(())
+            } else {
+                Err(SidecarError::Http(404))
+            }
+        })?;
+        let mut s = self.state.lock().unwrap();
+        if let Some(n) = s.images.fail.get_mut(image_name).filter(|n| **n > 0) {
+            *n -= 1;
+            return Err(SidecarError::Unreachable("mock download failure".into()));
+        }
+        Ok(MOCK_PNG.to_vec())
+    }
+
+    async fn image_info(
+        &self,
+        _base: &Url,
+        secret: &str,
+        image_name: &str,
+    ) -> Result<InvokeImage, SidecarError> {
+        self.with_images(secret, |inst| {
+            inst.images
+                .iter()
+                .find(|i| i.image_name == image_name)
+                .cloned()
+                .ok_or(SidecarError::Http(404))
+        })
+    }
+
+    async fn queue_item_ids(&self, _base: &Url, secret: &str) -> Result<Vec<u64>, SidecarError> {
+        self.with_images(secret, |inst| {
+            Ok(inst.queue.iter().rev().map(|q| q.item_id).collect())
+        })
+    }
+
+    async fn queue_item(
+        &self,
+        _base: &Url,
+        secret: &str,
+        item_id: u64,
+    ) -> Result<serde_json::Value, SidecarError> {
+        self.with_images(secret, |inst| {
+            inst.queue
+                .iter()
+                .find(|q| q.item_id == item_id)
+                .map(MockQueueItem::json)
+                .ok_or(SidecarError::Http(404))
+        })
+    }
+}
+
+impl MockSidecar {
+    /// Like `with_instance`, after catching up on auto-generated images.
+    fn with_images<T>(
+        &self,
+        secret: &str,
+        f: impl FnOnce(&mut MockInstance) -> Result<T, SidecarError>,
+    ) -> Result<T, SidecarError> {
+        let (auto, every) = {
+            let s = self.state.lock().unwrap();
+            (s.images.auto, s.images.every)
+        };
+        self.with_instance(secret, |inst, _| {
+            make_auto_images(inst, auto, every);
+            f(inst)
+        })
+    }
+}
+
+fn mock_image(name: String, k: usize, intermediate: bool) -> InvokeImage {
+    InvokeImage {
+        image_name: name,
+        created_at: Some(format!(
+            "2026-09-25 12:{:02}:{:02}.000",
+            (k / 60) % 60,
+            k % 60
+        )),
+        is_intermediate: intermediate,
+    }
+}
+
+/// A canvas run: staged result + scratch image (both intermediate) and the
+/// queue item that made them.
+fn push_canvas(inst: &mut MockInstance, name: &str, status: &'static str) {
+    let k = inst.images.len();
+    let scratch = format!("scratch-{name}");
+    inst.images.push(mock_image(scratch.clone(), k, true));
+    inst.images.push(mock_image(name.to_string(), k, true));
+    inst.queue.push(MockQueueItem {
+        item_id: inst.queue.len() as u64 + 1,
+        status,
+        canvas_image: name.to_string(),
+        scratch_image: scratch,
+    });
+}
+
+fn make_auto_images(inst: &mut MockInstance, auto: usize, every: Duration) {
+    let Some(ready) = inst.ready_at else { return };
+    if auto == 0 {
+        return;
+    }
+    let due = (ready.elapsed().as_millis() / every.as_millis().max(1)) as usize + 1;
+    // Unique per instance, like Invoke's uuids.
+    let tag: String = inst.token_hash.chars().take(8).collect();
+    while inst.auto_made < due.min(auto) {
+        let k = inst.auto_made;
+        if k % 2 == 1 {
+            push_canvas(inst, &format!("mock-{tag}-{k:04}-canvas.png"), "completed");
+        }
+        let gallery = mock_image(format!("mock-{tag}-{k:04}-gallery.png"), k, false);
+        inst.images.push(gallery);
+        inst.auto_made += 1;
     }
 }
 
