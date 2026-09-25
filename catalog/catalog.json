@@ -27,6 +27,92 @@
       "nsfw": true,
       "license_note": "CivitAI license: running on rented GPUs allowed (Rent, RentCivit); derivatives allowed; credit not required.",
       "invoke_min_version": "6.13.8"
+    },
+    {
+      "id": "anima-aesthetic",
+      "name": "Anima Aesthetic",
+      "description": "2B anime model by CircleStone Labs and Comfy Org, tuned for a polished default style. Use 30-50 steps and CFG 4-5; prompts work with Danbooru tags or plain sentences.",
+      "base": "anima",
+      "base_variant": "aesthetic-v1.1",
+      "source": {
+        "huggingface_repo": "circlestone-labs/Anima",
+        "revision": "f973fc41ec7545364ac9776c2440285f43ff2a30",
+        "page": "https://huggingface.co/circlestone-labs/Anima"
+      },
+      "files": [
+        {
+          "url": "https://huggingface.co/circlestone-labs/Anima/resolve/f973fc41ec7545364ac9776c2440285f43ff2a30/split_files/diffusion_models/anima-aesthetic-v1.1.safetensors",
+          "filename": "anima-aesthetic-v1.1.safetensors",
+          "sha256": "3C1868387A3A1FF504BBB87C33678321965EAD381FCF87AFBD0264DAA600C082",
+          "size_bytes": 4182230656,
+          "kind": "main",
+          "requires_civitai_token": false
+        },
+        {
+          "url": "https://huggingface.co/circlestone-labs/Anima/resolve/f973fc41ec7545364ac9776c2440285f43ff2a30/split_files/text_encoders/qwen_3_06b_base.safetensors",
+          "filename": "qwen_3_06b_base.safetensors",
+          "sha256": "CD2A512003E2F9F3CD3C32A9C3573F820BB28C940F73C57B1DDAA983D9223EBA",
+          "size_bytes": 1192135096,
+          "kind": "text_encoder",
+          "requires_civitai_token": false
+        },
+        {
+          "url": "https://huggingface.co/circlestone-labs/Anima/resolve/f973fc41ec7545364ac9776c2440285f43ff2a30/split_files/vae/qwen_image_vae.safetensors",
+          "filename": "qwen_image_vae.safetensors",
+          "sha256": "A70580F0213E67967EE9C95F05BB400E8FB08307E017A924BF3441223E023D1F",
+          "size_bytes": 253806246,
+          "kind": "vae",
+          "requires_civitai_token": false
+        }
+      ],
+      "min_vram_gb": 8,
+      "min_compute_cap": 800,
+      "nsfw": false,
+      "license_note": "CircleStone Labs Non-Commercial License v1.2: personal, non-commercial use only (renting your own GPU is fine; no paid or production use).",
+      "invoke_min_version": "6.14.1"
+    },
+    {
+      "id": "anima-turbo",
+      "name": "Anima Turbo",
+      "description": "Fast version of Anima (2B anime model). In Invoke, set CFG to 1 and steps to 8-12; the usual defaults give poor results.",
+      "base": "anima",
+      "base_variant": "turbo-v1.1",
+      "source": {
+        "huggingface_repo": "circlestone-labs/Anima",
+        "revision": "f973fc41ec7545364ac9776c2440285f43ff2a30",
+        "page": "https://huggingface.co/circlestone-labs/Anima"
+      },
+      "files": [
+        {
+          "url": "https://huggingface.co/circlestone-labs/Anima/resolve/f973fc41ec7545364ac9776c2440285f43ff2a30/split_files/diffusion_models/anima-turbo-v1.1.safetensors",
+          "filename": "anima-turbo-v1.1.safetensors",
+          "sha256": "FBA11953276B57EDF59D1DC4F1857AC05AA079C56F982B4D7C20298D57D3F7EB",
+          "size_bytes": 4182230656,
+          "kind": "main",
+          "requires_civitai_token": false
+        },
+        {
+          "url": "https://huggingface.co/circlestone-labs/Anima/resolve/f973fc41ec7545364ac9776c2440285f43ff2a30/split_files/text_encoders/qwen_3_06b_base.safetensors",
+          "filename": "qwen_3_06b_base.safetensors",
+          "sha256": "CD2A512003E2F9F3CD3C32A9C3573F820BB28C940F73C57B1DDAA983D9223EBA",
+          "size_bytes": 1192135096,
+          "kind": "text_encoder",
+          "requires_civitai_token": false
+        },
+        {
+          "url": "https://huggingface.co/circlestone-labs/Anima/resolve/f973fc41ec7545364ac9776c2440285f43ff2a30/split_files/vae/qwen_image_vae.safetensors",
+          "filename": "qwen_image_vae.safetensors",
+          "sha256": "A70580F0213E67967EE9C95F05BB400E8FB08307E017A924BF3441223E023D1F",
+          "size_bytes": 253806246,
+          "kind": "vae",
+          "requires_civitai_token": false
+        }
+      ],
+      "min_vram_gb": 8,
+      "min_compute_cap": 800,
+      "nsfw": false,
+      "license_note": "CircleStone Labs Non-Commercial License v1.2: personal, non-commercial use only (renting your own GPU is fine; no paid or production use).",
+      "invoke_min_version": "6.14.1"
     }
   ]
 }

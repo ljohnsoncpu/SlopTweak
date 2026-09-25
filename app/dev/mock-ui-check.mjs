@@ -245,7 +245,7 @@ async function wizardAndHome() {
   edited.models.push({ ...bundled.models[0], id: "upstream-test", name: "Upstream Test Model" });
   catalogText = JSON.stringify(edited);
   await evaluate(click("catalog-refresh"));
-  await waitFor(async () => (await evaluate(`${q("model")}.options.length`)) === 2, 10000, "2 models");
+  await waitFor(async () => (await evaluate(`${q("model")}.options.length`)) === bundled.models.length + 1, 10000, "one more model");
   check("editing the upstream catalog changes the model list", (await evaluate(text("model"))).includes("Upstream Test Model"));
 
   await evaluate(click("nav-home"));
@@ -280,7 +280,7 @@ async function restart() {
   const s = await launch();
   const { evaluate, shot } = s;
   check("keys survive a restart (no wizard)", (await evaluate(visible("view-home"))) && !(await evaluate(visible("view-wizard"))));
-  check("cached catalog used when upstream is down", (await evaluate(`${q("model")}.options.length`)) === 2);
+  check("cached catalog used when upstream is down", (await evaluate(`${q("model")}.options.length`)) === bundled.models.length + 1);
   check("catalog source says saved copy", (await evaluate(text("catalog-info"))).includes("saved copy"));
   const snap = await evaluate("window.__TAURI_INTERNALS__.invoke('get_snapshot')");
   check("settings survive a restart", snap.settings.max_dph === 0.4 && snap.settings.idle_minutes === 30);

@@ -216,6 +216,8 @@ struct ModelView {
     needs_civitai: bool,
     nsfw: bool,
     license_note: String,
+    /// The model's own GPU architecture floor, if it sets one.
+    min_compute_cap: Option<u32>,
 }
 
 impl From<&Model> for ModelView {
@@ -230,6 +232,7 @@ impl From<&Model> for ModelView {
             needs_civitai: m.needs_civitai(),
             nsfw: m.nsfw,
             license_note: m.license_note.clone(),
+            min_compute_cap: m.min_compute_cap,
         }
     }
 }

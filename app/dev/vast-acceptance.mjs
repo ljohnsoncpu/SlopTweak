@@ -12,6 +12,8 @@
 // never printed.
 //
 // Usage (from app/):  node dev/vast-acceptance.mjs [r1] [r2] [r3]
+//   TEST_MODEL=<catalog id>  pick this model before Start (default: first)
+//   GENERATE=1               in R1, type a prompt in Invoke and make one image
 
 import { spawn, execSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, appendFileSync } from "node:fs";
@@ -28,6 +30,8 @@ const CONFIG_DIR = join(process.env.APPDATA ?? "", "com.sloptweak.launcher");
 const DATA_DIR = join(process.env.LOCALAPPDATA ?? "", "com.sloptweak.launcher");
 const HEARTBEAT_MINUTES = 3;
 const runs = process.argv.slice(2).length ? process.argv.slice(2) : ["r1", "r2", "r3"];
+const TEST_MODEL = process.env.TEST_MODEL ?? "";
+const GENERATE = process.env.GENERATE === "1";
 
 mkdirSync(OUT, { recursive: true });
 const LOG = join(OUT, "acceptance.log");
@@ -195,6 +199,14 @@ async function follow(m, pred, ms, what) {
 }
 
 async function startAndWaitReady(m, tag) {
+  if (TEST_MODEL) {
+    const picked = await m.eval(`(() => { const s = document.getElementById('model');
+      if (![...s.options].some(o => o.value === ${JSON.stringify(TEST_MODEL)})) return false;
+      s.value = ${JSON.stringify(TEST_MODEL)}; s.dispatchEvent(new Event('change')); return true; })()`);
+    if (!picked) throw new Error(`model ${TEST_MODEL} is not in the catalog`);
+    say(`${tag}: model ${TEST_MODEL}`);
+    await sleep(3000);
+  }
   await m.eval("document.getElementById('start').click()");
   const s = await follow(m, (s) => s.kind === "ready", 30 * 60000, `${tag} ready`);
   say(`${tag}: READY instance ${s.instance_id} on offer ${s.offer.offer_id} (${s.offer.gpu_name}, $${s.offer.hourly.toFixed(4)}/hr)`);
@@ -209,11 +221,40 @@ async function invokeVisible(tag) {
   const title = await r.eval("document.title");
   const origin = await r.eval("location.origin");
   const ipc = await r.eval(`(async () => { try { await window.__TAURI_INTERNALS__.invoke('get_snapshot'); return 'ALLOWED'; } catch (e) { return 'denied'; } })()`);
-  const models = await r.eval("fetch('/api/v2/models/').then(r => r.json()).then(j => (j.models || []).map(m => m.name))");
+  const models = await r.eval("fetch('/api/v2/models/').then(r => r.json()).then(j => (j.models || []).map(m => m.base + '/' + m.type + ':' + m.name))");
+  if (GENERATE) await generateOnce(r, tag);
   r.ws.close();
   check(`${tag}: Invoke visible in app window`, title.includes("Invoke"), `${title} @ ${origin}`);
   check(`${tag}: remote window IPC denied`, ipc === "denied");
   check(`${tag}: catalog model registered`, Array.isArray(models) && models.length > 0, JSON.stringify(models));
+}
+
+/** Type a prompt into Invoke's UI and press Invoke; wait for one new image. */
+async function generateOnce(r, tag) {
+  const count = () =>
+    r.eval("fetch('/api/v1/images/?order_dir=DESC&starred_first=false&is_intermediate=false&limit=1').then(r => r.json()).then(j => j.total)");
+  const before = (await count()) ?? 0;
+  const typed = await r.eval(`(() => {
+    const ta = document.querySelector('textarea');
+    if (!ta) return 'no prompt box';
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(ta, 'a cat reading a book in a sunny library, detailed illustration');
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    return 'ok'; })()`);
+  await sleep(1500);
+  const clicked = await r.eval(`(() => {
+    const b = [...document.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Invoke' || /^Invoke$/.test(b.textContent.trim()));
+    if (!b) return 'no Invoke button';
+    if (b.disabled) return 'Invoke button disabled: ' + (b.getAttribute('title') || document.querySelector('[role=tooltip]')?.textContent || '');
+    b.click(); return 'ok'; })()`);
+  say(`${tag}: prompt ${typed}, invoke ${clicked}`);
+  const started = Date.now();
+  const total = await waitFor(async () => {
+    const t = await count();
+    return t > before ? t : false;
+  }, 10 * 60000, "generated image").catch(() => before);
+  const q = await r.eval("fetch('/api/v1/queue/default/status').then(r => r.json()).then(j => JSON.stringify(j.queue))");
+  await r.shot(`${tag}-generated`);
+  check(`${tag}: image generated`, total > before, `${Math.round((Date.now() - started) / 1000)}s, queue ${q}`);
 }
 
 async function orphanBanner(m, id) {

@@ -51,6 +51,11 @@ pub struct Model {
     pub license_note: String,
     #[serde(default)]
     pub invoke_min_version: Option<String>,
+    /// GPU architecture this model needs, Vast units (800 = Ampere / RTX
+    /// 30-series, for native bf16). Raises the app-wide floor for this
+    /// model only.
+    #[serde(default)]
+    pub min_compute_cap: Option<u32>,
 }
 
 impl Model {
@@ -191,6 +196,11 @@ fn validate(m: &Model) -> Result<(), String> {
     }
     if !(m.min_vram_gb > 0.0 && m.min_vram_gb <= 200.0) {
         return Err("bad min_vram_gb".into());
+    }
+    if m.min_compute_cap
+        .is_some_and(|c| !(300..=1300).contains(&c))
+    {
+        return Err("bad min_compute_cap".into());
     }
     if !m.files.iter().any(|f| f.kind == "main") {
         return Err("no main model file".into());
@@ -350,6 +360,26 @@ mod tests {
         assert_eq!(m.total_bytes(), 6_938_043_264);
         assert_eq!(m.files[0].sha256.len(), 64);
         assert_eq!(m.invoke_min_version.as_deref(), Some("6.13.8"));
+        assert_eq!(m.min_compute_cap, None);
+    }
+
+    #[test]
+    fn bundled_anima_entries_are_complete() {
+        let models = bundled();
+        for id in ["anima-aesthetic", "anima-turbo"] {
+            let m = models.iter().find(|m| m.id == id).unwrap();
+            assert_eq!(m.base, "anima");
+            assert_eq!(m.min_compute_cap, Some(800));
+            assert!(!m.needs_civitai(), "Anima is on Hugging Face, no key");
+            let kinds: Vec<&str> = m.files.iter().map(|f| f.kind.as_str()).collect();
+            assert_eq!(kinds, ["main", "text_encoder", "vae"]);
+            assert_eq!(m.total_bytes(), 4_182_230_656 + 1_192_135_096 + 253_806_246);
+            for f in &m.files {
+                assert!(f
+                    .url
+                    .contains("/resolve/f973fc41ec7545364ac9776c2440285f43ff2a30/"));
+            }
+        }
     }
 
     #[test]
@@ -366,6 +396,8 @@ mod tests {
         too_new["invoke_min_version"] = json!("99.0.0");
         let mut no_main = entry("nomain");
         no_main["files"][0]["kind"] = json!("lora");
+        let mut bad_cap = entry("cap");
+        bad_cap["min_compute_cap"] = json!(86);
         let mut bad_id = entry("Bad Id");
         bad_id["id"] = json!("Bad Id");
         let text = catalog(vec![
@@ -376,6 +408,7 @@ mod tests {
             http,
             too_new,
             no_main,
+            bad_cap,
             bad_id,
             entry("ok"),
             json!({"id": "junk"}),
@@ -383,7 +416,7 @@ mod tests {
         let (models, skipped) = parse(&text).unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "ok");
-        assert_eq!(skipped.len(), 9, "{skipped:?}");
+        assert_eq!(skipped.len(), 10, "{skipped:?}");
         assert!(skipped.iter().any(|s| s.contains("wants the CivitAI key")));
         assert!(skipped.iter().any(|s| s.starts_with("ok: duplicate")));
         assert!(skipped.iter().any(|s| s.contains("needs Invoke 99.0.0")));

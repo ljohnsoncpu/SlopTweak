@@ -126,6 +126,8 @@ pub fn family(civitai_base: &str) -> Option<&'static str> {
         Some("flux")
     } else if b.starts_with("sd 3") {
         Some("sd3")
+    } else if b.starts_with("anima") {
+        Some("anima")
     } else {
         None
     }
@@ -522,6 +524,7 @@ mod tests {
         assert_eq!(family("NoobAI"), Some("sdxl"));
         assert_eq!(family("SD 1.5"), Some("sd1"));
         assert_eq!(family("Flux.1 D"), Some("flux"));
+        assert_eq!(family("Anima"), Some("anima"));
         assert_eq!(family("Wan Video"), None);
     }
 
