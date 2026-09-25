@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SlopTweak</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <header class="bar">
+      <span class="brand">SlopTweak</span>
+      <span id="mode" class="badge" hidden>MOCK</span>
+      <span class="spacer"></span>
+      <span id="costbar" class="costbar"></span>
+      <button id="nav-settings" class="ghost" hidden>Settings</button>
+      <button id="nav-home" class="ghost" hidden>Back</button>
+    </header>
+
+    <main>
+      <!-- First-run wizard; steps are rendered by main.ts -->
+      <section id="view-wizard" class="card wizard" hidden></section>
+
+      <div id="view-home" class="view" hidden>
+        <section id="orphans" class="card warn" hidden></section>
+
+        <section class="card">
+          <div class="row">
+            <label for="model">Model</label>
+            <select id="model"></select>
+          </div>
+          <p id="model-desc" class="muted"></p>
+          <p id="model-license" class="muted small"></p>
+          <p id="lora-summary" class="muted small"></p>
+
+          <p id="estimate" class="estimate muted"></p>
+          <p id="gate" class="notice" hidden></p>
+
+          <div id="status" class="status">
+            <p id="status-text">Ready to start.</p>
+            <div id="progress" class="progress" hidden><div id="progress-fill"></div></div>
+            <p id="status-sub" class="muted"></p>
+          </div>
+
+          <div class="actions">
+            <button id="start" class="primary">Start</button>
+            <button id="open" hidden>Open Invoke</button>
+            <button id="stop" class="danger" hidden>Stop</button>
+            <button id="dismiss" hidden>OK</button>
+          </div>
+        </section>
+
+        <details class="card">
+          <summary>Details</summary>
+          <p id="catalog-info" class="muted small"></p>
+          <pre id="log"></pre>
+        </details>
+      </div>
+
+      <div id="view-settings" class="view" hidden>
+        <section class="card">
+          <h2>Session</h2>
+          <form id="settings-form" class="form">
+            <label for="s-max-dph">Most you'll pay per hour ($)</label>
+            <input id="s-max-dph" type="number" min="0.05" max="5" step="0.01" required />
+            <label for="s-idle">Shut down after this many idle minutes</label>
+            <input id="s-idle" type="number" min="5" max="240" step="1" required />
+            <label for="s-max-hours">Longest session (hours)</label>
+            <input id="s-max-hours" type="number" min="0.5" max="24" step="0.5" required />
+            <label for="s-min-credit">Don't start if Vast credit is below ($)</label>
+            <input id="s-min-credit" type="number" min="0" max="1000" step="0.5" required />
+            <div class="actions">
+              <button type="submit" class="primary">Save</button>
+              <span id="settings-msg" class="muted"></span>
+            </div>
+          </form>
+          <p class="muted small">Changes apply to the next session.</p>
+        </section>
+
+        <section class="card">
+          <h2>Output folder</h2>
+          <p id="out-dir" class="path"></p>
+          <div class="actions">
+            <button id="out-pick">Change…</button>
+            <button id="out-reset" class="ghost">Use the default</button>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>LoRAs</h2>
+          <p class="muted small">
+            Paste a link to a LoRA on CivitAI. It downloads with the model each time you start.
+          </p>
+          <div class="row">
+            <input id="lora-link" type="text" placeholder="https://civitai.com/models/…" spellcheck="false" />
+            <button id="lora-add">Add</button>
+          </div>
+          <p id="lora-msg" class="muted"></p>
+          <div id="lora-list" class="list"></div>
+        </section>
+
+        <section class="card">
+          <h2>Accounts</h2>
+          <div id="accounts"></div>
+          <div class="actions">
+            <button id="rerun-wizard" class="ghost">Run setup again</button>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Model list</h2>
+          <p id="catalog-status" class="muted"></p>
+          <div class="actions">
+            <button id="catalog-refresh">Check for new models</button>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <div id="modal" class="modal" hidden>
+      <div class="dialog">
+        <h2>Shut down the GPU and close?</h2>
+        <p>Closing SlopTweak shuts down the rented GPU so it stops billing.</p>
+        <p id="modal-msg" class="muted"></p>
+        <div class="actions">
+          <button id="modal-cancel">Keep running</button>
+          <button id="modal-ok" class="danger">Shut down and close</button>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

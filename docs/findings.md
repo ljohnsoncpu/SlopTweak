@@ -1,8 +1,8 @@
 # Phase 0 Findings
 
 Status: **complete (2026-09-24).** Docs pass plus a live Vast rental.
-Items 1–5 are verified live. Item 6 (Tauri) is verified from docs only, and
-its $0 local check is deferred to the start of Phase 2.
+Items 1–5 are verified live. Item 6 (Tauri) was verified locally at the
+start of Phase 2.
 
 Markers:
 - ✅ confirmed (docs/source, or **Live** = observed on a real rental)
@@ -41,7 +41,8 @@ failure and destroy.
 `No such container`. The host stopped it before the image ran. It cost
 ~$0.035 before we destroyed it. → Phase 2: treat
 `actual_status=loading` + `intended_status=stopped` as failed and move to
-the next offer, and cap `loading` at ~8 min regardless.
+the next offer, and cap `loading` at ~8 min regardless. (Superseded in
+Phase 2 by the stall-aware check; see "Startup policy".)
 
 ## 2. Instance self-identity and scoped keys ✅ Live
 
@@ -153,17 +154,35 @@ the next offer, and cap `loading` at ~8 min regardless.
   hostname (✅ label write works with the instance key), and the launcher
   reads it via `GET /instances/{id}/`. No extra port needed.
 
-## 6. Tauri 2 remote webview ✅ docs / 🧪 local
+## 6. Tauri 2 remote webview ✅ Local (Phase 2)
 
-- `WebviewWindowBuilder::new(app, "remote", WebviewUrl::External(url))`.
-- Remote origins get no command access unless a capability lists them
-  under `remote.urls`. Give the `remote` window label **no capability**.
-  `__TAURI_INTERNALS__` is still injected, but ACL denies calls. (Advisory
-  GHSA-57fm-592m-34r7, iframe bypass, is fixed.)
-- Cookies: dedicated `data_directory` for the remote window, or
-  `incognito(true)`. `on_navigation` pins the window to the tunnel origin.
-- 🧪 Needs a local check ($0, no rental), but Rust isn't installed on this
-  PC. **First task of Phase 2.**
+- `WebviewWindowBuilder::new(app, "remote-N", WebviewUrl::External(url))`
+  with `.data_directory(<app_local_data>/remote-webview)`,
+  `.on_navigation(|u| u.origin() == tunnel_origin)`, and
+  `.on_new_window(|_, _| NewWindowResponse::Deny)` (all in tauri 2.11.6).
+- App commands are declared in `build.rs` via `AppManifest::commands`, so
+  each one needs an `allow-*` permission. Only `capabilities/main.json`
+  (windows: `["main"]`) grants them. Remote windows match no capability.
+- ✅ **Verified locally** by `app/dev/webview-check.mjs` (21/21). The check
+  runs the real `sidecar.py` on 127.0.0.1 and inspects the remote window
+  over a dev-only CDP port:
+  - `__TAURI_INTERNALS__` is injected, but every call is denied, both app
+    commands (`get_snapshot not allowed on window "remote-0" … allowed on:
+    [windows: "main"]`) and core ones (`window.close not allowed`).
+  - Ticket login → HttpOnly cookie; the ticket is single-use; the cookie
+    survives reload and isn't visible to page JS. Chromium accepts the
+    `Secure` cookie on `http://127.0.0.1`.
+  - `location.href = 'https://example.com/'` is blocked; `window.open` makes
+    no new target.
+  - Separate WebView2 user-data dirs: `%LOCALAPPDATA%\com.sloptweak.launcher\EBWebView`
+    (main) vs `…\remote-webview\EBWebView`.
+- ⚠️ `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` applies to every WebView2
+  environment in the process, so two windows can't each get a debug port
+  that way. Use per-window `additional_browser_args` instead. That's why
+  `main` is created in `setup()` (`"create": false` in the config), with
+  debug-only `SLOPTWEAK_MAIN_DEBUG_PORT` / `SLOPTWEAK_REMOTE_DEBUG_PORT`.
+- PowerShell P/Invoke gotcha (dev scripts only): `$null` passed to a `string`
+  parameter becomes `""`. Use `[NullString]::Value` for `FindWindow`.
 
 ---
 
@@ -223,6 +242,88 @@ Phase 1:
 
 Phase 1 total ~$0.21 (credit $11.766 → $11.553).
 
+## Phase 2 acceptance (2026-09-25) ✅
+
+Driven by `app/dev/vast-acceptance.mjs` (debug build, real Vast, CDP on
+both windows; heartbeat timeout 3 min and max session 60 min for the run).
+**15/15 checks passed.**
+
+| Run | Result |
+| --- | --- |
+| R1 Start → Invoke → Stop | Instance 52531231 (RTX 3060, Connecticut, 2.4 Gbps). Cold host: create → `running` 355 s (image pull + SSH layer), then 159 s to Ready (download 6.94 GB + verify + register): **514 s total**. Invoke (v6.14.1, model registered) visible in the app window; IPC denied from the remote page; **Stop → gone in 5 s**, record cleared. |
+| R2 crash → relaunch | Instance 52532104, **Ready in 130 s** (same machine, image cached: `running` after 15 s). App killed; relaunch showed "A GPU from an earlier session is still running… Reconnect / Shut it down". **Reconnect** reattached (the stored launch secret worked, Invoke visible again). Killed again; relaunch → **Shut it down** → gone, banner cleared. |
+| R3 crash, no relaunch | Instance 52532417. App killed at Ready; **watchdog destroyed it 194 s after the kill** (3 min heartbeat + ≤15 s tick). Relaunch: no orphan, stale record cleared silently. |
+
+Findings from the run:
+- ⚠️ **Slow hosts miss the 8-minute `loading` cap because of the image
+  pull, not because they're dead.** First attempt (min 500 Mbps): three
+  hosts (two on the same KR machine, 560 Mbps; one VN, 868 Mbps) all hit
+  the cap. `status_msg` showed Docker pull progress
+  (`…: Download complete`), not an error. The app destroyed each one and
+  failed cleanly after 3 tries (~$0.007). Fixes (the first fix, a 2 Gbps
+  floor, was reverted per the decision below):
+  - **Stall-aware loading check** (see "Startup policy" below).
+  - A failed attempt now excludes the whole `machine_id`, not only the
+    offer id (one machine lists several offers).
+  - Provisioning logs `actual_status`/`status_msg` changes, so the pull,
+    the SSH layer build, and `running` are visible in the log.
+- The provisioning `status_msg` sequence on a cold host is: layer pulls →
+  apt output from Vast's SSH wrapper build (`#7 DONE 31.8s`) →
+  `Successfully loaded <image>` → `success, running …/ssh`.
+- The offer's `dph_total` excludes storage. The app adds
+  `storage_cost × disk / 730`, and the result matched the instance's
+  `dph_total` to within ~$0.002.
+- Offers carry `machine_id` and `host_id`. There's still no field for
+  "image cached on this host" (🧪 unverified whether one exists).
+
+## Phase 2 rental log (all destroyed; none running)
+
+| Instance | Offer | Outcome |
+| --- | --- | --- |
+| 52527438 | 41437596 (RTX 3060, KR, 560 Mbps) | Loading cap (slow image pull); destroyed by the app |
+| 52528249 | 41678963 (same KR machine) | Loading cap; destroyed by the app |
+| 52529084 | 52063421 (RTX 2060, VN, 868 Mbps) | Loading cap; destroyed by the app → session Failed after 3 tries |
+| 52531231 | 47594081 (RTX 3060, US-CT, 2.4 Gbps) | R1 passed; destroyed by Stop |
+| 52532104 | 47594081 | R2 passed; destroyed via orphan "Shut it down" |
+| 52532417 | 47594090 (same machine) | R3 passed; self-destroyed by the watchdog |
+| 52590528 | 51832512 (GTX TITAN X, 500 Mbps floor) | Startup-policy re-test: 634 s loading (past the old 8-min cap, progressing), Ready at **896 s**; R1 checks passed; destroyed by Stop |
+
+Phase 2 total **~$0.124** (credit $11.5389 → $11.4149; late charges may
+post).
+
+## Startup policy (user decision, 2026-09-25)
+
+The user prefers cheap to fast: **up to 15 minutes to start is fine**, and
+the app shouldn't over-filter on link speed.
+- `min_inet_down_mbps` is back to **500**.
+- The fixed 8-minute `loading` cap is replaced by:
+  - **stall**: fail if `actual_status`/`status_msg` hasn't changed for
+    **5 min**. Dead hosts are silent, while pulling hosts update every few
+    seconds. This still catches the Phase 1 dead-host case.
+  - **hard cap**: 12 min of `loading`. This leaves about 3 min of the
+    15-minute per-attempt budget for download, verify, and register (159 s
+    on a 2.4 Gbps host, 262 s on the slow host).
+  - Unchanged: `Error response from daemon`, and loading with
+    `intended_status=stopped`, fail immediately.
+- Re-tested live on the cheapest pick, a GTX TITAN X at $0.0626/hr: Ready
+  at 14.9 min, which is inside the budget but only just. On a similar host,
+  a retry would push the total past 15 min.
+- **GPU architecture floor** `min_compute_cap = 750` (Turing / RTX 20-series
+  and newer, Vast units). Without it, the cheapest pick was Maxwell
+  (compute 5.2). The pinned image uses **torch 2.7.1+cu128** (Invoke
+  v6.14.1 `pyproject.toml`). That probably still runs sm_5x, but SDXL is
+  slow there, and torch 2.8+ drops Maxwell/Pascal. With the floor, 54
+  offers still qualify; the cheapest was an RTX 2060 at $0.062/hr.
+  (🧪 Unverified: whether generation works on sm_52 with this image.
+  Invoke logs to a file, not the container log, so `request_logs` didn't
+  show the device.)
+- Faster startup, if we want it later: hosts with the image cached reach
+  `running` in ~15 s instead of 6–10 min. There's no known offer field for
+  that; a per-machine "was fast before" memory is one option.
+- Dev harness note: `webview-check.mjs` flaked twice, right after a
+  rebuild or the mock-UI run (cold WebView2 start), then passed 6 runs in a
+  row.
+
 ## Decisions (user, 2026-09-24)
 
 - **§9.1 watchdog credential → `CONTAINER_API_KEY`** (condition met: proven
@@ -242,11 +343,138 @@ Phase 1 total ~$0.21 (credit $11.766 → $11.553).
   allows use on rented GPUs. The user's link was on civitai.red, which
   serves the same model data as civitai.com; the catalog uses civitai.com
   URLs.
-- **§9.5 app name → SlopTweak.** GitHub org/repo not chosen yet; needed
-  before the catalog URL is hard-coded (Phase 3), not before.
+- **§9.5 app name → SlopTweak.** Repo `ljohnsoncpu/SlopTweak`; catalog URL
+  decided 2026-09-25 (see Phase 3).
 - **§9.6 signing → deferred to Phase 5.** It doesn't block anything
   earlier.
 
+## Phase 3 findings (2026-09-25)
+
+- **Catalog URL (user decision):** raw `main` of this repo,
+  `https://raw.githubusercontent.com/ljohnsoncpu/SlopTweak/main/catalog/catalog.json`
+  (200 live). Fetched on launch (10 s timeout, 1 MB cap), validated, cached
+  in `%LOCALAPPDATA%\com.sloptweak.launcher\catalog-cache.json`; falls back
+  to the cache, then to the bundled copy. GitHub's CDN caches raw files for
+  ~5 min, so an upstream edit can take that long to show up.
+- ⚠️ **Divergence from PLAN §4 schema:** `files[].sha256` and `size_bytes`
+  are **required**, not optional. provision.sh verifies both, and CivitAI
+  supplies them. The app also skips (and reports) entries that point the
+  CivitAI key at a non-civitai.com URL, have unsafe file names, lack a
+  `main` file, or need a newer Invoke (`invoke_min_version` > 6.14.1).
+- **CivitAI key check ✅ Live:** `GET https://civitai.com/api/v1/me` with
+  `Authorization: Bearer` → 200 `{id, username, email, tokenScope, …}`; bad
+  or missing key → 401 `{"error":"Unauthorized"}`. The app keeps only
+  `username` (the reply includes the email).
+- **LoRA metadata ✅ Live:** `GET /api/v1/model-versions/{id}` is public and
+  has `model.type` (`LORA`), `baseModel` ("SDXL 1.0", "Illustrious", …),
+  `trainedWords`, and `files[]` with `hashes.SHA256`, `sizeKB`,
+  `downloadUrl`, `primary`, `metadata.format`. **`sizeKB × 1024` is the
+  exact byte count** (Detail Tweaker XL: 223097.9921875 → 228,452,344,
+  matching a ranged GET's `Content-Range`). So LoRAs go through the
+  existing download + size + SHA-256 path in provision.sh unchanged, and
+  the instance asset bundle didn't need a new release.
+  `GET /api/v1/models/{id}` → `modelVersions[0]` is the newest version.
+  Downloads 307-redirect to a presigned R2 URL (HEAD on it → 403, so use a
+  ranged GET to probe sizes). Only `.safetensors` LoRAs are accepted.
+- A LoRA that fails to download, verify, or register ends the session
+  instead of retrying on another GPU (it would fail the same way and cost
+  money); the message tells the user to turn it off in Settings.
+- **Vast deep links:** `https://cloud.vast.ai/` (sign up),
+  `https://cloud.vast.ai/billing/` (Add Credit), and
+  `https://cloud.vast.ai/manage-keys/` (API keys, from the Vast quickstart
+  docs). Logged out, all of them redirect to `/create/`. Vast's minimum
+  deposit is **$5**, and email verification is required before renting.
+  CivitAI: `https://civitai.com/login` and `https://civitai.com/user/account`
+  (API Keys section).
+- Low-balance gate: default floor **$1.00** (Settings). Start is refused
+  below it (checked in Rust, not only the UI). The home screen warns when
+  credit − download < 1 h at the cheapest offer's price. The cost bar
+  counts from instance **creation** (billing starts then, not at Ready),
+  refreshes credit every 3 min, and also shows in the Invoke window's
+  title, since that window can't show app UI.
+- **Mock mode is isolated:** Credential Manager service `SlopTweak-mock`
+  and `…\mock` folders, so mock checks never touch real keys or settings.
+  (Before this, a mock-mode key check would have overwritten the real
+  CivitAI key.)
+- Dev harness: launching the app before vite is serving leaves the main
+  window blank (main.ts never runs); the scripts wait for vite first.
+
+- **Reliability floor → 99% (user decision, 2026-09-25)**, up from 98%.
+  Live that day: 53 offers passed at 0.99 vs 58 at 0.98. The cheapest
+  stayed at ~$0.061/hr (RTX 3060, PL, 0.999), so it costs almost nothing.
+
+## Phase 3 acceptance (2026-09-25) ✅
+
+`app/dev/fresh-profile-acceptance.mjs`, debug build, real Vast.
+**Approximation of "fresh Windows user profile":** the app's Credential
+Manager entries (`*.SlopTweak`) and its whole `%APPDATA%` and
+`%LOCALAPPDATA%` folders (settings, catalog cache, both WebView2 profiles)
+were deleted. The user's Windows profile itself wasn't new, and "install"
+was the debug exe, not the NSIS installer.
+
+| Step | Result |
+| --- | --- |
+| Wiped profile → launch | wizard shown, no keys stored ✅ |
+| User pasted both keys in the wizard (checked on paste) | both stored ✅; catalog fetched from GitHub (`online`) ✅ |
+| Add LoRA from a CivitAI link (Detail Tweaker XL) | real metadata, 228,452,344 B ✅ |
+| Start (run 1, old build) | 3 attempts all dropped by the 5-min stall rule (see below); run stopped, all destroyed |
+| Start (run 2, `--keep-profile`, 99% floor + pull-aware stall) | TH RTX 3060 and NV RTX 2080 Ti hit the 12-min loading cap; KR RTX 2060 (image cached from run 1) `running` in 26 s, **Ready 642 s after create (10.7 min)** ✅ |
+| Invoke registered model **and LoRA** | `main:bananaSplitzXXL_121`, `lora:add-detail-xl` ✅ |
+| First image (user prompt "A potted plant on a desk") | ✅ 1024² |
+| Cost bar | `$0.063/hr · 24 min · ≈$0.05 so far · $11.35 left` ✅ |
+| Stop | instance destroyed ✅ |
+| App restart | keys still there, no wizard ✅; the stale record from the killed run 1 was cleared on launch ✅ |
+
+Run 2: 9/9 checks. Both runs: credit $11.4149 → $11.3444 (~$0.07).
+
+Findings from the run:
+- ⚠️ **Cold image pulls are the startup bottleneck, and `status_msg`
+  goes silent while they unpack.** On four cold hosts (KR 2060 ×2, KR
+  3060, TH 3060, NV 2080 Ti) `status_msg` froze for 5–10+ min after the
+  last `…: Download complete`/`Pull complete`. The 5-min stall rule killed
+  working hosts, so it now allows 10 min once Docker pull output has been
+  seen (dead hosts show an empty `status_msg` and keep 5 min). The 12-min
+  cap still applies.
+- **A host with the image cached starts in ~30 s.** Failed attempts leave
+  the image cached on the host.
+- **Host floor raised (user decision, 2026-09-25):** `inet_down ≥ 2000`
+  Mbps (was 500) and a new `disk_bw ≥ 2000` MB/s (Vast `disk_bw` is in the
+  offer). Price barely predicts speed. Live median `disk_bw` was 1,754 MB/s
+  under $0.10/hr vs ~2,200–3,000 above, and median `inet_down` was ~900
+  Mbps in every price band. So filter on specs, not price. 25 of 150
+  offers passed both; the cheapest was ~$0.083/hr (+$0.02 over the
+  cheapest overall). Live estimate after the change: RTX 3060,
+  $0.107/hr incl. storage.
+- **Machine memory (user decision):** `machines.json` in app data. Skip a
+  machine for 7 days after it fails (unless it has worked since). Prefer a
+  machine that reached Ready before when its expected session cost is
+  within $0.05 of the cheapest. Stops, bad LoRAs, and key errors aren't
+  counted against the machine.
+- ⚠️ **Phase 2 bug fixed:** provision.sh reports `progress` as a fraction
+  (0–1); the app treated it as percent, so the download bar showed 0% on
+  real Vast. The sidecar client now converts it.
+- The 7 GB CivitAI download on the 589 Mbps KR host took ~6 min (vs ~1 min
+  on 2+ Gbps hosts), which is another reason for the link floor.
+- Dev harness: killing the app mid-run left the old script retrying
+  instead of cleaning up; it now aborts when the app exits. Instance
+  52605435 was destroyed by hand via the API.
+
+## Phase 3 rental log (all destroyed; none running)
+
+| Instance | Offer | Outcome |
+| --- | --- | --- |
+| 52603419 | 35050679 (RTX 2060, KR) | Run 1: stall rule after `Pull complete`; destroyed by the app |
+| 52604442 | 49698940 (RTX 2060, KR) | Run 1: same; destroyed by the app |
+| 52605435 | 41437590 (RTX 3060, KR) | Run 1: stopped for the rebuild; destroyed via API |
+| 52606728 | 51708220 (RTX 3060, TH) | Run 2: 12-min loading cap; destroyed by the app |
+| 52607839 | 49623260 (RTX 2080 Ti, NV) | Run 2: 12-min loading cap; destroyed by the app |
+| 52609457 | 35050679 (RTX 2060, KR, image cached) | Run 2: **acceptance passed**; destroyed by Stop |
+
+Phase 3 total **~$0.07** (credit $11.4149 → $11.3444; late charges may post).
+
 ## Still open
 
-- GitHub org/repo for releases and `catalog.json` (needed by Phase 3).
+- Wizard screenshots of the logged-in Vast/CivitAI pages (Claude in Chrome
+  wasn't connected during Phase 3). Drop PNGs into `app/src/wizard/`
+  (`vast-signup`, `vast-billing`, `vast-keys`, `civitai-signup`,
+  `civitai-keys`); the wizard shows them automatically.
