@@ -13,10 +13,38 @@ use crate::provider::{offers::CostInputs, LaunchSpec, OfferQuery, LABEL};
 
 /// Official InvokeAI image, pinned by digest (findings §3; never below 6.13.8).
 pub const IMAGE: &str = "ghcr.io/invoke-ai/invokeai:v6.14.1-cuda@sha256:39a7e3b182c4646634d62cf3ebdefd2082573ae20cdba773f9703fee29e600dd";
-/// Instance asset bundle (provision.sh, sidecar.py, requirements.txt).
-pub const ASSETS_URL: &str =
-    "https://github.com/ljohnsoncpu/SlopTweak/releases/download/instance-v0.1.0/instance-assets.tar.gz";
+/// Instance asset bundle (provision.sh, sidecar.py, requirements.txt),
+/// published by the release workflow to this app version's own release. CI
+/// rebuilds the bundle and refuses to release if its hash isn't
+/// [`ASSETS_SHA256`]. Debug builds use [`assets_url`]'s dev default.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+pub const ASSETS_URL: &str = concat!(
+    "https://github.com/ljohnsoncpu/SlopTweak/releases/download/v",
+    env!("CARGO_PKG_VERSION"),
+    "/instance-assets.tar.gz"
+);
 pub const ASSETS_SHA256: &str = "2ff1ecf68f2766a2c75b16e069670b8caca64405195313fd4439b1d619693811";
+/// Debug builds of a version that has no release yet fetch the same bytes
+/// from the Phase 1 pre-release; `SLOPTWEAK_DEV_ASSETS_URL` overrides it
+/// (the instance still checks [`ASSETS_SHA256`]).
+#[cfg(debug_assertions)]
+const DEV_ASSETS_URL: &str =
+    "https://github.com/ljohnsoncpu/SlopTweak/releases/download/instance-v0.1.0/instance-assets.tar.gz";
+
+/// Where instances fetch the bundle from.
+pub fn assets_url() -> String {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("SLOPTWEAK_DEV_ASSETS_URL")
+            .ok()
+            .filter(|u| u.starts_with("https://"))
+            .unwrap_or_else(|| DEV_ASSETS_URL.to_string())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        ASSETS_URL.to_string()
+    }
+}
 /// Vast limit on `onstart` (findings §1).
 pub const ONSTART_LIMIT: usize = 4048;
 /// Invoke version in [`IMAGE`]; catalog entries needing newer are skipped.
@@ -266,7 +294,7 @@ pub fn launch_spec(
             "MAX_SESSION_MINUTES".to_string(),
             s.max_session_minutes.to_string(),
         ),
-        ("SLOPTWEAK_ASSETS_URL".to_string(), ASSETS_URL.to_string()),
+        ("SLOPTWEAK_ASSETS_URL".to_string(), assets_url()),
         (
             "SLOPTWEAK_ASSETS_SHA256".to_string(),
             ASSETS_SHA256.to_string(),
@@ -302,6 +330,15 @@ mod tests {
         assert!(IMAGE.contains("-cuda@sha256:"));
         assert!(IMAGE.contains(&format!(":v{INVOKE_VERSION}-cuda@")));
         assert_eq!(ASSETS_SHA256.len(), 64);
+        assert!(ASSETS_SHA256.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn assets_come_from_this_versions_release() {
+        let tag = format!("/releases/download/v{}/", env!("CARGO_PKG_VERSION"));
+        assert!(ASSETS_URL.starts_with("https://github.com/ljohnsoncpu/SlopTweak/"));
+        assert!(ASSETS_URL.contains(&tag), "{ASSETS_URL}");
+        assert!(assets_url().starts_with("https://"));
     }
 
     fn lora(id: u64, base: &str, filename: &str) -> Lora {

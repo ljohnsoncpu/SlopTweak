@@ -177,6 +177,47 @@ fn name(s: &SessionState) -> &'static str {
     }
 }
 
+/// One line for the diagnostics history: set when the state kind changes,
+/// or a provisioning attempt moves to a new instance or setup stage (not on
+/// every progress tick). Not redacted; callers redact.
+pub fn history_entry(old: &SessionState, new: &SessionState) -> Option<String> {
+    use SessionState as S;
+    let describe = |s: &SessionState| match s {
+        S::Idle { notice: None } => "Idle".to_string(),
+        S::Idle { notice: Some(n) } => format!("Idle (notice: {n})"),
+        S::Renting {
+            attempt,
+            max_attempts,
+            offer,
+        } => match offer {
+            Some(o) => format!(
+                "Renting attempt {attempt}/{max_attempts}: offer {} {} ${:.4}/hr",
+                o.offer_id, o.gpu_name, o.hourly
+            ),
+            None => format!("Renting attempt {attempt}/{max_attempts}"),
+        },
+        S::Provisioning {
+            attempt,
+            instance_id,
+            stage,
+            ..
+        } => format!(
+            "Provisioning attempt {attempt}: instance {instance_id} stage {}",
+            stage.as_deref().unwrap_or("-")
+        ),
+        S::Ready {
+            instance_id, offer, ..
+        } => format!("Ready: instance {instance_id} {}", offer.gpu_name),
+        S::Stopping { instance_id } => match instance_id {
+            Some(id) => format!("Stopping instance {id}"),
+            None => "Stopping".to_string(),
+        },
+        S::Failed { reason } => format!("Failed: {reason}"),
+    };
+    let (a, b) = (describe(old), describe(new));
+    (a != b).then(|| format!("{} -> {b}", name(old)))
+}
+
 pub fn next(state: &SessionState, event: &Event) -> Result<SessionState, InvalidTransition> {
     use Event as E;
     use SessionState as S;
@@ -420,6 +461,8 @@ struct Inner {
     active: Option<Active>,
     task: Option<JoinHandle<()>>,
     log: VecDeque<String>,
+    /// State and stage changes, for diagnostics (already redacted).
+    history: VecDeque<String>,
     /// Output sync for the Ready instance, and its polling task.
     sync: Option<Arc<AsyncMutex<OutputSync>>>,
     sync_task: Option<JoinHandle<()>>,
@@ -446,6 +489,7 @@ pub struct SessionManager {
 }
 
 const LOG_LINES: usize = 300;
+const HISTORY_LINES: usize = 200;
 
 pub fn new_launch_secret() -> String {
     let mut bytes = [0u8; 32];
@@ -492,6 +536,7 @@ impl SessionManager {
                 active: None,
                 task: None,
                 log: VecDeque::new(),
+                history: VecDeque::new(),
                 sync: None,
                 sync_task: None,
                 sync_report: None,
@@ -537,6 +582,21 @@ impl SessionManager {
         self.inner.lock().unwrap().log.iter().cloned().collect()
     }
 
+    /// State machine and setup-stage history, oldest first.
+    pub fn history(&self) -> Vec<String> {
+        self.inner.lock().unwrap().history.iter().cloned().collect()
+    }
+
+    /// The launch secret of the current instance, so diagnostics can mask it.
+    pub fn active_secret(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .active
+            .as_ref()
+            .map(|a| a.secret.clone())
+    }
+
     /// When the current instance started billing, if there is one.
     pub fn billing_since(&self) -> Option<u64> {
         let inner = self.inner.lock().unwrap();
@@ -578,6 +638,15 @@ impl SessionManager {
             let mut inner = self.inner.lock().unwrap();
             match next(&inner.state, &ev) {
                 Ok(s) => {
+                    if let Some(entry) = history_entry(&inner.state, &s) {
+                        let known: Vec<&str> =
+                            inner.active.iter().map(|a| a.secret.as_str()).collect();
+                        let line = format!("{} {}", now_unix(), redact(&entry, &known));
+                        if inner.history.len() >= HISTORY_LINES {
+                            inner.history.pop_front();
+                        }
+                        inner.history.push_back(line);
+                    }
                     inner.state = s.clone();
                     s
                 }

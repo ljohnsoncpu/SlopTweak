@@ -34,8 +34,10 @@ so the retry and failure paths can be seen in the UI.
 | `remote.rs` | The isolated Invoke window, plus the injected tutorial overlay (`tutorial.js`, `assets/tutorial-sample.jpg`) |
 | `secrets.rs` | Credential Manager via `keyring` |
 | `persist.rs` | Active-instance record for crash recovery |
-| `redact.rs` | Secret redaction for logs |
-| `config.rs` | Pinned image/assets, settings (user-editable subset saved to settings.json), LoRA merge, create-call spec |
+| `redact.rs` | Secret redaction for logs and diagnostics |
+| `diagnostics.rs` | "Copy diagnostics" report (version, state history, log, settings), redacted as a whole |
+| `updater.rs` | Update rules (no install while a GPU runs); the plugin is driven from `lib.rs` commands only |
+| `config.rs` | Pinned image and instance assets (this version's release URL + SHA-256), settings (user-editable subset saved to settings.json), LoRA merge, create-call spec |
 | `catalog.rs` | Catalog fetch from GitHub, validation, cache, bundled fallback |
 | `civitai.rs` | CivitAI key check (`/me`) and LoRA links → verified file metadata |
 | `cost.rs` | Low-balance gate and cost bar (pure) |
@@ -52,6 +54,8 @@ so the retry and failure paths can be seen in the UI.
 | `SLOPTWEAK_MAIN_DEBUG_PORT`, `SLOPTWEAK_REMOTE_DEBUG_PORT` | CDP port for the main / remote window |
 | `SLOPTWEAK_DEV_REMOTE_URL` | Open the remote window at this URL on startup |
 | `SLOPTWEAK_MOCK_IMAGES=N` | Mock mode: after Ready, the fake sidecar makes N gallery images (one per 3 s) plus Canvas tries and scratch intermediates |
+| `SLOPTWEAK_MOCK_UPDATE=<version>` | Mock mode: pretend that version is released (update banner, install is a no-op) |
+| `SLOPTWEAK_DEV_ASSETS_URL` | Where instances fetch the asset bundle (default: the `instance-v0.1.0` pre-release, same bytes as the pin). Release builds always use `releases/download/v<version>/` |
 | `SLOPTWEAK_MOCK_SIDECAR=http` + `SLOPTWEAK_DEV_LAUNCH_SECRET` | Mock mode: talk to a real `sidecar.py` at `SLOPTWEAK_MOCK_REMOTE` with this fixed launch secret (`dev/sync-check.mjs`) |
 
 Mock mode saves its fake images to `%LOCALAPPDATA%\com.sloptweak.launcher\mock\output`,
@@ -65,8 +69,10 @@ not to Pictures.
   auto-advance, Done recorded, re-open), sync while running, and images made
   right before Stop on disk after it.
 - `mock-ui-check.mjs`: $0. Wizard, estimate, low-balance gate, settings, LoRAs,
-  upstream catalog edit (local server), restart persistence, cost bar,
-  close-to-destroy. All against the mock.
+  upstream catalog edit (local server), restart persistence, cost bar, update
+  offer, Copy diagnostics (redaction, clipboard), close-to-destroy. All against
+  the mock. `GUIDE_SHOTS=1` hides the MOCK badge for `docs/images/`. It
+  overwrites the clipboard.
 - `vast-acceptance.mjs`: **spends money.** Phase 2 acceptance on real Vast.
   Destroys everything it creates in `finally`.
 - `fresh-profile-acceptance.mjs`: **spends money, and wipes this app's real
@@ -80,6 +86,15 @@ not to Pictures.
 
 All scripts refuse to run if :1420 serves another checkout's UI (a vite left
 running elsewhere keeps the port despite `--strictPort`).
+
+## Updates and releases
+
+`tauri-plugin-updater` checks
+`https://github.com/ljohnsoncpu/SlopTweak/releases/latest/download/latest.json`
+3 s after launch (Vast mode). The installer's minisign signature is checked
+against `plugins.updater.pubkey`. No window has an updater or clipboard
+capability; `check_update`, `install_update`, and `copy_diagnostics` are app
+commands. Release process: [docs/releasing.md](../docs/releasing.md).
 
 ## Wizard screenshots
 

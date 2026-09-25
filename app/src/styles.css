@@ -367,3 +367,11 @@ button.link.primary-link {
 .sync.warn {
   color: var(--danger);
 }
+
+.notice-card {
+  border-left: 4px solid var(--accent);
+}
+
+.notice-card p {
+  margin: 0 0 8px;
+}

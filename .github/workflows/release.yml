@@ -1,0 +1,222 @@
+# Build, sign, and draft a GitHub Release for SlopTweak.
+#
+# Push a tag vX.Y.Z (matching the app version) to build a DRAFT release; a
+# maintainer reviews and publishes it by hand. "Run workflow" (dispatch) is
+# a dry run: same build, files kept as workflow artifacts, no release.
+#
+# Order matters: the app exe is code-signed before it is packed into the
+# NSIS installer, the installer is code-signed after, and the updater
+# signature is made last, over the final installer bytes.
+#
+# Secrets (Settings > Secrets and variables > Actions):
+#   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD  updater key (required)
+#   SIGNPATH_API_TOKEN                                             code signing (once approved)
+# Variables:
+#   SIGNPATH_ORGANIZATION_ID   empty = skip code signing (unsigned build)
+#   SIGNPATH_PROJECT_SLUG, SIGNPATH_POLICY_SLUG
+#   (artifact configurations: see .signpath/README.md)
+
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: write # create the draft release (tag builds only)
+      actions: read # SignPath reads the uploaded artifacts
+    env:
+      SIGN: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+      RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Version
+        id: version
+        run: |
+          if [ "$RELEASE" = "true" ]; then
+            v=$(python .github/scripts/release_files.py check-version "$GITHUB_REF_NAME")
+          else
+            v=$(python -c "import json;print(json.load(open('app/src-tauri/tauri.conf.json'))['version'])")
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Building SlopTweak $v (release=$RELEASE, code signing=$SIGN)"
+
+      - name: Instance assets (must match the hash the app pins)
+        run: python instance/build_assets.py --check-pin --out out/instance-assets.tar.gz
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Install JS deps
+        working-directory: app
+        run: npm ci
+
+      - name: Tests
+        working-directory: app/src-tauri
+        run: cargo test --locked
+
+      - name: Build app (no installer yet)
+        working-directory: app
+        run: npx tauri build --no-bundle -- --locked
+
+      # ---- code signing, pass 1: the app exe -----------------------------------
+      - name: Upload unsigned exe
+        id: exe-unsigned
+        if: env.SIGN == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: exe-unsigned
+          path: app/src-tauri/target/release/sloptweak.exe
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Sign exe (SignPath)
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          artifact-configuration-slug: app-exe
+          github-artifact-id: ${{ steps.exe-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: out/signed-exe
+
+      - name: Use signed exe
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature out/signed-exe/sloptweak.exe
+          if ($sig.Status -ne 'Valid') { throw "exe signature: $($sig.Status)" }
+          Copy-Item out/signed-exe/sloptweak.exe app/src-tauri/target/release/sloptweak.exe -Force
+
+      # ---- installer --------------------------------------------------------------
+      - name: Bundle NSIS installer
+        working-directory: app
+        run: |
+          before=$(sha256sum src-tauri/target/release/sloptweak.exe)
+          npx tauri bundle --bundles nsis
+          after=$(sha256sum src-tauri/target/release/sloptweak.exe)
+          # `tauri bundle` must package the exe we signed, not rebuild it.
+          [ "$before" = "$after" ] || { echo "exe changed during bundling"; exit 1; }
+          f=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe)
+          mkdir -p ../out/installer && cp "$f" ../out/installer/
+
+      # ---- code signing, pass 2: the installer ---------------------------------
+      - name: Upload unsigned installer
+        id: setup-unsigned
+        if: env.SIGN == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: setup-unsigned
+          path: out/installer/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Sign installer (SignPath)
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          artifact-configuration-slug: installer
+          github-artifact-id: ${{ steps.setup-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: out/signed-installer
+
+      - name: Use signed installer
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: |
+          $f = Get-ChildItem out/signed-installer/*-setup.exe | Select-Object -First 1
+          $sig = Get-AuthenticodeSignature $f.FullName
+          if ($sig.Status -ne 'Valid') { throw "installer signature: $($sig.Status)" }
+          Copy-Item $f.FullName out/installer/ -Force
+
+      # ---- updater signature (over the final installer) ----------------------------
+      - name: Updater signature and manifest
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set"; exit 1
+          fi
+          f=$(ls ../out/installer/*-setup.exe)
+          npx tauri signer sign "$f" > /dev/null
+          python ../.github/scripts/release_files.py latest-json \
+            --version "$VERSION" --installer "$f" --signature "$f.sig" \
+            --notes "SlopTweak $VERSION. See the release page for details." \
+            --out ../out/latest.json
+          cd ../out
+          python ../.github/scripts/release_files.py sha256sums \
+            installer/*-setup.exe instance-assets.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Keep files (dry run)
+        if: env.RELEASE != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sloptweak-${{ steps.version.outputs.version }}-dry-run
+          path: |
+            out/installer/
+            out/latest.json
+            out/SHA256SUMS.txt
+            out/instance-assets.tar.gz
+          retention-days: 7
+
+      - name: Draft release
+        if: env.RELEASE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          signed="Code-signed via SignPath Foundation."
+          [ "$SIGN" = "true" ] || signed="**Not code-signed yet**: Windows SmartScreen will warn (More info > Run anyway)."
+          {
+            echo "SlopTweak $VERSION for Windows 10/11 (x64)."
+            echo
+            echo "Download **$(basename out/installer/*-setup.exe)** and run it. $signed"
+            echo
+            echo "SHA-256:"
+            echo '```'
+            cat out/SHA256SUMS.txt
+            echo '```'
+          } > out/notes.md
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "SlopTweak $VERSION" --notes-file out/notes.md \
+            out/installer/*-setup.exe out/installer/*-setup.exe.sig \
+            out/latest.json out/instance-assets.tar.gz out/SHA256SUMS.txt

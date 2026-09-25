@@ -664,6 +664,112 @@ Dev harness notes:
 
 Phase 4 total **~$0.084** (credit $11.2925 → $11.2089; late charges may post).
 
+## Phase 5 findings (2026-09-25)
+
+### Decisions (user, 2026-09-25)
+
+- **Updater key → GitHub Actions secrets** `TAURI_SIGNING_PRIVATE_KEY` /
+  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, plus the user's offline backup. Generated
+  locally (never printed), outside the repo; only the public key is committed
+  (`tauri.conf.json` → `plugins.updater.pubkey`, key id `36F5919E71F882FB`).
+- **Wizard screenshots of Vast/CivitAI → ship without them** (the wizard keeps
+  its text steps; the slots in `app/src/wizard/` stay optional). The user guide
+  uses screenshots of SlopTweak itself from the mock run.
+- **First release → v0.2.0**, unsigned. Asked again before any tag or publish.
+- Code signing, per the Phase 5 brief: SignPath Foundation only (see
+  Decisions §9.6); the application is the user's to submit.
+
+### Verified
+
+- ✅ **Local updater end to end (0.2.0 → 0.2.1, release builds, $0).** Both
+  built like CI (`tauri build --no-bundle` then `tauri bundle --bundles nsis`),
+  with only the endpoint overridden (`--config`) to `http://127.0.0.1:8765` +
+  `dangerousInsecureTransportProtocol`. 0.2.1's installer was signed with the
+  real updater key; `latest.json` came from `.github/scripts/release_files.py`.
+  Installed 0.2.0 silently, launched it, and clicked **Update now** via UI
+  Automation: the banner said "SlopTweak 0.2.1 is available (you have 0.2.0)",
+  the installer downloaded, 0.2.0 exited 0, the passive NSIS installer ran with
+  no prompts (a progress window only), and **0.2.1 was installed and relaunched
+  within ~9 s** (it re-checked `latest.json` at +9 s and offered nothing).
+  Registry `DisplayVersion` 0.2.1. Test install removed afterwards. What's
+  **not** verified yet: the real GitHub endpoint (needs two published releases)
+  and SmartScreen on a signed build.
+- ✅ `tauri bundle` does **not** rebuild the exe (hash unchanged across the
+  bundle step), so a SignPath-signed exe can be swapped in between
+  `build --no-bundle` and `bundle`. release.yml asserts this on every run.
+- The release exe's version resource: `ProductName SlopTweak`,
+  `FileDescription SlopTweak`; `CompanyName` was the crate name (`sloptweak`),
+  now `bundle.publisher` = "The SlopTweak contributors" (also the uninstall
+  entry's Publisher). Installer 3.9 MB, per-user install to
+  `%LOCALAPPDATA%\SlopTweak`, no UAC.
+- ✅ The updater's `latest/download` URL skips drafts **and pre-releases**, so
+  releases meant for auto-update must be published as normal releases.
+- The instance asset bundle is reproducible (rebuild = pinned
+  `2ff1ecf6…3811`). The app now pins
+  `releases/download/v<app version>/instance-assets.tar.gz`; release.yml
+  rebuilds it and fails unless the hash equals `ASSETS_SHA256`
+  (`build_assets.py --check-pin`, also in CI). Debug builds default to the
+  `instance-v0.1.0` pre-release (same bytes), since `vX.Y.Z` doesn't exist
+  until it's published. ⚠️ Consequence: a draft release's files aren't public,
+  so a release build can only start a GPU after its release is published. The
+  runbook does one ~$0.05 real session right after publishing.
+- Git Bash rewrites `/S` into a path (`S:/`), so the NSIS silent switch must be
+  passed from PowerShell or cmd.
+- `navigator.clipboard.writeText` failed in the WebView2 main window when it
+  wasn't focused (CDP-driven). Copy diagnostics writes the clipboard from Rust
+  (`tauri-plugin-clipboard-manager`) instead; the UI falls back to selecting
+  the text.
+- The updater and clipboard plugins add JS commands, but no capability grants
+  them: webview-check now asserts `plugin:updater|check` and
+  `plugin:clipboard-manager|read_text/write_text` are denied from the Invoke
+  window, as are `copy_diagnostics` and `install_update` (26/26).
+- SignPath: action `signpath/github-action-submit-signing-request@v3`
+  (`f6d0478…`); input `github-artifact-id` comes from
+  `actions/upload-artifact`'s `artifact-id`. Artifacts are zips, so the artifact
+  configurations use `<zip-file>` roots (`.signpath/`). The Foundation's terms
+  require a "Code signing policy" on the homepage with the exact line "Free code
+  signing provided by SignPath.io, certificate by SignPath Foundation", team
+  roles, a privacy statement, MFA, manual approval per release, and "already
+  released in signed form" (🧪 probably means "released"; ask SignPath).
+  signpath.org/apply renders its form with JS; field list not seen.
+
+### As built
+
+- **Copy diagnostics** (`diagnostics.rs`): app version, mode, OS, WebView2
+  version, pinned image/asset hashes (shortened), key presence (stored/missing
+  only), credit, state, the active-instance record, sync report, settings
+  summary, catalog status, the state-machine **history** (new: every state-kind
+  change and setup-stage change, stamped, max 200), and the log (max 300).
+  The whole text goes through `redact` with every secret the app holds (Vast
+  key, CivitAI key, current and recorded launch secrets) plus the shape
+  patterns, and the home folder becomes `%USERPROFILE%` (case-insensitive,
+  either slash, Unicode-safe). Unit tests cover known and unknown secrets, the
+  user-name masking, and that useful facts survive. It's on the clipboard, and
+  never sent anywhere.
+- **Updates:** check 3 s after launch (Vast mode); a banner on the home screen
+  (Update now / What's new / Later); **Settings → About and help** shows the
+  version and has Check for updates. Install is refused while a session is
+  active (in Rust and the UI), because the NSIS installer kills the process
+  and would skip the last image sync and the destroy.
+- **CI** (`.github/workflows/ci.yml`, $0): Rust fmt/clippy/test and TS build on
+  Windows; ruff/mypy/pytest, shellcheck, and the asset-pin check on Ubuntu.
+- **Release** (`release.yml`): tag `vX.Y.Z` → draft release; manual dispatch =
+  dry run with artifacts only. Version fields must match the tag. Actions are
+  pinned by SHA.
+
+### Acceptance status (PLAN §4 Phase 5)
+
+| Criterion | Status |
+| --- | --- |
+| Signed installer installs without a SmartScreen block | ⏳ Blocked on SignPath approval. ⚠️ Known risk: even signed, a new OV certificate builds SmartScreen reputation over downloads, so early installs may still warn. |
+| Auto-update works from vN to vN+1 | ✅ locally with release builds (above); ⏳ the real GitHub path needs two published releases |
+| Beta users complete a session unassisted | ⏳ the user runs it; kit in `docs/beta.md` |
+
+$0 checks at this point: `cargo test` 127 passed (117 + 10 new); clippy -D warnings clean
+(debug and release); mock-ui-check 65/65; webview-check 26/26; sync-check
+18/18; instance pytest 25 + release-script tests 4; ruff/mypy clean. No Vast
+spend in Phase 5 so far.
+
 ## Still open
 
 - ~~Live upstream catalog edit~~ **done (2026-09-25).** Merging PR #3
@@ -673,7 +779,9 @@ Phase 4 total **~$0.084** (credit $11.2925 → $11.2089; late charges may post).
   returned 1. The "no rebuild needed" part is covered by mock-ui-check (an
   upstream edit shows up in a running app without a rebuild), because the
   live build also bundles the new catalog.
-- Wizard screenshots of the logged-in Vast/CivitAI pages. The Chrome profile
+- ~~Wizard screenshots~~ **shipping without them (user decision,
+  2026-09-25).** Still possible later: Wizard screenshots of the logged-in
+  Vast/CivitAI pages. The Chrome profile
   is signed in now (2026-09-25), but Claude in Chrome's screenshots here only
   come back to the agent; `save_to_disk` wrote no file anywhere findable, so
   nothing could be cropped/blurred into the repo. Drop PNGs into

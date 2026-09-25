@@ -4,12 +4,14 @@
 //   settings + validation -> LoRAs -> upstream catalog edit without rebuild ->
 //   Start -> cost bar -> image sync line + buttons -> Stop saves the rest ->
 //   restart (keys, settings, cached catalog survive) -> low-balance gate ->
+//   update offer (refused while a GPU runs) + Copy diagnostics (redacted) ->
 //   close-while-running confirm + last sync + destroy.
 // Mock mode uses its own Credential Manager service ("SlopTweak-mock") and
 // its own folders, so the real profile is never touched.
 //
 // Usage (from app/):  node dev/mock-ui-check.mjs
-// Needs a debug build. Starts vite on :1420 itself. Screenshots go to $SHOTS.
+// Needs a debug build. Starts vite on :1420 itself. Screenshots go to $SHOTS;
+// GUIDE_SHOTS=1 hides the MOCK badge so they can go in docs/.
 
 import { spawn, execSync } from "node:child_process";
 import { createServer } from "node:http";
@@ -112,6 +114,9 @@ async function connect() {
     (await send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true })).result
       ?.result?.value;
   const shot = async (name) => {
+    if (process.env.GUIDE_SHOTS === "1") {
+      await send("Runtime.evaluate", { expression: "document.getElementById('mode').hidden = true" });
+    }
     const r = await send("Page.captureScreenshot", { format: "png" });
     const file = join(SHOTS, `${name}.png`);
     writeFileSync(file, Buffer.from(r.result.data, "base64"));
@@ -325,6 +330,59 @@ async function lowBalance() {
   await closeIdle(s);
 }
 
+async function updateAndDiagnostics() {
+  const s = await launch({ SLOPTWEAK_MOCK_UPDATE: "9.9.9" });
+  const { evaluate, shot } = s;
+  await waitFor(async () => await evaluate(visible("update")), 15000, "update banner");
+  const offer = await evaluate(text("update-text"));
+  check("launch check offers a newer version", offer.includes("9.9.9") && offer.includes("you have 0.2.0"), offer);
+  await shot("u1-update-offer");
+  await evaluate(click("nav-settings"));
+  await sleep(300);
+  check("settings shows the app version", (await evaluate(text("about-version"))) === "SlopTweak 0.2.0");
+  await evaluate(click("update-check"));
+  await waitFor(async () => (await evaluate(text("about-msg"))).includes("available"), 10000, "manual check");
+  check("Check for updates finds it too", true);
+  await shot("s2-about");
+  await evaluate(click("nav-home"));
+  await sleep(300);
+
+  await waitFor(async () => !(await evaluate(`${q("start")}.disabled`)), 15000, "start enabled");
+  await evaluate(click("start"));
+  await waitFor(async () => await evaluate(visible("open")), 60000, "ready");
+  check("Update now is disabled while a GPU runs", await evaluate(`${q("update-install")}.disabled`));
+  const forced = await evaluate("window.__TAURI_INTERNALS__.invoke('install_update').then(() => 'installed', e => String(e))");
+  check("Rust refuses to install an update while a GPU runs", forced.includes("Stop the GPU"), forced);
+
+  const diag = (await evaluate("window.__TAURI_INTERNALS__.invoke('copy_diagnostics')")).text;
+  const user = process.env.USERNAME ?? "";
+  check("diagnostics: version, history, and log", diag.includes("app 0.2.0 (mock mode)") && diag.includes("== state history ==") && /Provisioning -> Ready: instance \d+/.test(diag) && diag.includes("== log =="));
+  check("diagnostics: no keys", !diag.includes(FAKE_VAST) && !diag.includes(FAKE_CIVITAI));
+  check("diagnostics: no token-shaped strings", !/[A-Za-z0-9_-]{40,}/.test(diag), diag.match(/[A-Za-z0-9_-]{40,}/)?.[0]);
+  check("diagnostics: no Windows user name", user.length < 3 || !diag.toLowerCase().includes(`\\users\\${user.toLowerCase()}`));
+  check("diagnostics: output folder shown under %USERPROFILE%", diag.includes("%USERPROFILE%"));
+  await evaluate("document.querySelector('details.card').open = true");
+  await evaluate(click("diag-copy"));
+  await waitFor(async () => (await evaluate(text("diag-msg"))).length > 0 && !(await evaluate(text("diag-msg"))).startsWith("Collecting"), 10000, "copy msg");
+  const copyMsg = await evaluate(text("diag-msg"));
+  check("Copy diagnostics puts the report on the clipboard", copyMsg.startsWith("Copied"), copyMsg);
+  const clip = execSync("powershell -NoProfile -Command Get-Clipboard -Raw", { encoding: "utf8" });
+  check("clipboard holds the redacted report", clip.includes("SlopTweak diagnostics") && !clip.includes(FAKE_VAST));
+  await shot("d1-diagnostics");
+
+  await evaluate(click("stop"));
+  await waitFor(async () => (await evaluate(text("status-text"))) === "Ready to start.", 60000, "idle");
+  check("Update now is enabled again after Stop", !(await evaluate(`${q("update-install")}.disabled`)));
+  await evaluate(click("update-later"));
+  await sleep(200);
+  check("Later hides the update offer", !(await evaluate(visible("update"))));
+  await evaluate("window.__TAURI_INTERNALS__.invoke('check_update')");
+  await evaluate(click("update-install"));
+  await waitFor(async () => (await evaluate(text("update-msg"))).startsWith("Installed"), 10000, "mock install");
+  check("mock update installs once idle", /mock: would install 9\.9\.9/.test(s.app.output()));
+  await closeIdle(s);
+}
+
 // Send WM_CLOSE to a top-level window, like clicking its X.
 const CLOSE_PS1 = join(mkdtempSync(join(tmpdir(), "sloptweak-ps-")), "close.ps1");
 writeFileSync(
@@ -374,6 +432,7 @@ try {
   await wizardAndHome();
   await restart();
   await lowBalance();
+  await updateAndDiagnostics();
   await closeWhileRunning();
 } catch (e) {
   check("harness", false, String(e));

@@ -27,6 +27,9 @@ fn main() {
             "destroy_orphan",
             "reattach_orphan",
             "confirm_close",
+            "copy_diagnostics",
+            "check_update",
+            "install_update",
         ]),
     ))
     .expect("tauri build");

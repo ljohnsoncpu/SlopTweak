@@ -197,6 +197,11 @@ async function main() {
     ["plugin:webview|create_webview_window", {}],
     ["plugin:event|emit", { event: "session-state", payload: null }],
     ["plugin:app|version", {}],
+    ["copy_diagnostics", {}],
+    ["install_update", {}],
+    ["plugin:updater|check", {}],
+    ["plugin:clipboard-manager|read_text", {}],
+    ["plugin:clipboard-manager|write_text", { text: "x" }],
   ];
   for (const [cmd, args] of cmds) {
     const r = await cdp.eval(`(async () => {

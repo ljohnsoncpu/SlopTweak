@@ -883,3 +883,63 @@ async fn self_destruct_still_saves_the_last_images() {
     assert_eq!(pngs(&out_dir(h.dir.path())).len(), 1);
     assert!(h.mock.live_ids().is_empty());
 }
+
+// ----- diagnostics history -----------------------------------------------------
+
+#[test]
+fn history_records_kind_and_stage_changes_only() {
+    let p = provisioning(1);
+    let staged = |stage: &str, progress: f64| {
+        next(
+            &p,
+            &Event::Stage(SidecarStatus {
+                stage: stage.into(),
+                progress: Some(progress),
+                ..Default::default()
+            }),
+        )
+        .unwrap()
+    };
+    let d10 = staged("downloading", 10.0);
+    let d50 = staged("downloading", 50.0);
+    let e = history_entry(&p, &d10).unwrap();
+    assert_eq!(
+        e,
+        "Provisioning -> Provisioning attempt 1: instance 42 stage downloading"
+    );
+    // Progress ticks inside one stage are not history.
+    assert_eq!(history_entry(&d10, &d50), None);
+    let failed = SessionState::Failed {
+        reason: "no GPU".into(),
+    };
+    assert_eq!(
+        history_entry(&d50, &failed).unwrap(),
+        "Provisioning -> Failed: no GPU"
+    );
+    assert_eq!(history_entry(&failed, &failed.clone()), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn manager_keeps_a_redacted_history() {
+    let h = harness(vec![MockBehavior::DaemonError]);
+    start(&h);
+    wait_for(&h.mgr, is_ready).await;
+    assert!(h.mgr.active_secret().is_some());
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+    let hist = h.mgr.history();
+    let text = hist.join("\n");
+    for want in [
+        "Idle -> Renting attempt 1/3",
+        "Renting attempt 2/3",
+        "-> Ready: instance",
+        "Ready -> Stopping instance",
+        "Stopping -> Idle",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in\n{text}");
+    }
+    // Each line is stamped with a unix time.
+    assert!(hist
+        .iter()
+        .all(|l| l.split(' ').next().unwrap().parse::<u64>().is_ok()));
+    assert_eq!(h.mgr.active_secret(), None);
+}
