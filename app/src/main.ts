@@ -50,6 +50,7 @@ interface ModelView {
   needs_civitai: boolean;
   nsfw: boolean;
   license_note: string;
+  min_compute_cap: number | null;
 }
 
 interface LoraView {
@@ -395,6 +396,14 @@ function render(): void {
   renderCostBar();
 }
 
+/** Plain words for a model's GPU architecture floor (Vast compute_cap units). */
+function gpuClass(cap: number | null): string {
+  if (cap === null || cap <= 750) return "";
+  if (cap >= 890) return ", RTX 40-series or newer";
+  if (cap >= 800) return ", RTX 30-series or newer";
+  return "";
+}
+
 function activeLoras(): LoraView[] {
   const m = currentModel();
   if (!snapshot || !m) return [];
@@ -410,7 +419,8 @@ function renderModels(): void {
   if (selected && snapshot.models.some((m) => m.id === selected)) ui.model.value = selected;
   const m = currentModel();
   ui.modelDesc.textContent = m
-    ? `${m.description} ${m.size_gb.toFixed(1)} GB download, needs a GPU with ${m.min_vram_gb} GB of memory.`
+    ? `${m.description} ${m.size_gb.toFixed(1)} GB download. Needs a GPU with ${m.min_vram_gb} GB of memory` +
+      `${gpuClass(m.min_compute_cap)}.`
     : "No models available.";
   ui.modelLicense.textContent = m?.license_note ? `License: ${m.license_note}` : "";
 

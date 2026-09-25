@@ -210,7 +210,7 @@ pub fn offer_query(model: &Model, s: &Settings) -> OfferQuery {
         min_disk_bw_mbps: s.min_disk_bw_mbps,
         max_dph: s.max_dph,
         min_cuda: MIN_CUDA,
-        min_compute_cap: s.min_compute_cap,
+        min_compute_cap: s.min_compute_cap.max(model.min_compute_cap.unwrap_or(0)),
         limit: 64,
     }
 }
@@ -419,6 +419,17 @@ mod tests {
         );
         // Must survive Vast's env string checks.
         crate::provider::vast::env_string(&spec.env).unwrap();
+    }
+
+    #[test]
+    fn model_can_raise_the_gpu_floor_but_not_lower_it() {
+        let mut model = catalog::bundled()[0].clone();
+        let s = Settings::default();
+        assert_eq!(offer_query(&model, &s).min_compute_cap, 750);
+        model.min_compute_cap = Some(800);
+        assert_eq!(offer_query(&model, &s).min_compute_cap, 800);
+        model.min_compute_cap = Some(600);
+        assert_eq!(offer_query(&model, &s).min_compute_cap, 750);
     }
 
     #[test]

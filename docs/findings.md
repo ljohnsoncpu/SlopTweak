@@ -495,6 +495,43 @@ Spend ~$0.018 (credit $11.3423 → $11.3247). The title check is also in
 | --- | --- | --- |
 | 52614236 | 44022327 (RTX 3060, NJ, 3755 MB/s) | Filter check passed; destroyed by Stop |
 
+## Catalog: Anima (user decision, 2026-09-25) ✅ Live
+
+- **§9.4 model set extended:** Anima Aesthetic v1.1 and Anima Turbo v1.1
+  (`circlestone-labs/Anima`, 2B, Cosmos-Predict2 based, anime-focused), both
+  added at the user's request. **Chroma** (lodestones) was skipped: Invoke
+  6.14.1 has no loader for it. The **Krea** models (FLUX.1 Krea dev, Krea-2)
+  were skipped for now: gated on Hugging Face (the instance would need an HF
+  token), much bigger, and need 16–24 GB+ GPUs.
+- License: **CircleStone Labs Non-Commercial License v1.2**. Personal and
+  hobby use is fine; commercial or production use isn't. Renting your own GPU
+  isn't "Distribution" (that means hosting it for third parties).
+- **Invoke 6.14.1 support is native:** `BaseModelType.Anima`, and it needs 3
+  files, all installable via the install API: the main transformer
+  (`anima/main`, 4.18 GB), the Qwen3 0.6B text encoder (`any/qwen3_encoder`,
+  1.19 GB, variant `qwen3_06b`), and the Qwen-Image VAE (`anima/vae`,
+  0.25 GB). The Anima loader is present from 6.13.8; the catalog says 6.14.1
+  (the verified version).
+- Files come from Hugging Face, pinned to revision
+  `f973fc41ec7545364ac9776c2440285f43ff2a30`, with SHA-256 from the HF API
+  (LFS oid). Sizes were confirmed by ranged GET. No token is needed.
+- Invoke runs Anima in **bf16 when the GPU allows it**
+  (`choose_bfloat16_safe_dtype`); Turing only emulates bf16. So the catalog
+  gained an optional per-model **`min_compute_cap`**. Anima sets 800
+  (RTX 30-series+), which raises the app-wide 750 floor for that model only
+  (it can't lower it). The model selector names the GPU class.
+- **Live (instance 52617607, offer 49992718, RTX 3060, Utah, 7.6 Gbps /
+  6.6 GB/s, $0.1012/hr):** Ready in 324 s; all 3 files registered; with
+  Invoke's defaults (1024², Anima encoder and VAE auto-selected) a prompt
+  typed into the UI made an image in **64 s**; cost-bar title, Stop, and
+  machine memory ✅. 11/11 checks, ~$0.028 (credit $11.3235 → $11.2956).
+  Anima Turbo wasn't run live (same pipeline, different main file); it needs
+  CFG 1 and 8–12 steps, which its description tells the user.
+- Follow-up idea: set Invoke's per-model `default_settings` (steps/CFG) at
+  registration, so Turbo works out of the box. That needs a provision.sh
+  change and a new instance-asset release.
+- CivitAI's `baseModel` "Anima" maps to the `anima` family for LoRAs.
+
 ## Still open
 
 - **Live upstream catalog edit.** Fetching from GitHub works live, and an
@@ -504,6 +541,7 @@ Spend ~$0.018 (credit $11.3423 → $11.3247). The title check is also in
   that step: edit `catalog/catalog.json` on `main`, wait ≤5 min for GitHub's
   CDN, then press Settings → "Check for new models".
 - Wizard screenshots of the logged-in Vast/CivitAI pages. Claude in Chrome
-  showed no connected browser. Drop PNGs into `app/src/wizard/`
+  now connects, but that Chrome profile isn't signed in to Vast or CivitAI
+  (and the agent won't sign in). Drop PNGs into `app/src/wizard/`
   (`vast-signup`, `vast-billing`, `vast-keys`, `civitai-signup`,
-  `civitai-keys`); the wizard shows them automatically.
+  `civitai-keys`), or sign in and ask again.
