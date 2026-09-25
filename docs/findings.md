@@ -35,6 +35,14 @@ Versions: Vast REST API v0, InvokeAI **v6.14.1** (2026-09-06), cloudflared
 treat `status_msg` matching `Error response from daemon` as an immediate
 failure and destroy.
 
+⚠️ **Dead-host hang (Phase 1, instance 52513014, offer 37862807):**
+`actual_status` stayed `loading` for 21 min with an empty `status_msg`, while
+`intended_status` and `cur_state` were `stopped` and the logs said
+`No such container`. The host stopped it before the image ran. It cost
+~$0.035 before we destroyed it. → Phase 2: treat
+`actual_status=loading` + `intended_status=stopped` as failed and move to
+the next offer, and cap `loading` at ~8 min regardless.
+
 ## 2. Instance self-identity and scoped keys ✅ Live
 
 - `CONTAINER_ID` and `CONTAINER_API_KEY` exist in **PID 1's environment**
@@ -159,6 +167,42 @@ failure and destroy.
 
 ---
 
+## Phase 1 acceptance (2026-09-24, instance 52519537) ✅
+
+Bundle `instance-v0.1.0` (SHA-256 `2ff1ecf6…3811`); model Banana Splitz XXL
+1.2.1 via CivitAI; RTX A4000 in Delaware, image cached on the host.
+
+| Step | Result |
+| --- | --- |
+| Create → tunnel label published | **+50 s** (onstart → verify bundle → provision.sh → sidecar → cloudflared → `PUT label`) |
+| 6.94 GB CivitAI download + SHA-256 | done by +131 s; token via header file, redirect followed |
+| Register via install API (`inplace=true`) | +152 s → +172 s |
+| **Ready** | **+172 s** |
+| No cookie (`/`, `/api/v1/images/`), `/__ticket`/`/__status` without bearer | 401 |
+| Fresh ticket → cookie → Invoke UI | ✅ model auto-selected (SDXL, 1024²) |
+| Generate | ✅ 1024×1024 |
+| Inpaint (canvas mask + prompt) | ✅ graph used `create_gradient_mask`/`apply_mask_to_image`; queue 2 completed / 0 failed |
+| Launcher-style bearer: list + `/full` | ✅ 200, 1.8 MB PNG |
+| Ticket 65 s old | 401 |
+| **Heartbeat killed → self-destroy** | **gone 182 s after the kill** (heartbeat timeout 3 min + ≤15 s tick) |
+
+Notes for later phases:
+- ⚠️ **Bandwidth is billed per GB and varies ~15× between hosts.** Offer
+  `inet_down_cost` ranged $0–$0.039/GB in one search. On an expensive host,
+  a 6.9 GB model costs ~$0.27 per session to download, more than an hour of
+  a cheap GPU. This run's credit drop ($11.757 → $11.553, $0.20) was mostly
+  bandwidth, plus late-posted charges from the dead-host instance.
+  → Phase 2 offer ranking must use
+  `dph_total × expected_hours + model_GB × inet_down_cost`, and the cost bar
+  must include the one-off download cost.
+- Canvas results stay **staged** (not in the gallery or the images list)
+  until the user accepts them. → Phase 4 sync needs to decide whether to
+  also pull staged/intermediate canvas outputs, or rely on acceptance.
+- Idle timeout was verified by unit tests only (20 min live would have
+  cost more for little new information).
+- Invoke's `/api/v1/queue/default/status` returns
+  `{queue: {pending, in_progress, completed, failed, …}}` as expected.
+
 ## Rental log (all destroyed; none running)
 
 | Instance | Offer | Outcome | Cost |
@@ -169,6 +213,15 @@ failure and destroy.
 
 Total: **~$0.02** (credit $11.787 → $11.766). No API keys were created on
 the account.
+
+Phase 1:
+
+| Instance | Offer | Outcome | Cost |
+| --- | --- | --- | --- |
+| 52513014 | 37862807 (RTX A4000, JP) | Dead host: stuck `loading`, container never created; destroyed from PC | ~$0.01–0.04 |
+| 52519537 | 48328454 (RTX A4000, US) | Full acceptance passed; **self-destroyed on heartbeat loss** | ~$0.17–0.20 incl. bandwidth |
+
+Phase 1 total ~$0.21 (credit $11.766 → $11.553).
 
 ## Decisions (user, 2026-09-24)
 
