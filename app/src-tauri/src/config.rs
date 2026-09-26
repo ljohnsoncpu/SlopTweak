@@ -245,6 +245,7 @@ pub fn offer_query(model: &Model, s: &Settings) -> OfferQuery {
         max_dph: s.max_dph,
         min_cuda: MIN_CUDA,
         min_compute_cap: s.min_compute_cap.max(model.min_compute_cap.unwrap_or(0)),
+        min_ram_gb: model.min_ram_gb.unwrap_or(0.0),
         limit: 64,
     }
 }
@@ -473,6 +474,16 @@ mod tests {
         assert_eq!(offer_query(&model, &s).min_compute_cap, 800);
         model.min_compute_cap = Some(600);
         assert_eq!(offer_query(&model, &s).min_compute_cap, 750);
+    }
+
+    #[test]
+    fn model_ram_floor_reaches_the_query() {
+        let mut model = catalog::bundled()[0].clone();
+        let s = Settings::default();
+        model.min_ram_gb = None;
+        assert_eq!(offer_query(&model, &s).min_ram_gb, 0.0);
+        model.min_ram_gb = Some(48.0);
+        assert_eq!(offer_query(&model, &s).min_ram_gb, 48.0);
     }
 
     #[test]

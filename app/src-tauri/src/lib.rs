@@ -6,6 +6,7 @@ mod civitai;
 mod config;
 mod cost;
 mod diagnostics;
+mod library;
 mod persist;
 mod provider;
 mod redact;
@@ -240,6 +241,19 @@ impl AppState {
                 let (config, default) = (self.config_dir.clone(), self.default_output_dir.clone());
                 Arc::new(move || output_dir(&config, &default))
             },
+            library: library::LibraryStore::new(&self.config_dir),
+            builtins: {
+                let app = self.ui.app.clone();
+                Arc::new(move |model_id: &str| {
+                    app.state::<AppState>()
+                        .catalog
+                        .lock()
+                        .unwrap()
+                        .find(model_id)
+                        .map(library::builtins_of)
+                        .unwrap_or_default()
+                })
+            },
             ui: self.ui.clone(),
         };
         let m = SessionManager::new(deps, Timing::default());
@@ -275,6 +289,9 @@ struct ModelView {
     license_note: String,
     /// The model's own GPU architecture floor, if it sets one.
     min_compute_cap: Option<u32>,
+    min_ram_gb: Option<f64>,
+    price_tier: Option<u8>,
+    good_for: String,
 }
 
 impl From<&Model> for ModelView {
@@ -290,6 +307,9 @@ impl From<&Model> for ModelView {
             nsfw: m.nsfw,
             license_note: m.license_note.clone(),
             min_compute_cap: m.min_compute_cap,
+            min_ram_gb: m.min_ram_gb,
+            price_tier: m.price_tier,
+            good_for: m.good_for.clone(),
         }
     }
 }
@@ -1092,8 +1112,22 @@ pub fn run() {
             let handle = app.handle().clone();
             let on_tutorial = {
                 let h = handle.clone();
+                // A page can send docs signals in a loop; don't let it open
+                // a browser tab for each one.
+                let last_docs = Mutex::new(None::<std::time::Instant>);
                 Arc::new(move |sig: TutorialSignal| {
                     eprintln!("[sloptweak] tutorial {sig:?}");
+                    if let TutorialSignal::Docs(url) = sig {
+                        let mut last = last_docs.lock().unwrap();
+                        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+                            return;
+                        }
+                        *last = Some(std::time::Instant::now());
+                        if let Err(e) = h.opener().open_url(url, None::<&str>) {
+                            eprintln!("[sloptweak] couldn't open the docs: {e}");
+                        }
+                        return;
+                    }
                     let st = h.state::<AppState>();
                     if let Err(e) = update_settings(&st, |u| {
                         u.tutorial_done = true;

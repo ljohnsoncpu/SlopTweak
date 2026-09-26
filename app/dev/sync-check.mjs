@@ -34,6 +34,7 @@ const ORIGIN = `http://127.0.0.1:${SIDECAR_PORT}`;
 const FAKE = `http://127.0.0.1:${INVOKE_PORT}`;
 const MOCK_CONFIG = join(process.env.APPDATA ?? "", "com.sloptweak.launcher", "mock");
 const SETTINGS = join(MOCK_CONFIG, "settings.json");
+const LIBRARY = join(MOCK_CONFIG, "library.json");
 
 const procs = [];
 const results = [];
@@ -129,6 +130,8 @@ async function main() {
 
   mkdirSync(MOCK_CONFIG, { recursive: true });
   const backup = existsSync(SETTINGS) ? readFileSync(SETTINGS, "utf8") : null;
+  const libBackup = existsSync(LIBRARY) ? readFileSync(LIBRARY, "utf8") : null;
+  rmSync(LIBRARY, { force: true });
   writeFileSync(SETTINGS, JSON.stringify({ output_dir: out, model_id: "anima-aesthetic", tutorial_done: false }));
   try {
     start("python", [join(APP, "dev", "fake_invoke.py"), String(INVOKE_PORT)]);
@@ -154,6 +157,7 @@ async function main() {
         SLOPTWEAK_PROVIDER: "mock",
         SLOPTWEAK_MOCK_REMOTE: `${ORIGIN}/`,
         SLOPTWEAK_MOCK_SIDECAR: "http",
+        SLOPTWEAK_CATALOG_URL: `${FAKE}/__fake/catalog.json`,
         SLOPTWEAK_DEV_LAUNCH_SECRET: secret,
         SLOPTWEAK_MAIN_DEBUG_PORT: String(MAIN_PORT),
         SLOPTWEAK_REMOTE_DEBUG_PORT: String(REMOTE_PORT),
@@ -181,6 +185,13 @@ async function main() {
     // ----- tutorial -----
     const r = await cdp(REMOTE_PORT, (u) => u.startsWith(ORIGIN));
     await waitFor(async () => (await r.eval("document.title")) === "FAKE INVOKE", 20000, "Invoke page");
+
+    // ----- templates -----
+    const fs1 = await (await fetch(`${FAKE}/__fake/state`)).json();
+    const builtins = fs1.presets.filter((p) => p.name.startsWith("Anima Aesthetic · "));
+    check("model's built-in templates are in Invoke when its window opens", builtins.length >= 1, builtins.map((p) => p.name).join(", "));
+    check("built-in templates carry their example picture", builtins.length > 0 && builtins.every((p) => fs1.preset_images.includes(p.id)));
+    check("built-in templates have the {prompt} slot", builtins.every((p) => p.preset_data.positive_prompt.includes("{prompt}")));
     // A real GPU is a new tunnel origin every time; this local origin isn't,
     // so forget the previous run's tutorial state.
     if (await r.eval("localStorage.length > 0")) {
@@ -205,6 +216,10 @@ async function main() {
     const t0 = Date.now();
     await waitFor(async () => (await cardText(r)).includes("Keep the one you like"), 10000, "auto-advance");
     check("a finished generation moves the tutorial on", true, `${Date.now() - t0} ms`);
+    await clickAct(r, "next");
+    await waitFor(async () => (await cardText(r)).includes("Where to go next"), 5000, "docs step");
+    const docs = await r.eval(`${TUT}?.querySelectorAll('[data-act="doc"]').length || 0`);
+    check("last step links to Invoke's docs", docs >= 5, `${docs} links`);
     await clickAct(r, "next"); // Done
     await sleep(1500);
     check("Done doesn't navigate the page away", (await r.eval("location.pathname")) === "/" && (await r.eval("document.title")) === "FAKE INVOKE");
@@ -231,6 +246,7 @@ async function main() {
     check("home screen says what was saved", line.includes("Saved 10 images and 3 Canvas tries"), line);
 
     await fake("/__fake/generate?gallery=3", "POST");
+    await fake("/__fake/library", "POST"); // a template and a workflow made in Invoke
     await m.eval("document.getElementById('stop').click()");
     await waitFor(async () => (await ipc("get_snapshot")).state.kind === "idle", 120000, "idle after Stop");
     const g = files(out);
@@ -240,12 +256,25 @@ async function main() {
     check("sync report: done, nothing missing", snap.sync?.phase === "done" && snap.sync?.missing === 0, JSON.stringify(snap.sync));
     const after = await m.eval("document.getElementById('sync').textContent");
     check("after Stop the home screen still says what was saved", after.includes("Saved 13 images"), after);
+    const lib = existsSync(LIBRARY) ? JSON.parse(readFileSync(LIBRARY, "utf8")) : {};
+    check(
+      "a template made in Invoke is saved on Stop (built-ins aren't copied)",
+      lib.templates?.length === 1 && lib.templates[0].name === "Made in Invoke" && lib.templates[0].positive === "moody, {prompt}",
+      JSON.stringify(lib.templates?.map((t) => t.name)),
+    );
+    check(
+      "a workflow made in Invoke is saved on Stop, without its id",
+      lib.workflows?.length === 1 && lib.workflows[0].name === "Flow made in Invoke" && !("id" in lib.workflows[0].workflow),
+      JSON.stringify(lib.workflows?.map((w) => w.name)),
+    );
     const log = await m.eval("document.getElementById('log').textContent");
     check("launch secret never logged", !log.includes(secret));
     m.ws.close();
   } finally {
     if (backup !== null) writeFileSync(SETTINGS, backup);
     else rmSync(SETTINGS, { force: true });
+    if (libBackup !== null) writeFileSync(LIBRARY, libBackup);
+    else rmSync(LIBRARY, { force: true });
     rmSync(status, { force: true });
   }
   rmSync(out, { recursive: true, force: true });

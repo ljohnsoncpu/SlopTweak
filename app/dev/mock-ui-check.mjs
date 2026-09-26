@@ -78,6 +78,7 @@ async function waitFor(fn, ms, what) {
 // ----- local "upstream" catalog ---------------------------------------------------
 
 const bundled = JSON.parse(readFileSync(join(APP, "..", "catalog", "catalog.json"), "utf8"));
+const VERSION = JSON.parse(readFileSync(join(APP, "package.json"), "utf8")).version;
 let catalogText = JSON.stringify(bundled);
 let catalogUp = true;
 const catalogServer = createServer((req, res) => {
@@ -335,11 +336,11 @@ async function updateAndDiagnostics() {
   const { evaluate, shot } = s;
   await waitFor(async () => await evaluate(visible("update")), 15000, "update banner");
   const offer = await evaluate(text("update-text"));
-  check("launch check offers a newer version", offer.includes("9.9.9") && offer.includes("you have 0.2.0"), offer);
+  check("launch check offers a newer version", offer.includes("9.9.9") && offer.includes(`you have ${VERSION}`), offer);
   await shot("u1-update-offer");
   await evaluate(click("nav-settings"));
   await sleep(300);
-  check("settings shows the app version", (await evaluate(text("about-version"))) === "SlopTweak 0.2.0");
+  check("settings shows the app version", (await evaluate(text("about-version"))) === `SlopTweak ${VERSION}`);
   await evaluate(click("update-check"));
   await waitFor(async () => (await evaluate(text("about-msg"))).includes("available"), 10000, "manual check");
   check("Check for updates finds it too", true);
@@ -356,7 +357,7 @@ async function updateAndDiagnostics() {
 
   const diag = (await evaluate("window.__TAURI_INTERNALS__.invoke('copy_diagnostics')")).text;
   const user = process.env.USERNAME ?? "";
-  check("diagnostics: version, history, and log", diag.includes("app 0.2.0 (mock mode)") && diag.includes("== state history ==") && /Provisioning -> Ready: instance \d+/.test(diag) && diag.includes("== log =="));
+  check("diagnostics: version, history, and log", diag.includes(`app ${VERSION} (mock mode)`) && diag.includes("== state history ==") && /Provisioning -> Ready: instance \d+/.test(diag) && diag.includes("== log =="));
   check("diagnostics: no keys", !diag.includes(FAKE_VAST) && !diag.includes(FAKE_CIVITAI));
   check("diagnostics: no token-shaped strings", !/[A-Za-z0-9_-]{40,}/.test(diag), diag.match(/[A-Za-z0-9_-]{40,}/)?.[0]);
   check("diagnostics: no Windows user name", user.length < 3 || !diag.toLowerCase().includes(`\\users\\${user.toLowerCase()}`));

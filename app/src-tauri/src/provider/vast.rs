@@ -120,6 +120,8 @@ pub fn search_body(q: &OfferQuery) -> Value {
         "dph_total": {"lte": q.max_dph},
         "cuda_max_good": {"gte": q.min_cuda},
         "compute_cap": {"gte": q.min_compute_cap},
+        // cpu_ram is MB, like gpu_ram.
+        "cpu_ram": {"gte": q.min_ram_gb * 1000.0},
         "order": [["dph_total", "asc"]],
         "limit": q.limit,
     })
@@ -190,6 +192,8 @@ struct RawOffer {
     #[serde(default)]
     compute_cap: u32,
     #[serde(default)]
+    cpu_ram: f64,
+    #[serde(default)]
     geolocation: Option<String>,
     #[serde(default)]
     machine_id: Option<u64>,
@@ -219,6 +223,7 @@ pub fn parse_offers(v: &Value) -> Result<Vec<Offer>, ProviderError> {
             disk_space_gb: o.disk_space,
             cuda_max_good: o.cuda_max_good,
             compute_cap: o.compute_cap,
+            cpu_ram_mb: o.cpu_ram,
             geolocation: o.geolocation,
             machine_id: o.machine_id,
         })
@@ -400,6 +405,7 @@ mod tests {
             max_dph: 0.5,
             min_cuda: 12.4,
             min_compute_cap: 750,
+            min_ram_gb: 0.0,
             limit: 64,
         };
         let b = search_body(&q);
@@ -407,6 +413,7 @@ mod tests {
         assert_eq!(b["gpu_ram"]["gte"], 12000.0);
         assert_eq!(b["dph_total"]["lte"], 0.5);
         assert_eq!(b["compute_cap"]["gte"], 750);
+        assert_eq!(b["cpu_ram"]["gte"], 0.0);
         assert_eq!(b["disk_bw"]["gte"], 2000.0);
         assert_eq!(b["type"], "ondemand");
         // Never filter by id (findings: false negatives).

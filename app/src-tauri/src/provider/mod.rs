@@ -47,6 +47,8 @@ pub struct Offer {
     pub cuda_max_good: f64,
     /// GPU architecture, Vast units (e.g. 860 = sm_86). 0 if unknown.
     pub compute_cap: u32,
+    /// Host RAM available to the instance, MB (Vast `cpu_ram`). 0 if unknown.
+    pub cpu_ram_mb: f64,
     pub geolocation: Option<String>,
     /// Physical machine; one machine can list several offers.
     pub machine_id: Option<u64>,
@@ -64,6 +66,8 @@ pub struct OfferQuery {
     pub min_cuda: f64,
     /// Vast units (750 = Turing / RTX 20-series).
     pub min_compute_cap: u32,
+    /// Host RAM, GB. 0 = no requirement.
+    pub min_ram_gb: f64,
     pub limit: u32,
 }
 

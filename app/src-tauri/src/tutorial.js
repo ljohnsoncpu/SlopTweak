@@ -6,12 +6,15 @@
 // wrapper: { autoShow, force, sample (base64 JPEG), sampleName }.
 //
 // Skip and Done tell the app by navigating to /__sloptweak/tutorial/<done|
-// skipped>, which the app intercepts and blocks (remote.rs). Nothing else
-// crosses back.
+// skipped>, and a docs link by navigating to /__sloptweak/docs/<key>; the app
+// intercepts and blocks both (remote.rs) and opens only its own fixed URL for
+// the key. Nothing else crosses back.
 //
 // Written against Invoke 6.14.1's labels (en.json): Assets, New Canvas from
 // Image, As Raster Layer (Resize), Inpaint Mask, Brush, Invoke, Accept, Save
-// To Gallery.
+// To Gallery. The highlight ring finds its target by that visible text or
+// aria-label only; if a later Invoke renames or hides it, there is simply no
+// ring, and the written steps still stand.
 (function (CFG) {
   "use strict";
   if (window.top !== window || window.__slopTweakTutorial) return;
@@ -31,23 +34,22 @@
       /* private mode: this page only */
     }
   };
-  // step: 0 intro .. 4 accept; status: "open" | "min" | "closed"
-  let st = Object.assign({ step: 0, status: CFG.autoShow ? "open" : "closed" }, load());
-  // "Show tutorial" in the app opened this window: show it once, not on
-  // every reload of the window.
-  try {
-    if (CFG.force && !sessionStorage.getItem("sloptweak.forced")) {
-      sessionStorage.setItem("sloptweak.forced", "1");
-      st.status = "open";
-      if (st.step >= 4) st.step = 0;
-    }
-  } catch {
-    /* no storage: fine */
-  }
 
   const PROMPT = "a bowl of oranges";
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 
+  // Invoke's own docs; the keys must match remote.rs `invoke_docs`.
+  const DOCS = [
+    ["canvas", "Layers on the canvas"],
+    ["bbox", "The bounding box (sharper inpainting)"],
+    ["prompting", "Writing prompts"],
+    ["hotkeys", "Keyboard shortcuts"],
+    ["videos", "Video walkthroughs"],
+    ["home", "All of Invoke's documentation"],
+  ];
+
+  // `target`: what to ring, most specific first (the first one on screen
+  // wins, so the ring follows the user into a right-click menu).
   const STEPS = [
     {
       title: "Welcome to Invoke",
@@ -62,6 +64,7 @@
         "In the gallery on the right, click <b>Assets</b>. Right-click the picture of a room " +
         "and choose <b>New Canvas from Image</b> → <b>As Raster Layer (Resize)</b>.",
       thumb: true,
+      target: ["As Raster Layer (Resize)", "New Canvas from Image", "Assets"],
     },
     {
       title: "Paint over the vase",
@@ -69,6 +72,7 @@
         "In the layer list on the right, click <b>Inpaint Mask</b> (no mask there? Right-click " +
         "the picture → <b>New Inpaint Mask</b>). Press <b>B</b> for the brush and paint over the " +
         "whole vase and its flowers. Only what you paint gets redrawn.",
+      target: ["New Inpaint Mask", "Inpaint Mask"],
     },
     {
       title: "Say what goes there",
@@ -77,6 +81,7 @@
         `<code>${PROMPT}</code> <button data-act="copy" class="mini">Copy</button>. ` +
         "Then press <b>Invoke</b>. The first picture can take a minute.",
       watch: true,
+      target: ["Invoke"],
     },
     {
       title: "Keep the one you like",
@@ -85,19 +90,50 @@
         "arrows and press <b>✓ Accept</b> to keep one. SlopTweak saves every try to the " +
         "<b>Canvas</b> folder inside your output folder. To save the finished picture too, " +
         "right-click it → <b>Save To Gallery</b> → <b>Save Canvas To Gallery</b>.",
+      target: ["Accept"],
+    },
+    {
+      title: "Where to go next",
+      body:
+        "That's the basics. Invoke can do a lot more (layers, reference images, control, " +
+        "upscaling), and its own guides cover it. They open in your browser:" +
+        `<span class="docs">${DOCS.map(([k, t]) => `<a href="#" data-act="doc" data-doc="${k}">${esc(t)}</a>`).join("")}</span>` +
+        "Want this tour again? Press <b>Show tutorial</b> in SlopTweak.",
       next: "Done",
     },
   ];
+  const LAST = STEPS.length - 1;
+  const MARGIN = 16;
+
+  // step: 0 intro .. LAST; status: "open" | "min" | "closed";
+  // pos: the card's distance from the window's right and bottom edges.
+  let st = Object.assign({ step: 0, status: CFG.autoShow ? "open" : "closed" }, load());
+  // "Show tutorial" in the app opened this window: show it once, not on
+  // every reload of the window.
+  try {
+    if (CFG.force && !sessionStorage.getItem("sloptweak.forced")) {
+      sessionStorage.setItem("sloptweak.forced", "1");
+      st.status = "open";
+      if (st.step >= LAST) st.step = 0;
+    }
+  } catch {
+    /* no storage: fine */
+  }
 
   const CSS = `
     :host { all: initial; }
-    .card, .pill { position: fixed; left: 16px; bottom: 16px; z-index: 2147483647;
+    .box { position: fixed; z-index: 2147483647;
       font: 14px/1.45 system-ui, "Segoe UI", sans-serif; color: #e6e8ee;
       background: #1c1f26; border: 1px solid #3b82f6; border-radius: 10px;
       box-shadow: 0 8px 28px rgba(0,0,0,.5); }
     .card { width: 340px; padding: 14px 16px 12px; }
+    /* The welcome card: centered over a dimmed page so it can't be missed. */
+    .scrim { position: fixed; inset: 0; z-index: 2147483646; background: rgba(0,0,0,.45); }
+    .card.center { left: 50%; top: 50%; transform: translate(-50%, -50%); width: 380px; }
+    .card.center .head { cursor: default; }
     .pill { padding: 6px 12px; cursor: pointer; }
-    .head { display: flex; align-items: center; gap: 8px; color: #93a4c3; font-size: 12px; }
+    .head { display: flex; align-items: center; gap: 8px; color: #93a4c3; font-size: 12px;
+      cursor: move; user-select: none; touch-action: none; margin: -6px -8px 0; padding: 6px 8px 0; }
     .head .sp { flex: 1; }
     h3 { margin: 6px 0 6px; font-size: 16px; color: #fff; }
     p { margin: 0 0 10px; }
@@ -105,6 +141,9 @@
     code { background: #2a2f3a; padding: 1px 5px; border-radius: 4px; }
     img { display: block; width: 96px; height: 96px; object-fit: cover; border-radius: 6px;
       margin: 0 0 10px; border: 1px solid #3a3f4b; }
+    .docs { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
+    a { color: #93c5fd; text-decoration: none; }
+    a:hover { text-decoration: underline; }
     .row { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
     .row .sp { flex: 1; }
     button { font: inherit; border-radius: 6px; border: 1px solid #3a3f4b; background: #2a2f3a;
@@ -115,11 +154,17 @@
     button.link { border: none; background: none; color: #93a4c3; padding: 5px 4px; }
     .status { min-height: 1.4em; color: #fbbf24; font-size: 13px; margin: -4px 0 8px; }
     .err { color: #f87171; }
+    .ring { position: fixed; z-index: 2147483646; pointer-events: none; display: none;
+      border: 2px solid #3b82f6; border-radius: 8px; box-shadow: 0 0 0 3px rgba(59,130,246,.25);
+      animation: pulse 1.1s ease-in-out 3; }
+    @keyframes pulse { 50% { box-shadow: 0 0 0 7px rgba(59,130,246,.12); } }
+    @media (prefers-reduced-motion: reduce) { .ring { animation: none; } }
   `;
 
   let host = null;
   let root = null;
   let poll = null;
+  let ringTimer = null;
 
   function mount() {
     if (host && host.isConnected) return;
@@ -127,6 +172,7 @@
     root = host.attachShadow({ mode: "open" }); // open: dev/sync-check.mjs drives it
     document.documentElement.appendChild(host);
     root.addEventListener("click", onClick);
+    root.addEventListener("pointerdown", onDragStart);
   }
 
   function setStatus(text, cls = "") {
@@ -137,9 +183,124 @@
     }
   }
 
+  // ----- position: bottom-right by default, dragged by the title line -----
+
+  /** Keep the box fully on screen (the window can shrink after a drag). */
+  function place() {
+    const box = root && root.querySelector(".box");
+    if (!box || box.classList.contains("center")) return;
+    const pos = st.pos || { r: MARGIN, b: MARGIN };
+    const maxR = Math.max(0, window.innerWidth - box.offsetWidth);
+    const maxB = Math.max(0, window.innerHeight - box.offsetHeight);
+    box.style.right = `${Math.min(Math.max(0, pos.r), maxR)}px`;
+    box.style.bottom = `${Math.min(Math.max(0, pos.b), maxB)}px`;
+  }
+
+  function onDragStart(e) {
+    const head = e.target.closest(".head");
+    if (!head || e.button !== 0 || e.target.closest("button")) return;
+    const box = root.querySelector(".box");
+    if (box.classList.contains("center")) return;
+    const r0 = parseFloat(box.style.right) || 0;
+    const b0 = parseFloat(box.style.bottom) || 0;
+    const x0 = e.clientX;
+    const y0 = e.clientY;
+    head.setPointerCapture(e.pointerId);
+    const move = (ev) => {
+      st.pos = { r: r0 - (ev.clientX - x0), b: b0 - (ev.clientY - y0) };
+      place();
+    };
+    const up = () => {
+      head.removeEventListener("pointermove", move);
+      head.removeEventListener("pointerup", up);
+      head.removeEventListener("pointercancel", up);
+      // Save where it really ended up, not an off-screen request.
+      st.pos = { r: parseFloat(box.style.right) || 0, b: parseFloat(box.style.bottom) || 0 };
+      store();
+    };
+    head.addEventListener("pointermove", move);
+    head.addEventListener("pointerup", up);
+    head.addEventListener("pointercancel", up);
+    e.preventDefault();
+  }
+
+  // ----- highlight ring: found by visible text or aria-label, never required -----
+
+  const CLICKABLE = 'button, a, [role="button"], [role="tab"], [role="menuitem"], [role="option"]';
+
+  function onScreen(el) {
+    if (el.checkVisibility && !el.checkVisibility({ opacityProperty: true, visibilityProperty: true })) return null;
+    const r = el.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) return null;
+    if (r.bottom <= 0 || r.right <= 0 || r.top >= window.innerHeight || r.left >= window.innerWidth) return null;
+    return r;
+  }
+
+  /** The on-screen rectangle of the first label that matches, or null. */
+  function findTarget(labels) {
+    const body = document.body;
+    if (!body) return null;
+    // label -> { r, strong }; a match on something clickable beats plain text.
+    const found = new Map();
+    const offer = (l, el, strong) => {
+      const had = found.get(l);
+      if (had && (had.strong || !strong)) return;
+      const r = onScreen(el);
+      if (r) found.set(l, { r, strong });
+    };
+    const wanted = new Set(labels);
+    // Icon buttons (Accept) are named by aria-label.
+    for (const el of body.querySelectorAll("[aria-label]")) {
+      const l = el.getAttribute("aria-label").trim();
+      if (wanted.has(l)) offer(l, el, true);
+    }
+    // Everything else by its own text; ring the clickable thing around it.
+    const walk = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+      const l = n.nodeValue.trim();
+      const el = n.parentElement;
+      if (!el || !wanted.has(l)) continue;
+      const c = el.closest(CLICKABLE);
+      offer(l, c || el, !!c);
+    }
+    for (const l of labels) if (found.has(l)) return found.get(l).r;
+    return null;
+  }
+
+  function trackRing(labels) {
+    const tick = () => {
+      const ring = root && root.querySelector(".ring");
+      if (!ring || document.hidden) return;
+      let r = null;
+      try {
+        r = findTarget(labels);
+      } catch {
+        /* a page we don't understand: no ring */
+      }
+      if (!r) {
+        ring.style.display = "none";
+        return;
+      }
+      const pad = 4;
+      Object.assign(ring.style, {
+        display: "block",
+        left: `${r.left - pad}px`,
+        top: `${r.top - pad}px`,
+        width: `${r.width + 2 * pad}px`,
+        height: `${r.height + 2 * pad}px`,
+      });
+    };
+    tick();
+    ringTimer = window.setInterval(tick, 500);
+  }
+
+  // ----- rendering -----
+
   function render() {
     window.clearInterval(poll);
+    window.clearInterval(ringTimer);
     poll = null;
+    ringTimer = null;
     if (st.status === "closed") {
       if (host) host.remove();
       host = null;
@@ -147,15 +308,18 @@
     }
     mount();
     if (st.status === "min") {
-      root.innerHTML = `<style>${CSS}</style><div class="pill" data-act="restore">Tutorial · step ${st.step + 1} of ${STEPS.length}</div>`;
+      root.innerHTML = `<style>${CSS}</style><div class="box pill" data-act="restore">Tutorial · step ${st.step + 1} of ${STEPS.length}</div>`;
+      place();
       return;
     }
     const s = STEPS[st.step] || STEPS[0];
     const thumb =
       s.thumb && st.image ? `<img alt="" src="/api/v1/images/i/${encodeURIComponent(st.image)}/thumbnail">` : "";
+    const intro = st.step === 0;
     root.innerHTML = `<style>${CSS}</style>
-      <div class="card" role="dialog" aria-label="SlopTweak tutorial">
-        <div class="head"><span>SlopTweak tutorial · ${st.step + 1} of ${STEPS.length}</span><span class="sp"></span>
+      ${intro ? '<div class="scrim"></div>' : '<div class="ring"></div>'}
+      <div class="box card${intro ? " center" : ""}" role="dialog" aria-label="SlopTweak tutorial">
+        <div class="head"${intro ? "" : ' title="Drag to move"'}><span>SlopTweak tutorial · ${st.step + 1} of ${STEPS.length}</span><span class="sp"></span>
           <button class="x" data-act="min" title="Minimize">–</button>
           <button class="x" data-act="skip" title="Close the tutorial">×</button></div>
         <h3>${esc(s.title)}</h3>
@@ -167,7 +331,9 @@
           <button class="primary" data-act="next">${esc(s.next || "Next")}</button>
         </div>
       </div>`;
+    place();
     if (s.watch) watchQueue();
+    if (s.target) trackRing(s.target);
   }
 
   async function queueStatus() {
@@ -201,7 +367,7 @@
   }
 
   function go(step) {
-    st.step = Math.max(0, Math.min(STEPS.length - 1, step));
+    st.step = Math.max(0, Math.min(LAST, step));
     if (st.step !== 3) delete st.baseline;
     store();
     render();
@@ -229,9 +395,9 @@
   }
 
   /** Tell the app (it blocks this navigation, so the page stays). */
-  function signal(kind) {
+  function signal(path) {
     try {
-      window.location.assign(`/__sloptweak/tutorial/${kind}`);
+      window.location.assign(`/__sloptweak/${path}`);
     } catch {
       /* the app will offer the tutorial again next time */
     }
@@ -242,7 +408,7 @@
     st.step = 0;
     store();
     render();
-    signal(kind);
+    signal(`tutorial/${kind}`);
   }
 
   async function onClick(e) {
@@ -261,6 +427,10 @@
       return render();
     }
     if (act === "back") return go(st.step - 1);
+    if (act === "doc") {
+      e.preventDefault();
+      return signal(`docs/${encodeURIComponent(el.getAttribute("data-doc") || "")}`);
+    }
     if (act === "copy") {
       try {
         await navigator.clipboard.writeText(PROMPT);
@@ -271,7 +441,7 @@
       return;
     }
     if (act !== "next") return;
-    if (st.step === STEPS.length - 1) return close("done");
+    if (st.step === LAST) return close("done");
     if (st.step === 0) {
       el.disabled = true;
       setStatus("Getting the sample picture ready…");
@@ -294,12 +464,13 @@
   window.__slopTweakTutorial = {
     open() {
       st.status = "open";
-      if (st.step >= STEPS.length) st.step = 0;
+      if (st.step > LAST) st.step = 0;
       store();
       render();
     },
   };
 
+  window.addEventListener("resize", place);
   const boot = () => render();
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
   else boot();

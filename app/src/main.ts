@@ -51,6 +51,9 @@ interface ModelView {
   nsfw: boolean;
   license_note: string;
   min_compute_cap: number | null;
+  min_ram_gb: number | null;
+  price_tier: number | null;
+  good_for: string;
 }
 
 interface LoraView {
@@ -509,17 +512,41 @@ function activeLoras(): LoraView[] {
   return snapshot.settings.loras.filter((l) => l.enabled && l.family === m.base);
 }
 
+/** What the $ marks mean. Live prices are in the estimate line below. */
+function tierNote(tier: number | null): string {
+  switch (tier) {
+    case 1:
+      return " $ = runs on the cheapest GPUs.";
+    case 2:
+      return " $$ = needs a bigger GPU, usually about twice the hourly price of $ models.";
+    case 3:
+      return " $$$ = needs a high-end GPU, several times the price of $ models.";
+    default:
+      return "";
+  }
+}
+
+/** "Anima Turbo · $ · Anime, quick drafts (NSFW)" */
+function modelLabel(m: ModelView): string {
+  const parts = [m.name];
+  if (m.price_tier) parts.push("$".repeat(m.price_tier));
+  if (m.good_for) parts.push(m.good_for);
+  return parts.join(" · ") + (m.nsfw ? " (NSFW)" : "");
+}
+
 function renderModels(): void {
   if (!snapshot) return;
   const selected = ui.model.value || snapshot.settings.model_id || "";
   ui.model.replaceChildren(
-    ...snapshot.models.map((m) => h("option", { value: m.id }, m.name + (m.nsfw ? " (NSFW)" : ""))),
+    ...snapshot.models.map((m) => h("option", { value: m.id }, modelLabel(m))),
   );
   if (selected && snapshot.models.some((m) => m.id === selected)) ui.model.value = selected;
   const m = currentModel();
   ui.modelDesc.textContent = m
     ? `${m.description} ${m.size_gb.toFixed(1)} GB download. Needs a GPU with ${m.min_vram_gb} GB of memory` +
-      `${gpuClass(m.min_compute_cap)}.`
+      `${gpuClass(m.min_compute_cap)}` +
+      (m.min_ram_gb ? ` and ${m.min_ram_gb} GB of system memory.` : ".") +
+      tierNote(m.price_tier)
     : "No models available.";
   ui.modelLicense.textContent = m?.license_note ? `License: ${m.license_note}` : "";
 

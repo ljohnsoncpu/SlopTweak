@@ -10,6 +10,12 @@ Serves just what SlopTweak touches, with the shapes of Invoke 6.14.1
 * GET  /api/v1/queue/default/status
 * GET  /api/v1/queue/default/item_ids?order_dir=DESC
 * GET  /api/v1/queue/default/i/<id>   with session.prepared_source_mapping + results
+* GET  /api/v1/style_presets/          templates (one of Invoke's own + the user's)
+* GET  /api/v1/style_presets/i/<id>/image
+* POST /api/v1/style_presets/          multipart "data" (JSON) + optional "image"
+* GET  /api/v1/workflows/?categories=user&page=&per_page=
+* GET  /api/v1/workflows/i/<id>
+* POST /api/v1/workflows/              {"workflow": {...}} without an id
 
 Like the real thing, an image's `node_id` is the *prepared* node id (a uuid);
 only the queue item maps it back to its source node (`canvas_output:*`).
@@ -19,6 +25,9 @@ Test control (called directly on this port, never through the sidecar):
 * POST /__fake/generate?gallery=N&canvas=M   N Generate-tab images (gallery)
   and M Canvas runs (a staged intermediate + a scratch intermediate), each
   one completed queue item
+* POST /__fake/library          one user template and one user workflow, as
+  if made in Invoke's UI
+* GET  /__fake/catalog.json     this checkout's catalog/catalog.json
 * GET  /__fake/state                                   what's stored
 
 Stdlib only. Binds 127.0.0.1.
@@ -34,6 +43,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -50,6 +60,68 @@ images: list[dict[str, Any]] = []  # oldest first
 files: dict[str, bytes] = {}
 queue = {"pending": 0, "in_progress": 0, "completed": 0, "failed": 0}
 queue_items: list[dict[str, Any]] = []  # oldest first
+presets: list[dict[str, Any]] = []
+preset_images: dict[str, bytes] = {}
+workflows: list[dict[str, Any]] = []  # records, each with its "workflow"
+DEFAULT_PRESET = {
+    "id": "default-1",
+    "name": "Invoke's own",
+    "type": "default",
+    "user_id": "system",
+    "is_public": True,
+    "image": None,
+    "preset_data": {"positive_prompt": "{prompt}", "negative_prompt": ""},
+}
+
+
+def now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S.000", time.gmtime())
+
+
+def multipart(body: bytes, ctype: str) -> dict[str, bytes]:
+    """Form parts by name (good enough for what the app sends)."""
+    boundary = b"--" + ctype.split("boundary=")[-1].strip('"').encode()
+    out: dict[str, bytes] = {}
+    for part in body.split(boundary)[1:]:
+        head, _, data = part.partition(b"\r\n\r\n")
+        for token in head.split(b";"):
+            token = token.strip()
+            if token.startswith(b'name="'):
+                out[token[6:-1].decode()] = data.removesuffix(b"\r\n")
+    return out
+
+
+def add_preset(name: str, positive: str, negative: str, image: bytes | None) -> dict[str, Any]:
+    pid = str(uuid.uuid4())
+    rec = {
+        "id": pid,
+        "name": name,
+        "type": "user",
+        "user_id": "system",
+        "is_public": False,
+        "image": f"api/v1/style_presets/i/{pid}/image" if image else None,
+        "preset_data": {"positive_prompt": positive, "negative_prompt": negative},
+    }
+    presets.append(rec)
+    if image:
+        preset_images[pid] = image
+    return rec
+
+
+def add_workflow(wf: dict[str, Any]) -> dict[str, Any]:
+    wid = str(uuid.uuid4())
+    t = now()
+    rec = {
+        "workflow_id": wid,
+        "name": wf.get("name", ""),
+        "created_at": t,
+        "updated_at": t,
+        "user_id": "system",
+        "is_public": False,
+        "workflow": dict(wf, id=wid),
+    }
+    workflows.append(rec)
+    return rec
 
 
 def add(category: str, intermediate: bool, data: bytes = PNG) -> dict[str, Any]:
@@ -123,10 +195,7 @@ class Handler(BaseHTTPRequestHandler):
                 sel = [
                     i
                     for i in reversed(images)
-                    if (
-                        want_inter is None
-                        or str(i["is_intermediate"]).lower() == want_inter
-                    )
+                    if (want_inter is None or str(i["is_intermediate"]).lower() == want_inter)
                     and (not cats or i["image_category"] in cats)
                 ]
             return self.json(
@@ -163,9 +232,63 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/queue/default/status":
             with lock:
                 return self.json({"queue": dict(queue, queue_id="default")})
+        if path == "/api/v1/style_presets/":
+            with lock:
+                return self.json([DEFAULT_PRESET, *presets])
+        if path.startswith("/api/v1/style_presets/i/") and path.endswith("/image"):
+            pid = path.split("/")[-2]
+            with lock:
+                img = preset_images.get(pid)
+            if img is None:
+                return self.json({"detail": "not found"}, 404)
+            return self.send(200, img, "image/webp")
+        if path == "/api/v1/workflows/":
+            if q.get("categories") != ["user"]:
+                return self.json({"detail": "only user workflows here"}, 422)
+            page = int(q.get("page", ["0"])[0])
+            per = int(q.get("per_page", ["1000"])[0])
+            with lock:
+                items = [
+                    {
+                        "workflow_id": w["workflow_id"],
+                        "name": w["name"],
+                        "updated_at": w["updated_at"],
+                        "category": "user",
+                    }
+                    for w in workflows[page * per : (page + 1) * per]
+                ]
+                total = len(workflows)
+            return self.json(
+                {
+                    "items": items,
+                    "page": page,
+                    "per_page": per,
+                    "total": total,
+                    "pages": max(1, -(-total // per)),
+                }
+            )
+        if path.startswith("/api/v1/workflows/i/"):
+            wid = path.rsplit("/", 1)[-1]
+            with lock:
+                rec = next((w for w in workflows if w["workflow_id"] == wid), None)
+            if rec is None:
+                return self.json({"detail": "Workflow not found"}, 404)
+            return self.json(rec)
+        if path == "/__fake/catalog.json":
+            # This checkout's catalog (the app otherwise fetches main's).
+            cat = Path(__file__).resolve().parents[2] / "catalog" / "catalog.json"
+            return self.send(200, cat.read_bytes())
         if path == "/__fake/state":
             with lock:
-                return self.json({"images": images, "queue": queue})
+                return self.json(
+                    {
+                        "images": images,
+                        "queue": queue,
+                        "presets": presets,
+                        "preset_images": sorted(preset_images),
+                        "workflows": workflows,
+                    }
+                )
         return self.json({"detail": "Not Found"}, 404)
 
     def do_POST(self) -> None:
@@ -189,6 +312,46 @@ class Handler(BaseHTTPRequestHandler):
                     data,
                 )
             return self.json(img, 201)
+        if u.path == "/api/v1/style_presets/":
+            parts = multipart(body, self.headers.get("Content-Type", ""))
+            try:
+                data = json.loads(parts["data"])
+                name, pos = data["name"], data["positive_prompt"]
+            except (KeyError, ValueError):
+                return self.json({"detail": "Invalid preset data"}, 400)
+            if data.get("type") != "user":
+                return self.json({"detail": "Only admins can create default presets"}, 403)
+            with lock:
+                rec = add_preset(name, pos, data.get("negative_prompt", ""), parts.get("image"))
+            return self.json(rec)
+        if u.path == "/api/v1/workflows/":
+            try:
+                wf = json.loads(body)["workflow"]
+            except (KeyError, ValueError):
+                return self.json({"detail": "bad body"}, 422)
+            if "id" in wf or wf.get("meta", {}).get("category") != "user":
+                return self.json({"detail": "bad workflow"}, 422)
+            with lock:
+                return self.json(add_workflow(wf))
+        if u.path == "/__fake/library":
+            with lock:
+                add_preset("Made in Invoke", "moody, {prompt}", "blurry", None)
+                add_workflow(
+                    {
+                        "name": "Flow made in Invoke",
+                        "author": "",
+                        "description": "",
+                        "version": "1.0.0",
+                        "contact": "",
+                        "tags": "",
+                        "notes": "",
+                        "exposedFields": [],
+                        "meta": {"version": "3.0.0", "category": "user"},
+                        "nodes": [{"id": "n1", "type": "invocation"}],
+                        "edges": [],
+                    }
+                )
+            return self.json({"ok": True})
         if u.path == "/__fake/generate":
             n = {k: int(q.get(k, ["0"])[0]) for k in ("gallery", "canvas")}
             with lock:

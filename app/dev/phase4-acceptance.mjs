@@ -302,6 +302,8 @@ async function tutorial(r, settingsFile, outDir) {
     } else say("Accept button not found (staging toolbar)");
     await sleep(2000);
     await r.shot("t6-accepted");
+    await clickAct(r, "next");
+    await waitFor(async () => (await cardText(r)).includes("Where to go next"), 5000, "docs step");
     await clickAct(r, "next"); // Done
   } catch (e) {
     auto = false;

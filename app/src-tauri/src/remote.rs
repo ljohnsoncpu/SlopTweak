@@ -8,10 +8,11 @@
 //! * Navigation is pinned to the tunnel origin, and popups are denied.
 //!
 //! The tutorial (tutorial.js) is injected as an initialization script: plain
-//! page JS, no IPC. Its only way back is a navigation to
-//! `/__sloptweak/tutorial/<done|skipped>`, which is intercepted here and
-//! blocked. A page could fake that, but all it does is mark the tutorial as
-//! seen.
+//! page JS, no IPC. Its only ways back are navigations to
+//! `/__sloptweak/tutorial/<done|skipped>` and `/__sloptweak/docs/<key>`,
+//! which are intercepted here and blocked. A page could fake them, but all
+//! they do is mark the tutorial as seen or open one of a few fixed Invoke
+//! docs pages in the user's browser.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,8 @@ const TUTORIAL_SAMPLE: &[u8] = include_bytes!("../assets/tutorial-sample.jpg");
 pub enum TutorialSignal {
     Done,
     Skipped,
+    /// Open this fixed docs page in the user's browser.
+    Docs(&'static str),
 }
 
 pub type TutorialHandler = Arc<dyn Fn(TutorialSignal) + Send + Sync>;
@@ -49,6 +52,20 @@ pub fn allowed(origin: &Origin, url: &Url) -> bool {
     &url.origin() == origin
 }
 
+/// Invoke docs pages the tutorial's last step links to. The page sends a
+/// key, never a URL. Keys must match `DOCS` in tutorial.js.
+pub fn invoke_docs(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "home" => "https://invoke.ai/",
+        "canvas" => "https://invoke.ai/features/canvas/layers-and-drops/",
+        "bbox" => "https://invoke.ai/features/canvas/bounding-box/",
+        "prompting" => "https://invoke.ai/concepts/prompting-guide/",
+        "hotkeys" => "https://invoke.ai/features/hotkeys/",
+        "videos" => "https://invoke.ai/troubleshooting/videos/",
+        _ => return None,
+    })
+}
+
 /// A tutorial signal navigation (same origin, exact path), if `url` is one.
 pub fn tutorial_signal(origin: &Origin, url: &Url) -> Option<TutorialSignal> {
     if &url.origin() != origin {
@@ -57,7 +74,10 @@ pub fn tutorial_signal(origin: &Origin, url: &Url) -> Option<TutorialSignal> {
     match url.path() {
         "/__sloptweak/tutorial/done" => Some(TutorialSignal::Done),
         "/__sloptweak/tutorial/skipped" => Some(TutorialSignal::Skipped),
-        _ => None,
+        p => p
+            .strip_prefix("/__sloptweak/docs/")
+            .and_then(invoke_docs)
+            .map(TutorialSignal::Docs),
     }
 }
 
@@ -237,13 +257,37 @@ mod tests {
             sig("https://a-b.trycloudflare.com/__sloptweak/tutorial/skipped?x=1"),
             Some(TutorialSignal::Skipped)
         );
+        assert_eq!(
+            sig("https://a-b.trycloudflare.com/__sloptweak/docs/canvas"),
+            Some(TutorialSignal::Docs(
+                "https://invoke.ai/features/canvas/layers-and-drops/"
+            ))
+        );
         for no in [
             "https://evil.trycloudflare.com/__sloptweak/tutorial/done",
+            "https://evil.trycloudflare.com/__sloptweak/docs/home",
+            "https://a-b.trycloudflare.com/__sloptweak/docs/",
+            "https://a-b.trycloudflare.com/__sloptweak/docs/https%3A%2F%2Fevil.com",
+            "https://a-b.trycloudflare.com/__sloptweak/docs/home/x",
             "https://a-b.trycloudflare.com/__sloptweak/tutorial/done/x",
             "https://a-b.trycloudflare.com/__sloptweak/tutorial/",
             "https://a-b.trycloudflare.com/",
         ] {
             assert_eq!(sig(no), None, "{no}");
+        }
+    }
+
+    #[test]
+    fn every_docs_key_in_the_script_has_a_page() {
+        let keys: Vec<&str> = TUTORIAL_JS
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("[\""))
+            .filter_map(|l| l.split('"').next())
+            .collect();
+        assert!(keys.len() >= 5, "{keys:?}");
+        for k in keys {
+            let url = invoke_docs(k).unwrap_or_else(|| panic!("no page for {k}"));
+            assert!(url.starts_with("https://invoke.ai/"), "{url}");
         }
     }
 
