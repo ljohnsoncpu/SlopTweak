@@ -709,7 +709,7 @@ Phase 4 total **~$0.084** (credit $11.2925 → $11.2089; late charges may post).
   `releases/download/v<app version>/instance-assets.tar.gz`; release.yml
   rebuilds it and fails unless the hash equals `ASSETS_SHA256`
   (`build_assets.py --check-pin`, also in CI). Debug builds default to the
-  `instance-v0.1.0` pre-release (same bytes), since `vX.Y.Z` doesn't exist
+  `instance-v0.1.1` pre-release (same bytes), since `vX.Y.Z` doesn't exist
   until it's published. ⚠️ Consequence: a draft release's files aren't public,
   so a release build can only start a GPU after its release is published. The
   runbook does one ~$0.05 real session right after publishing.
@@ -782,8 +782,11 @@ Verified locally, $0:
   asset fetch or venv setup and a dead sidecar. Simulated against a fake API
   (DELETE sent, key on stdin only); ⏳ not yet seen on a live instance.
 - **Asset pin moved** to `ea4bd0bc…` (provision.sh changed). The Phase 1
-  pre-release (`instance-v0.1.0`) no longer matches, so debug builds renting
-  real GPUs need `SLOPTWEAK_DEV_ASSETS_URL` pointing at a rebuilt bundle.
+  pre-release (`instance-v0.1.0`) no longer matches, so the rebuilt bundle is
+  published as pre-release `instance-v0.1.1` (2026-09-26; download checked,
+  SHA-256 matches the pin) and is the debug builds' default. Whenever the
+  bundle changes again, publish a new `instance-v0.1.N` and move
+  `DEV_ASSETS_URL`.
 
 Also changed: each create call uses a unique `sloptweak-<nonce>` label, and
 an ambiguous create failure (network, parse, 5xx) is checked against the

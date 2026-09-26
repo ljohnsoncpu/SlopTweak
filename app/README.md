@@ -55,7 +55,7 @@ so the retry and failure paths can be seen in the UI.
 | `SLOPTWEAK_DEV_REMOTE_URL` | Open the remote window at this URL on startup |
 | `SLOPTWEAK_MOCK_IMAGES=N` | Mock mode: after Ready, the fake sidecar makes N gallery images (one per 3 s) plus Canvas tries and scratch intermediates |
 | `SLOPTWEAK_MOCK_UPDATE=<version>` | Mock mode: pretend that version is released (update banner, install is a no-op) |
-| `SLOPTWEAK_DEV_ASSETS_URL` | Where instances fetch the asset bundle (default: the `instance-v0.1.0` pre-release, same bytes as the pin). Release builds always use `releases/download/v<version>/` |
+| `SLOPTWEAK_DEV_ASSETS_URL` | Where instances fetch the asset bundle (default: the `instance-v0.1.1` pre-release, same bytes as the pin). Release builds always use `releases/download/v<version>/` |
 | `SLOPTWEAK_MOCK_SIDECAR=http` + `SLOPTWEAK_DEV_LAUNCH_SECRET` | Mock mode: talk to a real `sidecar.py` at `SLOPTWEAK_MOCK_REMOTE` with this fixed launch secret (`dev/sync-check.mjs`) |
 
 Mock mode saves its fake images to `%LOCALAPPDATA%\com.sloptweak.launcher\mock\output`,

@@ -44,7 +44,7 @@ says so in the release notes.
    in `ASSETS_SHA256` in `config.rs`. CI rebuilds the bundle and fails the release
    if the hash doesn't match the pin. Then run a real-Vast acceptance with a debug
    build, pointing `SLOPTWEAK_DEV_ASSETS_URL` at a test upload of the new bundle
-   (debug builds use the `instance-v0.1.0` pre-release by default, because
+   (debug builds use the `instance-v0.1.1` pre-release by default, because
    `vX.Y.Z` doesn't exist yet).
 3. Merge to `main` with CI green. Optionally run the **Release** workflow by hand
    (Actions → Release → Run workflow) for a dry run: it builds and signs
