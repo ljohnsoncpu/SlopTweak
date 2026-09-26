@@ -16,11 +16,42 @@ pub fn redact(text: &str, known: &[&str]) -> String {
     for s in known {
         // Very short "secrets" would mangle ordinary text; patterns cover them.
         if s.len() >= 8 {
-            out = out.replace(s, MASK);
+            for form in encodings(s) {
+                out = out.replace(&form, MASK);
+            }
         }
     }
     let out = redact_bearer(&out);
     redact_tokens(&out)
+}
+
+/// A secret as it may appear in text: raw, JSON-escaped, percent-encoded
+/// (either hex case), and form-encoded. Raw comes first.
+fn encodings(secret: &str) -> Vec<String> {
+    let mut forms = vec![secret.to_string()];
+    if let Ok(json) = serde_json::to_string(secret) {
+        forms.push(json.trim_matches('"').to_string());
+    }
+    let pct = percent_encode(secret);
+    forms.push(pct.to_ascii_lowercase());
+    forms.push(pct);
+    forms.push(url::form_urlencoded::byte_serialize(secret.as_bytes()).collect());
+    forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    forms.dedup();
+    forms
+}
+
+/// RFC 3986: everything but unreserved characters as `%XX`.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn redact_bearer(text: &str) -> String {
@@ -142,6 +173,28 @@ mod tests {
         assert_eq!(redact(s, &[]), s);
         let long_words = "registering bananaSplitzXXL_121.safetensors";
         assert_eq!(redact(long_words, &[]), long_words);
+    }
+
+    #[test]
+    fn encoded_known_secrets_are_masked() {
+        let key = "k3y/with+odd=chars\"x";
+        for text in [
+            "raw k3y/with+odd=chars\"x end".to_string(),
+            "url ?t=k3y%2Fwith%2Bodd%3Dchars%22x end".to_string(),
+            "lower ?t=k3y%2fwith%2bodd%3dchars%22x end".to_string(),
+            "json {\"t\":\"k3y/with+odd=chars\\\"x\"} end".to_string(),
+        ] {
+            let r = redact(&text, &[key]);
+            assert!(r.contains(MASK) && !r.contains("odd"), "{text} -> {r}");
+        }
+    }
+
+    #[test]
+    fn short_civitai_key_is_masked_when_known() {
+        // Shorter than the pattern threshold, so only the known value catches it.
+        let key = "a1b2c3d4e5f6a7b8c9d0";
+        assert_eq!(redact(&format!("got {key}"), &[]), format!("got {key}"));
+        assert_eq!(redact(&format!("got {key}"), &[key]), "got [REDACTED]");
     }
 
     #[test]

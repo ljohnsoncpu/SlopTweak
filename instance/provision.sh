@@ -127,12 +127,6 @@ while IFS=$'\t' read -r _ _ size _ _; do
   TOTAL_BYTES=$((TOTAL_BYTES + size))
 done <<<"$MODEL_LINES"
 
-AUTH_HEADER_FILE="$STATE_DIR/civitai.header"
-if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
-  # Header file keeps the token out of the process list.
-  (umask 077 && printf 'Authorization: Bearer %s\n' "$CIVITAI_TOKEN" >"$AUTH_HEADER_FILE")
-fi
-
 bytes_on_disk() {
   local total=0 f
   for f in "$MODELS_DIR"/*; do
@@ -144,20 +138,24 @@ bytes_on_disk() {
 download_model() {
   local url="$1" sha="$2" size="$3" name="$4" needs_token="$5"
   local dest="$MODELS_DIR/$name" part="$MODELS_DIR/$name.part"
-  local -a auth=()
+  local -a opts=(-fL --silent --show-error -C - -o "$part")
   if [[ -f "$dest" ]] && [[ "$(stat -c %s "$dest")" == "$size" ]]; then
     log "already present: $name"
     return 0
   fi
   if [[ "$needs_token" == 1 ]]; then
-    [[ -f "$AUTH_HEADER_FILE" ]] || fail "$name needs a CivitAI key"
-    auth=(-H "@$AUTH_HEADER_FILE")
+    [[ -n "${CIVITAI_TOKEN:-}" ]] || fail "$name needs a CivitAI key"
   fi
   local attempt pid
   for attempt in 1 2 3 4 5; do
     # curl does not send custom Authorization headers to other hosts on redirect.
-    curl -fL --silent --show-error -C - "${auth[@]}" -o "$part" "$url" \
-      2>>"$LOG_DIR/download.log" &
+    if [[ "$needs_token" == 1 ]]; then
+      # Header on stdin: the token never touches disk or the process list.
+      printf 'Authorization: Bearer %s\n' "$CIVITAI_TOKEN" |
+        curl "${opts[@]}" -H @- "$url" 2>>"$LOG_DIR/download.log" &
+    else
+      curl "${opts[@]}" "$url" </dev/null 2>>"$LOG_DIR/download.log" &
+    fi
     pid=$!
     while kill -0 "$pid" 2>/dev/null; do
       status downloading "$name" "$(awk -v a="$(bytes_on_disk)" -v b="$TOTAL_BYTES" \
@@ -182,7 +180,6 @@ download_model() {
 while IFS=$'\t' read -r url sha size name needs_token; do
   download_model "$url" "$sha" "$size" "$name" "$needs_token"
 done <<<"$MODEL_LINES"
-rm -f "$AUTH_HEADER_FILE"
 
 # ---- Register with Invoke ----------------------------------------------------
 status starting "waiting for Invoke"

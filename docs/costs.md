@@ -42,14 +42,14 @@ because a paused GPU still bills for its disk. It destroys the GPU when:
 | Nothing is happening in Invoke | after **20 idle minutes** | Settings |
 | Session length limit | after **4 hours** (warning 10 minutes before) | Settings |
 | Your PC crashes, sleeps, or loses the internet | about **10 minutes** after SlopTweak last checked in | — |
-| The GPU can't be set up | right away; SlopTweak tries up to 3 GPUs in total | — |
+| The GPU can't be set up | right away; SlopTweak tries up to 3 GPUs in total. If your PC is off by then, about 10 minutes after setup stopped | — |
 
-The GPU shuts **itself** down in the idle, time-limit, and lost-contact cases,
-so it works even when your PC is off. The next time you open SlopTweak it checks
+The GPU shuts **itself** down in the idle, time-limit, lost-contact, and failed-setup
+cases, so it works even when your PC is off. The next time you open SlopTweak it checks
 for anything left running and offers to shut it down.
 
-Your images are copied to your PC as you make them, so a shutdown never loses
-anything that was finished.
+Your images are copied to your PC as you make them. If any couldn't be copied
+before a shutdown, SlopTweak says so instead of reporting everything saved.
 
 ## Protecting your credit
 

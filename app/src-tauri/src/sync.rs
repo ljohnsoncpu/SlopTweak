@@ -34,7 +34,8 @@ use crate::sidecar::{InvokeImage, SidecarApi, SidecarError};
 pub const CANVAS_DIR: &str = "Canvas";
 /// Invoke allows up to 1000 per page.
 const PAGE: u64 = 100;
-/// Download failures before an image is given up on for this session.
+/// Download failures before an image is only retried on full passes. It is
+/// never given up on: it stays missing until it's saved or deleted in Invoke.
 const MAX_TRIES: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +150,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub struct Ledger {
     pub gallery: BTreeSet<String>,
     pub canvas: BTreeSet<String>,
-    /// Seen and deliberately not saved (already in the gallery, gone, given up).
+    /// Seen and deliberately not saved (already in the gallery, gone, bad name).
     pub ignored: BTreeSet<String>,
     /// Finished queue items whose Canvas results are all handled.
     pub queue_done: BTreeSet<u64>,
@@ -242,6 +243,9 @@ pub struct OutputSync {
     output_dir: OutputDir,
     ledger: Ledger,
     tries: HashMap<String, u32>,
+    /// Failed [`MAX_TRIES`] times: skipped by quick passes, retried by full
+    /// ones, and always counted as missing.
+    deferred: BTreeSet<String>,
     report: SyncReport,
 }
 
@@ -289,6 +293,7 @@ impl OutputSync {
             output_dir,
             ledger,
             tries: HashMap::new(),
+            deferred: BTreeSet::new(),
             report,
         }
     }
@@ -315,7 +320,7 @@ impl OutputSync {
         };
         self.report.saved = self.ledger.gallery.len();
         self.report.canvas_saved = self.ledger.canvas.len();
-        self.report.missing = t.missing;
+        self.report.missing = t.missing + self.deferred.len();
         self.report.last_error = match &result {
             Err(e) => Some(format!("Couldn't reach the GPU: {e}")),
             Ok(()) => t.error,
@@ -341,7 +346,7 @@ impl OutputSync {
                 .await?;
             let mut fresh = 0;
             for img in &page.items {
-                if self.ledger.knows(&img.image_name) {
+                if self.ledger.knows(&img.image_name) || self.skip(&img.image_name, full) {
                     continue;
                 }
                 fresh += 1;
@@ -388,6 +393,10 @@ impl OutputSync {
                 if self.ledger.knows(name) {
                     continue;
                 }
+                if self.skip(name, full) {
+                    all_handled = false;
+                    continue;
+                }
                 let outcome = match self
                     .sidecar
                     .image_info(&self.base, &self.secret, name)
@@ -408,8 +417,17 @@ impl OutputSync {
         Ok(())
     }
 
+    /// A quick pass leaves images that keep failing to the next full pass.
+    fn skip(&self, name: &str, full: bool) -> bool {
+        !full && self.deferred.contains(name)
+    }
+
     /// Book one image's outcome. Returns false if it should be tried again.
     fn record(&mut self, name: &str, outcome: Outcome, t: &mut Tally) -> bool {
+        if !matches!(outcome, Outcome::Retry(_)) {
+            self.deferred.remove(name);
+            self.tries.remove(name);
+        }
         match outcome {
             Outcome::Saved(kind) => {
                 let set = match kind {
@@ -426,7 +444,10 @@ impl OutputSync {
                 true
             }
             Outcome::Retry(why) => {
-                t.missing += 1;
+                // Deferred images are counted once, in `pass`.
+                if !self.deferred.contains(name) {
+                    t.missing += 1;
+                }
                 t.error = Some(why);
                 false
             }
@@ -462,13 +483,10 @@ impl OutputSync {
                 };
                 let n = self.tries.entry(img.image_name.clone()).or_default();
                 *n += 1;
-                return if *n >= MAX_TRIES {
-                    Outcome::Ignore(Some(format!(
-                        "Gave up on an image after {MAX_TRIES} tries: {why}"
-                    )))
-                } else {
-                    Outcome::Retry(format!("Couldn't download an image: {why}"))
-                };
+                if *n >= MAX_TRIES {
+                    self.deferred.insert(img.image_name.clone());
+                }
+                return Outcome::Retry(format!("Couldn't download an image: {why}"));
             }
         };
         let dir = match kind {

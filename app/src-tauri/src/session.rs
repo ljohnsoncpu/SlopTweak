@@ -33,7 +33,7 @@ use crate::config::{self, Settings};
 use crate::persist::{now_unix, ActiveRecord, RecordFile};
 use crate::provider::machines::MachineFile;
 use crate::provider::offers::{self, RankedOffer};
-use crate::provider::{GpuProvider, Health, InstanceInfo, ProviderError};
+use crate::provider::{self, GpuProvider, Health, InstanceInfo, ProviderError};
 use crate::redact::redact;
 use crate::secrets::{self, SecretStore};
 use crate::sidecar::{auth_url, Deadlines, SidecarApi, SidecarError, SidecarStatus};
@@ -497,6 +497,13 @@ pub fn new_launch_secret() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Random hex for a per-attempt instance label.
+fn new_nonce() -> String {
+    let mut bytes = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 pub fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
@@ -613,12 +620,21 @@ impl SessionManager {
             .is_some_and(|t| !t.is_finished())
     }
 
+    /// Every secret this session could echo: the launch secret and the
+    /// user's keys (a provider or sidecar message may contain them).
+    fn known_secrets(&self) -> Vec<String> {
+        let mut known: Vec<String> = [secrets::VAST_API_KEY, secrets::CIVITAI_TOKEN]
+            .into_iter()
+            .filter_map(|n| self.deps.secrets.get(n).ok().flatten())
+            .collect();
+        known.extend(self.active_secret());
+        known
+    }
+
     pub fn log(&self, msg: impl AsRef<str>) {
-        let line = {
-            let inner = self.inner.lock().unwrap();
-            let known: Vec<&str> = inner.active.iter().map(|a| a.secret.as_str()).collect();
-            redact(msg.as_ref(), &known)
-        };
+        let known = self.known_secrets();
+        let known: Vec<&str> = known.iter().map(String::as_str).collect();
+        let line = redact(msg.as_ref(), &known);
         let stamped = format!("{} {line}", now_unix());
         {
             let mut inner = self.inner.lock().unwrap();
@@ -634,13 +650,13 @@ impl SessionManager {
     /// Apply an event. Returns false (and changes nothing) if it isn't valid
     /// in the current state.
     fn apply(&self, ev: Event) -> bool {
+        let known = self.known_secrets();
+        let known: Vec<&str> = known.iter().map(String::as_str).collect();
         let new = {
             let mut inner = self.inner.lock().unwrap();
             match next(&inner.state, &ev) {
                 Ok(s) => {
                     if let Some(entry) = history_entry(&inner.state, &s) {
-                        let known: Vec<&str> =
-                            inner.active.iter().map(|a| a.secret.as_str()).collect();
                         let line = format!("{} {}", now_unix(), redact(&entry, &known));
                         if inner.history.len() >= HISTORY_LINES {
                             inner.history.pop_front();
@@ -942,14 +958,28 @@ impl SessionManager {
             }
 
             let secret = self.launch_secret();
-            let spec =
+            let mut spec =
                 config::launch_spec(&model, &settings, &sha256_hex(&secret), civitai.as_deref());
-            let instance_id = match self
+            spec.label = provider::attempt_label(&new_nonce());
+            let created = match self
                 .deps
                 .provider
                 .create_instance(best.offer.id, &spec)
                 .await
             {
+                Err(e) if e.create_may_have_succeeded() => {
+                    self.log(format!(
+                        "create on offer {} failed ({e}); checking whether it went through",
+                        best.offer.id
+                    ));
+                    match self.find_created(&spec.label).await {
+                        Some(id) => Ok(id),
+                        None => Err(e),
+                    }
+                }
+                other => other,
+            };
+            let instance_id = match created {
                 Ok(id) => id,
                 Err(ProviderError::OfferUnavailable) => {
                     self.log(format!("offer {} was taken", best.offer.id));
@@ -962,9 +992,14 @@ impl SessionManager {
                     continue;
                 }
                 Err(e) => {
-                    self.apply(Event::Fail {
-                        reason: format!("Couldn't rent the GPU: {e}"),
-                    });
+                    let reason = if e.create_may_have_succeeded() {
+                        format!(
+                            "Couldn't rent the GPU: {e}. If a GPU shows up in the Vast console                              anyway, SlopTweak offers to shut it down next time it starts."
+                        )
+                    } else {
+                        format!("Couldn't rent the GPU: {e}")
+                    };
+                    self.apply(Event::Fail { reason });
                     return;
                 }
             };
@@ -1428,6 +1463,27 @@ impl SessionManager {
         self.forget(instance_id);
         self.deps.ui.close_remote();
         self.apply(Event::InstanceGone { reason });
+    }
+
+    /// After a create call failed ambiguously: the instance it may have made,
+    /// found by its per-attempt label.
+    async fn find_created(&self, label: &str) -> Option<u64> {
+        for attempt in 1..=4 {
+            if attempt > 1 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            match self.deps.provider.list_instances().await {
+                Ok(list) => {
+                    if let Some(i) = list.iter().find(|i| i.label.as_deref() == Some(label)) {
+                        self.log(format!("the create went through: instance {}", i.id));
+                        return Some(i.id);
+                    }
+                }
+                Err(e) => self.log(format!("couldn't list instances: {e}")),
+            }
+        }
+        self.log("no instance was created");
+        None
     }
 
     /// Destroy, then poll until the provider no longer lists the instance.

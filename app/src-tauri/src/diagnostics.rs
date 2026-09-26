@@ -340,7 +340,7 @@ mod tests {
             "== state history ==",
             "== log ==",
             "ghcr.io/invoke-ai/invokeai:v6.14.1-cuda (digest 39a7e3b182c4…)",
-            "sha256 2ff1ecf68f27…",
+            "sha256 ea4bd0bc22da…",
             "Bearer [REDACTED]",
         ] {
             assert!(text.contains(want), "missing {want:?}:\n{text}");

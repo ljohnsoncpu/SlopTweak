@@ -104,6 +104,8 @@ jobs:
           project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
           signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
           artifact-configuration-slug: app-exe
+          parameters: |
+            version: "${{ steps.version.outputs.version }}"
           github-artifact-id: ${{ steps.exe-unsigned.outputs.artifact-id }}
           wait-for-completion: true
           wait-for-completion-timeout-in-seconds: 3600
@@ -149,6 +151,8 @@ jobs:
           project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
           signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
           artifact-configuration-slug: installer
+          parameters: |
+            version: "${{ steps.version.outputs.version }}"
           github-artifact-id: ${{ steps.setup-unsigned.outputs.artifact-id }}
           wait-for-completion: true
           wait-for-completion-timeout-in-seconds: 3600
@@ -175,7 +179,9 @@ jobs:
             echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set"; exit 1
           fi
           f=$(ls ../out/installer/*-setup.exe)
-          npx tauri signer sign "$f" > /dev/null
+          # --app-version binds the signature to this version, so a manifest
+          # can't pass off an older signed installer as a newer release.
+          npx tauri signer sign --app-version "$VERSION" "$f" > /dev/null
           python ../.github/scripts/release_files.py latest-json \
             --version "$VERSION" --installer "$f" --signature "$f.sig" \
             --notes "SlopTweak $VERSION. See the release page for details." \
@@ -209,6 +215,8 @@ jobs:
             echo "SlopTweak $VERSION for Windows 10/11 (x64)."
             echo
             echo "Download **$(basename out/installer/*-setup.exe)** and run it. $signed"
+            echo
+            echo "Code signing policy: https://github.com/$GITHUB_REPOSITORY#code-signing-policy"
             echo
             echo "SHA-256:"
             echo '```'

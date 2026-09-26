@@ -11,6 +11,10 @@ the variable below is set.
      this folder:
      - `app-exe`: [`artifact-configurations/app-exe.xml`](artifact-configurations/app-exe.xml)
      - `installer`: [`artifact-configurations/installer.xml`](artifact-configurations/installer.xml)
+
+     Both require a `version` parameter (release.yml passes the release
+     version) and restrict the file's ProductName to `SlopTweak` and its
+     ProductVersion to that version.
    - **Signing policy:** the Foundation's release-signing policy, with manual
      approval by the Approver listed in the README. Note its slug.
    - **API token:** a CI user with *submitter* rights on the project.

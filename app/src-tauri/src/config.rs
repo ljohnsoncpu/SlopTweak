@@ -23,7 +23,7 @@ pub const ASSETS_URL: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "/instance-assets.tar.gz"
 );
-pub const ASSETS_SHA256: &str = "2ff1ecf68f2766a2c75b16e069670b8caca64405195313fd4439b1d619693811";
+pub const ASSETS_SHA256: &str = "ea4bd0bc22da9dfb0c0f49612388ca9346ece88211df1ddfdd8eca5c0afcaa99";
 /// Debug builds of a version that has no release yet fetch the same bytes
 /// from the Phase 1 pre-release; `SLOPTWEAK_DEV_ASSETS_URL` overrides it
 /// (the instance still checks [`ASSETS_SHA256`]).

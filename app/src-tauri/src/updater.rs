@@ -3,6 +3,9 @@
 //! The endpoint and public key are in `tauri.conf.json`; the plugin checks
 //! the minisign signature of the downloaded installer against that key
 //! before running it, so a tampered `latest.json` or installer is refused.
+//! `requireSignedVersion` also makes it check that the signature was made
+//! for the version `latest.json` announces (release.yml signs with
+//! `--app-version`), so an older signed installer can't pose as an update.
 //! The UI can't call the plugin directly (no capability grants it); these
 //! helpers and the `check_update` / `install_update` commands in `lib.rs`
 //! are the only way in.
@@ -78,6 +81,8 @@ mod tests {
             "https://github.com/ljohnsoncpu/SlopTweak/releases/latest/download/latest.json"
         );
         assert!(up.get("dangerousInsecureTransportProtocol").is_none());
+        assert_eq!(up["requireSignedVersion"], true);
+        assert!(up.get("allowDowngrades").is_none());
         // minisign public key, base64 of "untrusted comment: minisign public key: …"
         let key = up["pubkey"].as_str().unwrap();
         use base64::Engine;

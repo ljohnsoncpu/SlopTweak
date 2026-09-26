@@ -107,6 +107,10 @@ struct AppState {
     /// Serialises read-modify-write of settings.json.
     settings_lock: Mutex<()>,
     update: Mutex<Option<(UpdateInfo, PendingUpdate)>>,
+    /// True while an update downloads and installs. Starting (or
+    /// reattaching) a session and installing exclude each other through this
+    /// lock: the installer exits the app, skipping the last sync and destroy.
+    installing: tokio::sync::Mutex<bool>,
 }
 
 fn output_dir(config_dir: &std::path::Path, default: &std::path::Path) -> PathBuf {
@@ -505,8 +509,14 @@ async fn start_session(st: State<'_, AppState>, model_id: String) -> Result<(), 
         return Err(msg);
     }
     let civitai = st.secret(secrets::CIVITAI_TOKEN);
+    let installing = st.installing.lock().await;
+    if *installing {
+        return Err(UPDATING.into());
+    }
     m.start(model, settings, civitai)
 }
+
+const UPDATING: &str = "SlopTweak is installing an update and will restart.";
 
 #[tauri::command]
 async fn stop_session(st: State<'_, AppState>) -> Result<(), String> {
@@ -794,6 +804,10 @@ async fn destroy_orphan(st: State<'_, AppState>, instance_id: u64) -> Result<(),
 
 #[tauri::command]
 async fn reattach_orphan(st: State<'_, AppState>, instance_id: u64) -> Result<(), String> {
+    let installing = st.installing.lock().await;
+    if *installing {
+        return Err(UPDATING.into());
+    }
     st.manager()?.reattach(instance_id).await
 }
 
@@ -953,7 +967,21 @@ async fn check_update(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
 /// replaces the app and restarts it, so a success doesn't return.
 #[tauri::command]
 async fn install_update(app: AppHandle, st: State<'_, AppState>) -> Result<(), String> {
-    updater::may_install(session_active(&app))?;
+    {
+        let mut installing = st.installing.lock().await;
+        if *installing {
+            return Err("The update is already being installed.".into());
+        }
+        updater::may_install(session_active(&app))?;
+        *installing = true;
+    }
+    let result = install_pending(&app, &st).await;
+    // Only reached if nothing was installed (mock mode or an error).
+    *st.installing.lock().await = false;
+    result
+}
+
+async fn install_pending(app: &AppHandle, st: &AppState) -> Result<(), String> {
     let Some((info, pending)) = st.update.lock().unwrap().take() else {
         return Err("No update is waiting. Check for updates first.".into());
     };
@@ -966,12 +994,10 @@ async fn install_update(app: AppHandle, st: State<'_, AppState>) -> Result<(), S
         }
         PendingUpdate::Real(u) => u,
     };
-    // The installer closes this process: close the Invoke window first.
-    st.ui.remote.close();
     let mut received = 0usize;
     let progress_app = app.clone();
-    update
-        .download_and_install(
+    let bytes = update
+        .download(
             move |chunk, total| {
                 received += chunk;
                 if let Some(t) = total.filter(|t| *t > 0) {
@@ -982,6 +1008,14 @@ async fn install_update(app: AppHandle, st: State<'_, AppState>) -> Result<(), S
             || {},
         )
         .await
+        .map_err(|e| format!("The update didn't download ({e}). SlopTweak wasn't changed."))?;
+    // `installing` has kept sessions from starting since the check above;
+    // check again right before the installer takes over, to be sure.
+    updater::may_install(session_active(app))?;
+    // The installer closes this process: close the Invoke window first.
+    st.ui.remote.close();
+    update
+        .install(bytes)
         .map_err(|e| format!("The update didn't install ({e}). SlopTweak wasn't changed."))?;
     app.exit(0);
     Ok(())
@@ -1025,8 +1059,10 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            // Mock mode (and every SLOPTWEAK_MOCK_* hook, read only in it) is
+            // dev-only: a release build always talks to Vast.
             let mode = match std::env::var("SLOPTWEAK_PROVIDER").as_deref() {
-                Ok("mock") => Mode::Mock,
+                Ok("mock") if cfg!(debug_assertions) => Mode::Mock,
                 _ => Mode::Vast,
             };
             // Mock mode gets its own credential service and folders, so fake
@@ -1099,6 +1135,7 @@ pub fn run() {
                 credit: Mutex::new(None),
                 settings_lock: Mutex::new(()),
                 update: Mutex::new(None),
+                installing: tokio::sync::Mutex::new(false),
             });
             eprintln!("[sloptweak] provider mode: {mode:?}");
             // Created here rather than from config so dev builds can attach a

@@ -48,6 +48,7 @@
       "endpoints": [
         "https://github.com/ljohnsoncpu/SlopTweak/releases/latest/download/latest.json"
       ],
+      "requireSignedVersion": true,
       "windows": {
         "installMode": "passive"
       }

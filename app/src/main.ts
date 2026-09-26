@@ -270,6 +270,8 @@ let estimate: Estimate | null = null;
 let view: "wizard" | "home" | "settings" = "home";
 let update: UpdateInfo | null = null;
 let updateDismissed = false;
+/** An update is downloading/installing; the app will exit, so no new session. */
+let installing = false;
 let wizardStep = 0;
 let tick: number | undefined;
 
@@ -382,7 +384,7 @@ function renderUpdate(): void {
   ui.updateText.textContent = `SlopTweak ${update.version} is available (you have ${update.current}).`;
   ui.updateNotes.textContent = update.notes ?? "";
   const busy = active();
-  ui.updateInstall.disabled = busy;
+  ui.updateInstall.disabled = busy || installing;
   if (busy) ui.updateMsg.textContent = "You can update after you stop the GPU. Updating closes and reopens SlopTweak.";
   else if (ui.updateMsg.textContent?.startsWith("You can update")) ui.updateMsg.textContent = "";
 }
@@ -396,7 +398,7 @@ function render(): void {
   const refused = !active() && estimate?.gate.kind === "refuse";
 
   ui.start.hidden = active();
-  ui.start.disabled = !keysOk || refused || !currentModel();
+  ui.start.disabled = !keysOk || refused || !currentModel() || installing;
   ui.stop.hidden = !active() || s.kind === "stopping";
   ui.open.hidden = s.kind !== "ready";
   ui.tutorial.hidden = s.kind !== "ready";
@@ -1097,15 +1099,19 @@ ui.updateLater.onclick = () => {
 };
 ui.updateNotesLink.onclick = () => void openLink("release_notes");
 ui.updateInstall.onclick = async () => {
-  ui.updateInstall.disabled = true;
+  installing = true;
+  render();
   ui.updateMsg.textContent = "Downloading the update…";
   try {
     await invoke("install_update");
     // Real updates close the app here; mock mode returns.
     ui.updateMsg.textContent = "Installed. SlopTweak will restart.";
+    installing = false;
+    render();
   } catch (e) {
+    installing = false;
+    render();
     ui.updateMsg.textContent = String(e);
-    ui.updateInstall.disabled = false;
   }
 };
 

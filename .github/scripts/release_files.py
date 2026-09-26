@@ -10,6 +10,8 @@ Standard library only; runs on the Windows runner's Python.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime as dt
 import hashlib
 import json
@@ -44,6 +46,21 @@ def check_version(tag: str, root: Path = ROOT) -> str:
     return want
 
 
+def signed_version(sig_b64: str) -> str | None:
+    """The `version:` field of a Tauri updater signature's trusted comment."""
+    try:
+        text = base64.b64decode(sig_b64, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return None
+    for line in text.splitlines():
+        if line.startswith("trusted comment: "):
+            for field in line.removeprefix("trusted comment: ").split("	"):
+                key, _, value = field.partition(":")
+                if key == "version":
+                    return value
+    return None
+
+
 def latest_json(
     version: str,
     installer: Path,
@@ -57,6 +74,9 @@ def latest_json(
     sig = signature.read_text(encoding="utf-8").strip()
     if not sig:
         raise SystemExit(f"{signature} is empty")
+    if signed_version(sig) != version:
+        # The app sets requireSignedVersion and would refuse this update.
+        raise SystemExit(f"{signature} is not bound to version {version} (--app-version)")
     entry = {"signature": sig, "url": url}
     manifest = {
         "version": version,

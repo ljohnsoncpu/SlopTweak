@@ -42,7 +42,7 @@ Early releases may not be code-signed yet, so Windows SmartScreen can say
   the GPU runs, and once more before it shuts down.
 - **No surprise bills.** **Stop** or closing the app shuts the GPU down. If your
   PC crashes, sleeps, or goes offline, the GPU shuts itself down within about 10
-  minutes, and after 20 idle minutes or 4 hours in any case (you can change
+  minutes (also if its setup fails), and after 20 idle minutes or 4 hours in any case (you can change
   these). Next launch, SlopTweak finds anything left over and offers to shut it
   down.
 - **Private.** The InvokeAI page on the GPU needs a secret only your copy of the

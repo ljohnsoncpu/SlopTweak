@@ -757,6 +757,43 @@ Phase 4 total **~$0.084** (credit $11.2925 → $11.2089; late charges may post).
   dry run with artifacts only. Version fields must match the tag. Actions are
   pinned by SHA.
 
+### Review fixes (Codex review of PR #7, 2026-09-25)
+
+Verified locally, $0:
+- **Tauri updater version binding.** `tauri-plugin-updater` 2.12 has
+  `requireSignedVersion`: after checking the minisign signature it requires
+  the signature's trusted comment to carry `version:<v>` equal to the version
+  `latest.json` announces. CLI 2.11.5 writes it with
+  `tauri signer sign --app-version <v>` (checked: trusted comment
+  `timestamp:…\tfile:SlopTweak_0.2.0_x64-setup.exe\tversion:0.2.0`). Both on;
+  `release_files.py latest-json` refuses an unbound signature.
+- **PE version resources.** Both `sloptweak.exe` and the NSIS installer carry
+  ProductName `SlopTweak` and ProductVersion `X.Y.Z` (e.g. `0.2.1`), so the
+  SignPath configs restrict both to `SlopTweak` / `${version}`. The pinned
+  submit action takes `parameters:` as `<name>: "<json string>"` lines.
+  ⏳ Whether SignPath accepts the configs is only known once the project is
+  approved.
+- **curl `-H @-`** reads headers from stdin (checked against a local echo
+  server), so provision.sh passes the CivitAI header that way. No header
+  file, so nothing to clean up on failure.
+- **Deadman** (onstart.sh): a detached loop destroys the instance with
+  `CONTAINER_API_KEY` once the sidecar has been unreachable on
+  `127.0.0.1:8080` for max(HEARTBEAT_MINUTES, 10) minutes. It covers a failed
+  asset fetch or venv setup and a dead sidecar. Simulated against a fake API
+  (DELETE sent, key on stdin only); ⏳ not yet seen on a live instance.
+- **Asset pin moved** to `ea4bd0bc…` (provision.sh changed). The Phase 1
+  pre-release (`instance-v0.1.0`) no longer matches, so debug builds renting
+  real GPUs need `SLOPTWEAK_DEV_ASSETS_URL` pointing at a rebuilt bundle.
+
+Also changed: each create call uses a unique `sloptweak-<nonce>` label, and
+an ambiguous create failure (network, parse, 5xx) is checked against the
+instance list before giving up. An image that fails to download 5 times stays
+missing (quick passes skip it, the final pass retries it) instead of being
+dropped. Starting or reattaching a session and installing an update exclude
+each other until the installer runs. The session log redacts the stored Vast
+and CivitAI keys too, and every known secret is also masked JSON-escaped and
+percent-encoded. Mock mode is debug-only.
+
 ### Acceptance status (PLAN §4 Phase 5)
 
 | Criterion | Status |
