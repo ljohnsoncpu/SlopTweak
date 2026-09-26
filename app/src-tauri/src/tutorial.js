@@ -3,25 +3,104 @@
 // Plain page script: it has no Tauri IPC (the remote window has no
 // capabilities) and no secrets. It talks only to the page's own origin,
 // through the same session cookie Invoke uses. `CFG` is supplied by the
-// wrapper: { autoShow, force, sample (base64 JPEG), sampleName }.
+// wrapper: { autoShow, force, stage, stages, modelId, modelName, modelPage,
+// portrait (base64), portraitName, portraitType }.
 //
-// Skip and Done tell the app by navigating to /__sloptweak/tutorial/<done|
-// skipped>, which the app intercepts and blocks (remote.rs). Nothing else
-// crosses back.
+// It tells the app things by navigating to /__sloptweak/tutorial/<done|
+// skipped|stage/N|model-page>, which the app intercepts and blocks
+// (remote.rs). Nothing else crosses back. The stage number is how the
+// tutorial resumes on the next GPU: this page's localStorage is per tunnel
+// origin, so it's empty on every new instance.
 //
-// Written against Invoke 6.14.1's labels (en.json): Assets, New Canvas from
-// Image, As Raster Layer (Resize), Inpaint Mask, Brush, Invoke, Accept, Save
-// To Gallery.
+// Five stages, one character (PLAN §4 Phase 6). Labels and hotkeys are
+// Invoke 6.14.1's, checked against its source (docs/findings.md → "Label
+// check for the v2 copy"): Generate, Width, Height, Add Negative Prompt,
+// Seed, Random, Choose Prompt Template, Create Prompt Template, Positive
+// Prompt, Negative Prompt, Insert placeholder, Save, Assets, New Canvas from
+// Image, As Raster Layer (Resize), Inpaint Mask, Raster Layer, Add Layer,
+// Fit Bbox To Masks (Shift+B), Bbox (C), Brush (B), Reset Layer (Shift+C),
+// Image, Advanced Options, Scale Before Processing, Auto, Denoising
+// Strength, Opacity, Foreground Color, Accept (Enter), Save To Gallery, Save
+// Canvas To Gallery. A future image bump must re-check them.
 (function (CFG) {
   "use strict";
   if (window.top !== window || window.__slopTweakTutorial) return;
 
-  const KEY = "sloptweak.tutorial";
+  const STAGES_N = CFG.stages || 5;
+
+  // Numbers, seeds, and tags tuned on real GPUs (PLAN §4 Phase 6; results in
+  // docs/findings.md → "Phase 6 tuning").
+  const TUNE = {
+    // Tuned live 2026-09-26 (docs/findings.md → "Phase 6 tuning"). A model
+    // with no seed here leaves Random on.
+    seed: { "banana-splitz-xxl": 42, "anima-aesthetic": 42, "anima-turbo": 123 },
+    // Our portrait: 0.3 turns the eyes a muddy olive and keeps the broken
+    // pupils (Banana Splitz) or leaves them red (Anima); 0.55 gives clean
+    // green eyes. Turbo at CFG 1 follows the prompt more loosely: 0.55-0.6
+    // stay olive, 0.65-0.7 turn green.
+    eyeDenoiseLow: "0.3",
+    eyeDenoiseHigh: { "anima-turbo": "0.65" },
+    eyeDenoiseHighDefault: "0.55",
+    // With a ~50% blue band painted: a clear see-through visor at 0.6–0.75,
+    // cleanest at 0.7. Without paint the model draws thin glasses instead.
+    visorDenoise: "0.7",
+    visorDenoiseRange: "0.6–0.75",
+    visorOpacity: "50",
+    visorPrompt: "transparent blue cyberpunk visor",
+    // Per catalog model, from its page (2026-09-26). Checked live on Anima
+    // Aesthetic (less oversaturated, better shading); Banana Splitz's is from
+    // its examples only.
+    // Banana Splitz: tags in most of the 10 example prompts of v1.2.1 and
+    // in all 10 negatives. Anima: the model card's recommended prefix and
+    // negative, minus the score_* tags it says to leave out on Aesthetic.
+    template: {
+      "banana-splitz-xxl": {
+        tags: "masterpiece, best quality, amazing quality, very aesthetic, absurdres, newest",
+        negative: "worst quality, low quality, lowres, bad quality, bad hands, mutated hands, signature, artist name, sketch",
+      },
+      "anima-aesthetic": {
+        tags: "masterpiece, best quality, safe",
+        negative: "worst quality, low quality, artist name, blurry, jpeg artifacts, chromatic aberration",
+      },
+      "anima-turbo": {
+        tags: "masterpiece, best quality, safe",
+        negative: "worst quality, low quality, artist name, blurry, jpeg artifacts, chromatic aberration",
+      },
+    },
+    // Settings a model needs that Invoke's defaults (CFG 7.5, 30 steps) get
+    // wrong; the catalog description says the same.
+    settings: {
+      "anima-turbo":
+        "Turbo needs its own settings: in the <b>Generation</b> section, open <b>Advanced Options</b> " +
+        "and set <b>CFG Scale</b> to <code>1</code> and <b>Steps</b> to <code>10</code>. ",
+    },
+    // At CFG 1 there's no negative guidance, so a negative prompt does nothing.
+    noNegative: { "anima-turbo": true },
+    // Per catalog model, from its page: the caption style it expects.
+    captionHint: {
+      "banana-splitz-xxl": "Its examples are almost all tags, starting with quality tags.",
+      "anima-aesthetic":
+        "It knows both tags and sentences; its page asks for lowercase tags, with spaces instead of underscores.",
+      "anima-turbo":
+        "It knows both tags and sentences; its page asks for lowercase tags, with spaces instead of underscores.",
+    },
+  };
+
+  // The fixed character (user-supplied; PLAN §4 Phase 6). Verbatim.
+  const POSITIVE =
+    "a woman standing in front of a white background,\n" +
+    "solo, female, human, white background, black tank top, black jeans, red eyes, red hair, " +
+    "simple background, front view, forehead, standing, medium shot, smile";
+  const NEGATIVE = "nsfw";
+  const WIDTH = 832;
+  const HEIGHT = 1216;
+
+  const KEY = "sloptweak.tutorial.v2"; // v1 kept a different shape
   const load = () => {
     try {
-      return JSON.parse(localStorage.getItem(KEY) || "{}") || {};
+      return JSON.parse(localStorage.getItem(KEY) || "null");
     } catch {
-      return {};
+      return null;
     }
   };
   const store = () => {
@@ -31,63 +110,272 @@
       /* private mode: this page only */
     }
   };
-  // step: 0 intro .. 4 accept; status: "open" | "min" | "closed"
-  let st = Object.assign({ step: 0, status: CFG.autoShow ? "open" : "closed" }, load());
+
+  const clampStage = (n) => Math.max(1, Math.min(STAGES_N, n | 0 || 1));
+  // stage: 0 = the home card, 1..STAGES_N; step: index into visible steps.
+  // status: "open" | "min" | "closed". resume: the stage "Continue" goes to.
+  // jumped: this stage was entered from the home card, not from the stage
+  // before it, so the canvas may be empty (a new GPU). base: queue
+  // baselines per step. image: the fallback portrait's name in Invoke.
+  let st = load() || {
+    stage: 0,
+    step: 0,
+    status: CFG.autoShow ? "open" : "closed",
+    resume: clampStage(CFG.stage),
+    signaled: clampStage(CFG.stage),
+  };
+  st.base = st.base || {};
   // "Show tutorial" in the app opened this window: show it once, not on
   // every reload of the window.
   try {
     if (CFG.force && !sessionStorage.getItem("sloptweak.forced")) {
       sessionStorage.setItem("sloptweak.forced", "1");
       st.status = "open";
-      if (st.step >= 4) st.step = 0;
     }
   } catch {
     /* no storage: fine */
   }
 
-  const PROMPT = "a bowl of oranges";
-  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  const esc = (s) =>
+    String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  const model = CFG.modelName ? `<b>${esc(CFG.modelName)}</b>` : "this model";
+  const tpl = TUNE.template[CFG.modelId] || null;
+  const eyeHigh = TUNE.eyeDenoiseHigh[CFG.modelId] || TUNE.eyeDenoiseHighDefault;
 
-  const STEPS = [
+  // Text the Copy buttons put on the clipboard.
+  const COPY = {
+    positive: POSITIVE,
+    negative: NEGATIVE,
+    green: "green eyes",
+    visor: TUNE.visorPrompt,
+    tplPositive: tpl ? `${tpl.tags}, {prompt}` : "",
+    tplNegative: tpl ? tpl.negative : "",
+  };
+  const copyBtn = (k) => `<button data-act="copy" data-copy="${k}" class="mini">Copy</button>`;
+  const pageBtn = CFG.modelPage
+    ? `<button data-act="page" class="mini">Open the model page</button>`
+    : "";
+  const oursBtn = `<button data-act="ours">Use ours instead</button>`;
+  const promptBlock = `<pre>${esc(POSITIVE)}</pre>`;
+
+  // Steps with `jumpOnly` show only when the stage was entered from the
+  // home card (a new GPU has an empty gallery and canvas). `watch` moves on
+  // by itself when a generation finishes. `ours` shows the fallback button.
+  const onCanvas = {
+    jumpOnly: true,
+    ours: true,
+    title: "Get the picture on the canvas",
+    body: () =>
+      "This GPU starts empty, so set things up again. Paste the prompt into the prompt box " +
+      `${copyBtn("positive")}, and <code>${NEGATIVE}</code> in the negative box ${copyBtn("negative")} ` +
+      "(the <b>±</b> button shows it). " +
+      (st.image ? "Then" : "Then press <b>Use ours instead</b>,") +
+      " open the gallery's <b>Assets</b> tab, right-click our picture and choose " +
+      "<b>New Canvas from Image</b> → <b>As Raster Layer (Resize)</b>.",
+  };
+
+  const STAGES = [
     {
-      title: "Welcome to Invoke",
-      body:
-        "Want a two-minute tour? You'll change part of a picture: paint over something, " +
-        "say what should be there instead, and let the GPU redraw it.",
-      next: "Show me",
+      title: "Prompting",
+      steps: [
+        {
+          title: "Set up the Generate tab",
+          body: () =>
+            "Click the <b>Generate</b> tab on the left. " +
+            (TUNE.settings[CFG.modelId] || "") +
+            "In the <b>Image</b> section, set " +
+            `<b>Width</b> to <code>${WIDTH}</code> and <b>Height</b> to <code>${HEIGHT}</code>. ` +
+            `Then put this in the prompt box: ${promptBlock} ${copyBtn("positive")}`,
+        },
+        {
+          title: "Say what you don't want",
+          watch: true,
+          body: () =>
+            "Click the <b>±</b> button on the prompt box (<b>Add Negative Prompt</b>) and type " +
+            `<code>${NEGATIVE}</code> in the new box ${copyBtn("negative")}. The top box says what you ` +
+            "want; this one says what you don't. Some models can make adult pictures, and " +
+            `<code>${NEGATIVE}</code> here keeps this one safe. ` +
+            (TUNE.noNegative[CFG.modelId]
+              ? "One catch for Turbo: at CFG 1 it ignores the negative box, so also put " +
+                "<code>safe,</code> at the start of the prompt. "
+              : "") +
+            (TUNE.seed[CFG.modelId] !== undefined
+              ? `Turn off <b>Random</b> next to <b>Seed</b> and set it to <code>${esc(TUNE.seed[CFG.modelId])}</code>, so you get a picture we've tried. `
+              : "") +
+            "Now press <b>Invoke</b>. The first picture can take a minute.",
+        },
+        {
+          title: "A sentence, then tags",
+          body: () =>
+            "Your prompt had two parts. The first line is a plain sentence; the second is short tags " +
+            "separated by commas. Every model learned from its own kind of captions, so the best " +
+            `prompts copy its style. For ${model}, look at the example pictures and their prompts on its ` +
+            `page. ${esc(TUNE.captionHint[CFG.modelId] || "")} ${pageBtn}`,
+        },
+      ],
     },
     {
-      title: "Open the sample picture",
-      body:
-        "In the gallery on the right, click <b>Assets</b>. Right-click the picture of a room " +
-        "and choose <b>New Canvas from Image</b> → <b>As Raster Layer (Resize)</b>.",
-      thumb: true,
+      title: "Prompt Templates",
+      steps: [
+        {
+          title: "Find the model's usual tags",
+          body: () =>
+            `On ${model}'s page, look at the prompts of the example pictures. Tags that show up in ` +
+            "nearly every one, usually about quality or style, belong in a template, so you don't " +
+            "have to type them each time. Negative prompts repeat too." +
+            (tpl
+              ? ` For this model they are <code>${esc(tpl.tags)}</code>, and in the negative ` +
+                `<code>${esc(tpl.negative)}</code>.`
+              : "") +
+            ` ${pageBtn}`,
+        },
+        {
+          title: "Make a template",
+          body: () =>
+            "Above the prompt box, click <b>Choose Prompt Template</b>, then the <b>+</b> " +
+            "(<b>Create Prompt Template</b>). Name it after the model. In <b>Positive Prompt</b>, " +
+            "paste the tags, then click <b>Insert placeholder</b>: <code>{prompt}</code> is where your " +
+            "own words go" +
+            (tpl ? ` ${copyBtn("tplPositive")}` : "") +
+            ". Put the negative tags in <b>Negative Prompt</b>" +
+            (tpl ? ` ${copyBtn("tplNegative")}` : "") +
+            " and press <b>Save</b>.",
+        },
+        {
+          title: "Use it",
+          body: () =>
+            "Pick your template in the list. Your prompt box stays as it is; Invoke puts your words " +
+            "where <code>{prompt}</code> is when you press <b>Invoke</b>. Press it now and compare with " +
+            "your first picture. A template isn't tied to a model, so choose another one when you " +
+            "switch models.",
+        },
+      ],
     },
     {
-      title: "Paint over the vase",
-      body:
-        "In the layer list on the right, click <b>Inpaint Mask</b> (no mask there? Right-click " +
-        "the picture → <b>New Inpaint Mask</b>). Press <b>B</b> for the brush and paint over the " +
-        "whole vase and its flowers. Only what you paint gets redrawn.",
+      title: "To the canvas",
+      steps: [
+        {
+          title: "Open your picture on the canvas",
+          ours: true,
+          body: () =>
+            (st.image
+              ? "Our picture is in the gallery's <b>Assets</b> tab. Right-click it"
+              : "In the gallery on the right, right-click the picture you made") +
+            " and choose <b>New Canvas from Image</b> → <b>As Raster Layer (Resize)</b>." +
+            (st.image
+              ? ""
+              : st.jumped
+                ? " This GPU starts with an empty gallery, so press <b>Use ours instead</b>."
+                : " Not happy with it? Use ours; its eyes need fixing, which is next."),
+        },
+        {
+          title: "What you're looking at",
+          body: () =>
+            "Your picture is now a <b>Raster Layer</b> (see the layer list on the right). Above it is " +
+            "an empty <b>Inpaint Mask</b>, already selected: whatever you paint on it gets redrawn. The " +
+            "box with handles around the picture is the <b>bbox</b>, the area the model looks at.",
+        },
+      ],
     },
     {
-      title: "Say what goes there",
-      body:
-        "Click the prompt box at the top left and type what you want there, for example " +
-        `<code>${PROMPT}</code> <button data-act="copy" class="mini">Copy</button>. ` +
-        "Then press <b>Invoke</b>. The first picture can take a minute.",
-      watch: true,
+      title: "Fix the eyes",
+      steps: [
+        onCanvas,
+        {
+          title: "Mask the eyes",
+          body: () =>
+            "Click <b>Inpaint Mask</b> in the layer list, press <b>B</b> for the brush, and paint over " +
+            "both eyes. Only what you paint gets redrawn.",
+        },
+        {
+          title: "Fit the box, then give it the face",
+          body: () =>
+            "Press <b>Shift+B</b> (<b>Fit Bbox To Masks</b>): the bbox snaps tight around the eyes. " +
+            "Now press <b>C</b> and drag its corners out until it covers the whole face. The mask is " +
+            "what gets redrawn; the bbox is what the model sees, and it needs the face to draw eyes " +
+            "that fit.",
+        },
+        {
+          title: "Why a small box looks sharp",
+          body: () =>
+            "Look at the top left of the canvas: <b>Bbox</b> is small, but <b>Scaled Bbox</b> is " +
+            "much bigger. In the <b>Image</b> section, open <b>Advanced Options</b>: <b>Scale Before " +
+            "Processing</b> is <b>Auto</b>. Invoke enlarges the small bbox to the size the model works " +
+            "best at, draws there, and shrinks the result back. That's what brings back detail in a small face.",
+        },
+        {
+          title: "Recolor them, gently",
+          watch: true,
+          body: () =>
+            `In the prompt, change <code>red eyes</code> to <code>green eyes</code> ${copyBtn("green")}. ` +
+            `At the top of the layers panel, set <b>Denoising Strength</b> to <code>${TUNE.eyeDenoiseLow}</code> ` +
+            "and press <b>Invoke</b>.",
+        },
+        {
+          title: "Now a bit stronger",
+          watch: true,
+          body: () =>
+            `At <code>${TUNE.eyeDenoiseLow}</code> the eyes barely change, or turn a muddy half-green ` +
+            "that keeps any old smudges: low denoise keeps most of the old picture. Set " +
+            `<b>Denoising Strength</b> to <code>${eyeHigh}</code> and press <b>Invoke</b> again.`,
+        },
+        {
+          title: "Keep the best one",
+          body: () =>
+            "Your tries show on the canvas with a toolbar under it. Flip through them with the arrows " +
+            "and press <b>Accept</b> (or <b>Enter</b>) on the one you like. SlopTweak saves every try " +
+            "to the <b>Canvas</b> folder in your output folder.",
+        },
+      ],
     },
     {
-      title: "Keep the one you like",
-      body:
-        "Your results show on the picture, with a toolbar under it. Flip through them with the " +
-        "arrows and press <b>✓ Accept</b> to keep one. SlopTweak saves every try to the " +
-        "<b>Canvas</b> folder inside your output folder. To save the finished picture too, " +
-        "right-click it → <b>Save To Gallery</b> → <b>Save Canvas To Gallery</b>.",
-      next: "Done",
+      title: "A see-through visor",
+      steps: [
+        onCanvas,
+        {
+          title: "Paint a rough visor",
+          body: () =>
+            "If tries still show under the canvas, <b>Accept</b> one first: you can't paint while " +
+            "they're there. Under the layer list, click <b>+</b> (<b>Add Layer</b>) → <b>Raster Layer</b>. " +
+            "Click the color circles at the top left of the canvas (<b>Foreground Color</b>) and pick a " +
+            "bright blue. Press <b>B</b> and paint a thick band across both eyes. Rough is fine.",
+        },
+        {
+          title: "Make it see-through",
+          body: () =>
+            "With the new layer selected, set <b>Opacity</b> (just above the layer list) to about " +
+            `<code>${TUNE.visorOpacity}%</code>. The eyes show through the blue: that's the tinted ` +
+            "glass the model will draw.",
+        },
+        {
+          title: "Mask the band",
+          body: () =>
+            "Click <b>Inpaint Mask</b> in the layer list and press <b>Shift+C</b> (<b>Reset Layer</b>) " +
+            "to clear the old eye mask. Press <b>B</b> and paint over the whole band. Then " +
+            "<b>Shift+B</b>, and <b>C</b> to drag the bbox out over the head.",
+        },
+        {
+          title: "Describe it, then go big",
+          watch: true,
+          body: () =>
+            `Add <code>${esc(TUNE.visorPrompt)}</code> to the end of the prompt ${copyBtn("visor")}. ` +
+            `Set <b>Denoising Strength</b> to about <code>${TUNE.visorDenoise}</code> ` +
+            `(${TUNE.visorDenoiseRange}) and press <b>Invoke</b>. The eye fix needed no paint and ` +
+            "little denoise; a big change needs both.",
+        },
+        {
+          title: "Keep it and save it",
+          body: () =>
+            "Press <b>Accept</b> on the one you like. Accept puts it on the canvas but not in the " +
+            "gallery: right-click the canvas → <b>Save To Gallery</b> → <b>Save Canvas To Gallery</b> " +
+            "(or use <b>Save To Gallery</b> in the toolbar under the canvas before you accept).",
+          next: "Done",
+        },
+      ],
     },
   ];
+
+  const stepsOf = (n) => STAGES[n - 1].steps.filter((s) => !s.jumpOnly || st.jumped);
 
   const CSS = `
     :host { all: initial; }
@@ -95,20 +383,27 @@
       font: 14px/1.45 system-ui, "Segoe UI", sans-serif; color: #e6e8ee;
       background: #1c1f26; border: 1px solid #3b82f6; border-radius: 10px;
       box-shadow: 0 8px 28px rgba(0,0,0,.5); }
-    .card { width: 340px; padding: 14px 16px 12px; }
+    .card { width: 370px; max-height: calc(100vh - 32px); overflow: auto; box-sizing: border-box;
+      padding: 14px 16px 12px; }
     .pill { padding: 6px 12px; cursor: pointer; }
     .head { display: flex; align-items: center; gap: 8px; color: #93a4c3; font-size: 12px; }
     .head .sp { flex: 1; }
     h3 { margin: 6px 0 6px; font-size: 16px; color: #fff; }
-    p { margin: 0 0 10px; }
+    p, .body { margin: 0 0 10px; }
     b { color: #fff; }
     code { background: #2a2f3a; padding: 1px 5px; border-radius: 4px; }
-    img { display: block; width: 96px; height: 96px; object-fit: cover; border-radius: 6px;
+    pre { background: #2a2f3a; padding: 6px 8px; border-radius: 6px; margin: 6px 0 4px;
+      white-space: pre-wrap; font: 12px/1.4 ui-monospace, Consolas, monospace; }
+    img { display: block; width: 72px; height: 105px; object-fit: cover; border-radius: 6px;
       margin: 0 0 10px; border: 1px solid #3a3f4b; }
+    ol { margin: 0 0 10px; padding: 0; list-style: none; }
+    li button { width: 100%; text-align: left; margin: 0 0 4px; }
+    li .ok { color: #4ade80; }
     .row { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
     .row .sp { flex: 1; }
     button { font: inherit; border-radius: 6px; border: 1px solid #3a3f4b; background: #2a2f3a;
       color: #e6e8ee; padding: 5px 12px; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: default; }
     button.primary { background: #3b82f6; border-color: #3b82f6; color: #fff; }
     button.x { border: none; background: none; padding: 0 4px; font-size: 16px; color: #93a4c3; }
     button.mini { padding: 0 6px; font-size: 12px; }
@@ -137,6 +432,57 @@
     }
   }
 
+  const head = (label) => `<div class="head"><span>${label}</span><span class="sp"></span>
+      <button class="x" data-act="min" title="Minimize">–</button>
+      <button class="x" data-act="skip" title="Close the tutorial">×</button></div>`;
+
+  function homeCard() {
+    const first = st.resume === 1;
+    const list = STAGES.map(
+      (s, i) =>
+        `<li><button data-act="jump" data-stage="${i + 1}">${i + 1 < st.resume ? '<span class="ok">✓</span> ' : ""}` +
+        `${i + 1}. ${esc(s.title)}</button></li>`,
+    ).join("");
+    return `<div class="card" role="dialog" aria-label="SlopTweak tutorial" data-stage="0" data-step="0">
+        ${head("SlopTweak tutorial")}
+        <h3>${first ? "Welcome to Invoke" : "Welcome back"}</h3>
+        <p>${
+          first
+            ? "Five short lessons with one character: write a prompt, save your favorite tags, " +
+              "then fix and change the picture on the canvas. Leave whenever you like; SlopTweak " +
+              "remembers the stage you're on, even on your next GPU."
+            : `You were on stage ${st.resume}. Carry on, or pick any stage.`
+        }</p>
+        <ol>${list}</ol>
+        <div class="status"></div>
+        <div class="row">
+          <button class="link" data-act="skip">Skip</button><span class="sp"></span>
+          <button class="primary" data-act="start">${first ? "Start" : `Continue stage ${st.resume}`}</button>
+        </div>
+      </div>`;
+  }
+
+  function stepCard() {
+    const stage = STAGES[st.stage - 1];
+    const steps = stepsOf(st.stage);
+    const s = steps[st.step] || steps[0];
+    const last = st.stage === STAGES_N && st.step === steps.length - 1;
+    const thumb =
+      s.ours && st.image ? `<img alt="" src="/api/v1/images/i/${encodeURIComponent(st.image)}/thumbnail">` : "";
+    return `<div class="card" role="dialog" aria-label="SlopTweak tutorial" data-stage="${st.stage}" data-step="${st.step}">
+        ${head(`Stage ${st.stage} of ${STAGES_N} · ${esc(stage.title)} · ${st.step + 1}/${steps.length}`)}
+        <h3>${esc(s.title)}</h3>
+        <div class="body">${s.body()}</div>${thumb}
+        <div class="status"></div>
+        <div class="row">
+          <button data-act="back">Back</button>
+          ${s.ours && !st.image ? oursBtn : ""}
+          <span class="sp"></span>
+          <button class="primary" data-act="next">${esc(s.next || (last ? "Done" : "Next"))}</button>
+        </div>
+      </div>`;
+  }
+
   function render() {
     window.clearInterval(poll);
     poll = null;
@@ -147,27 +493,13 @@
     }
     mount();
     if (st.status === "min") {
-      root.innerHTML = `<style>${CSS}</style><div class="pill" data-act="restore">Tutorial · step ${st.step + 1} of ${STEPS.length}</div>`;
+      const where = st.stage ? ` · stage ${st.stage} of ${STAGES_N}` : "";
+      root.innerHTML = `<style>${CSS}</style><div class="pill" data-act="restore">Tutorial${where}</div>`;
       return;
     }
-    const s = STEPS[st.step] || STEPS[0];
-    const thumb =
-      s.thumb && st.image ? `<img alt="" src="/api/v1/images/i/${encodeURIComponent(st.image)}/thumbnail">` : "";
-    root.innerHTML = `<style>${CSS}</style>
-      <div class="card" role="dialog" aria-label="SlopTweak tutorial">
-        <div class="head"><span>SlopTweak tutorial · ${st.step + 1} of ${STEPS.length}</span><span class="sp"></span>
-          <button class="x" data-act="min" title="Minimize">–</button>
-          <button class="x" data-act="skip" title="Close the tutorial">×</button></div>
-        <h3>${esc(s.title)}</h3>
-        <p>${s.body}</p>${thumb}
-        <div class="status"></div>
-        <div class="row">
-          ${st.step === 0 ? '<button class="link" data-act="skip">Skip</button>' : '<button data-act="back">Back</button>'}
-          <span class="sp"></span>
-          <button class="primary" data-act="next">${esc(s.next || "Next")}</button>
-        </div>
-      </div>`;
-    if (s.watch) watchQueue();
+    root.innerHTML = `<style>${CSS}</style>${st.stage ? stepCard() : homeCard()}`;
+    const s = st.stage && stepsOf(st.stage)[st.step];
+    if (s && s.watch) watchQueue(`${st.stage}.${st.step}`);
   }
 
   async function queueStatus() {
@@ -177,18 +509,18 @@
     return j.queue || j;
   }
 
-  /** Step 3: move on by itself once a generation finishes. */
-  function watchQueue() {
+  /** Move on by itself once a generation finishes. */
+  function watchQueue(key) {
     const tick = async () => {
       try {
         const q = await queueStatus();
-        if (st.baseline === undefined) {
-          st.baseline = q.completed || 0;
+        if (st.base[key] === undefined) {
+          st.base[key] = q.completed || 0;
           store();
         }
-        if ((q.completed || 0) > st.baseline) {
-          go(4);
-          return;
+        if ((q.completed || 0) > st.base[key]) {
+          delete st.base[key];
+          return next();
         }
         const busy = (q.in_progress || 0) + (q.pending || 0);
         setStatus(busy ? "Making your picture…" : "");
@@ -200,34 +532,6 @@
     poll = window.setInterval(tick, 2000);
   }
 
-  function go(step) {
-    st.step = Math.max(0, Math.min(STEPS.length - 1, step));
-    if (st.step !== 3) delete st.baseline;
-    store();
-    render();
-  }
-
-  /** Put the sample in Invoke's Assets (once per GPU), then reload so the gallery shows it. */
-  async function ensureSample() {
-    if (st.image) {
-      const r = await fetch(`/api/v1/images/i/${encodeURIComponent(st.image)}`, { credentials: "same-origin" });
-      if (r.ok) return false;
-    }
-    const bin = atob(CFG.sample);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    const form = new FormData();
-    form.append("file", new Blob([bytes], { type: "image/jpeg" }), CFG.sampleName);
-    const r = await fetch("/api/v1/images/upload?image_category=user&is_intermediate=false", {
-      method: "POST",
-      body: form,
-      credentials: "same-origin",
-    });
-    if (!r.ok) throw new Error(`upload failed (HTTP ${r.status})`);
-    st.image = (await r.json()).image_name;
-    return true;
-  }
-
   /** Tell the app (it blocks this navigation, so the page stays). */
   function signal(kind) {
     try {
@@ -237,9 +541,73 @@
     }
   }
 
+  /** Enter stage `n` at its first step; `jumped` = from the home card. */
+  function enter(n, jumped) {
+    st.stage = clampStage(n);
+    st.step = 0;
+    st.jumped = jumped;
+    st.base = {};
+    st.resume = st.stage;
+    store();
+    render();
+    if (st.signaled !== st.stage) {
+      st.signaled = st.stage;
+      store();
+      signal(`stage/${st.stage}`);
+    }
+  }
+
+  function next() {
+    const steps = stepsOf(st.stage);
+    if (st.step < steps.length - 1) {
+      st.step += 1;
+      store();
+      return render();
+    }
+    if (st.stage < STAGES_N) return enter(st.stage + 1, false);
+    return close("done");
+  }
+
+  function back() {
+    if (st.step > 0) {
+      st.step -= 1;
+      delete st.base[`${st.stage}.${st.step}`];
+    } else {
+      st.stage = 0;
+    }
+    store();
+    render();
+  }
+
+  /** Put the fallback portrait in Invoke's Assets (once per GPU), then reload so the gallery shows it. */
+  async function ensurePortrait() {
+    if (st.image) {
+      const r = await fetch(`/api/v1/images/i/${encodeURIComponent(st.image)}`, { credentials: "same-origin" });
+      if (r.ok) return false;
+    }
+    const bin = atob(CFG.portrait);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const form = new FormData();
+    form.append("file", new Blob([bytes], { type: CFG.portraitType }), CFG.portraitName);
+    const r = await fetch("/api/v1/images/upload?image_category=user&is_intermediate=false", {
+      method: "POST",
+      body: form,
+      credentials: "same-origin",
+    });
+    if (!r.ok) throw new Error(`upload failed (HTTP ${r.status})`);
+    st.image = (await r.json()).image_name;
+    store();
+    return true;
+  }
+
   function close(kind) {
     st.status = "closed";
-    st.step = 0;
+    if (kind === "done") {
+      st.stage = 0;
+      st.resume = 1;
+      st.signaled = 1;
+    }
     store();
     render();
     signal(kind);
@@ -250,51 +618,46 @@
     if (!el) return;
     const act = el.getAttribute("data-act");
     if (act === "skip") return close("skipped");
-    if (act === "min") {
-      st.status = "min";
+    if (act === "min" || act === "restore") {
+      st.status = act === "min" ? "min" : "open";
       store();
       return render();
     }
-    if (act === "restore") {
-      st.status = "open";
-      store();
-      return render();
+    if (act === "back") return back();
+    if (act === "next") return next();
+    if (act === "start") return enter(st.resume, st.resume > 1);
+    if (act === "jump") {
+      const n = Number(el.getAttribute("data-stage"));
+      return enter(n, n > 1);
     }
-    if (act === "back") return go(st.step - 1);
+    if (act === "page") return signal("model-page");
     if (act === "copy") {
       try {
-        await navigator.clipboard.writeText(PROMPT);
+        await navigator.clipboard.writeText(COPY[el.getAttribute("data-copy")] || "");
         el.textContent = "Copied";
       } catch {
         el.textContent = "Select it and copy";
       }
       return;
     }
-    if (act !== "next") return;
-    if (st.step === STEPS.length - 1) return close("done");
-    if (st.step === 0) {
+    if (act === "ours") {
       el.disabled = true;
-      setStatus("Getting the sample picture ready…");
+      setStatus("Getting our picture ready…");
       try {
-        const uploaded = await ensureSample();
-        st.step = 1;
-        store();
         // Invoke's gallery doesn't hear about uploads made outside its own
-        // UI, so reload once to show the sample.
-        if (uploaded) return window.location.reload();
+        // UI, so reload once to show it.
+        if (await ensurePortrait()) return window.location.reload();
         return render();
       } catch (err) {
         el.disabled = false;
-        return setStatus(`Couldn't load the sample: ${err.message}`, "err");
+        return setStatus(`Couldn't load our picture: ${err.message}`, "err");
       }
     }
-    go(st.step + 1);
   }
 
   window.__slopTweakTutorial = {
     open() {
       st.status = "open";
-      if (st.step >= STEPS.length) st.step = 0;
       store();
       render();
     },

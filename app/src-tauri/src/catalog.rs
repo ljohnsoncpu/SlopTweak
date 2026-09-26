@@ -60,6 +60,8 @@ pub struct Model {
     /// model's Invoke config (`default_settings`) after registering it.
     #[serde(default)]
     pub default_settings: Option<DefaultSettings>,
+    #[serde(default)]
+    pub source: ModelSource,
 }
 
 /// A subset of Invoke's `MainModelDefaultSettings` (6.14.1). Invoke's UI
@@ -142,6 +144,16 @@ fn validate_defaults(d: &DefaultSettings, base: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Where the model came from. Only the page is used (the tutorial opens it).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelSource {
+    #[serde(default)]
+    pub page: Option<String>,
+}
+
+/// Hosts whose model pages the app will open in the user's browser.
+const PAGE_HOSTS: [&str; 2] = ["civitai.com", "huggingface.co"];
+
 impl Model {
     pub fn total_bytes(&self) -> u64 {
         self.files.iter().map(|f| f.size_bytes).sum()
@@ -149,6 +161,17 @@ impl Model {
 
     pub fn needs_civitai(&self) -> bool {
         self.files.iter().any(|f| f.requires_civitai_token)
+    }
+
+    /// The model's page, if it's an https page on CivitAI or Hugging Face.
+    pub fn page_url(&self) -> Option<Url> {
+        let u = Url::parse(self.source.page.as_deref()?).ok()?;
+        let ok = u.scheme() == "https"
+            && u.port().is_none()
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.host_str().is_some_and(|h| PAGE_HOSTS.contains(&h));
+        ok.then_some(u)
     }
 }
 
@@ -448,6 +471,34 @@ mod tests {
         assert_eq!(m.files[0].sha256.len(), 64);
         assert_eq!(m.invoke_min_version.as_deref(), Some("6.13.8"));
         assert_eq!(m.min_compute_cap, None);
+    }
+
+    #[test]
+    fn model_pages_are_https_on_known_hosts() {
+        for m in bundled() {
+            assert!(m.page_url().is_some(), "{} has a page", m.id);
+        }
+        let with = |page: &str| {
+            let mut e = entry("x");
+            e["source"] = json!({ "page": page, "civitai_model_id": 1 });
+            serde_json::from_value::<Model>(e).unwrap().page_url()
+        };
+        assert!(with("https://civitai.com/models/1/x").is_some());
+        assert!(with("https://huggingface.co/a/b").is_some());
+        for bad in [
+            "http://civitai.com/models/1",
+            "https://civitai.com.evil.com/",
+            "https://evil.com/?civitai.com",
+            "https://user@civitai.com/",
+            "https://civitai.com:8443/",
+            "file:///C:/x",
+            "javascript:alert(1)",
+            "not a url",
+        ] {
+            assert!(with(bad).is_none(), "{bad}");
+        }
+        let no_source: Model = serde_json::from_value(entry("x")).unwrap();
+        assert!(no_source.page_url().is_none());
     }
 
     #[test]

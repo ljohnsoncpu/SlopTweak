@@ -97,22 +97,29 @@ spent, and your credit left.
 
 If you close the Invoke window by accident, press **Open Invoke**.
 
-## 4. Inpainting: the built-in tutorial
+## 4. The built-in tutorial
 
-The first time Invoke opens, a small guide appears in its corner. It loads a
-sample picture and walks you through **inpainting**: painting over part of an
-image and describing what should go there instead.
+The first time Invoke opens, a small guide appears in its corner. It has five
+short stages, all with the same character:
 
-1. In the gallery, open **Assets**, right-click the sample picture, and choose
-   **New Canvas from Image → As Raster Layer (Resize)**.
-2. Select the **Inpaint Mask** layer, press **B** for the brush, and paint over
-   the part you want to change.
-3. Type what should be there (for example "a bowl of oranges") and press
-   **Invoke**.
-4. Press **✓ Accept** to keep the result on the canvas. To also keep it as its
-   own image, use **Save To Gallery** (the floppy-disk button).
+1. **Prompting.** Make the character in the **Generate** tab. The prompt is a
+   plain sentence, then tags; the **negative prompt** (`nsfw`) says what you
+   don't want.
+2. **Prompt Templates.** Save the tags a model likes (from its page) as a
+   template, with `{prompt}` where your own words go.
+3. **To the canvas.** Right-click your picture in the gallery →
+   **New Canvas from Image → As Raster Layer (Resize)**. Don't like yours?
+   **Use ours instead** loads a ready-made one.
+4. **Fix the eyes.** Paint a mask over the eyes, press **Shift+B** to fit the
+   box to it, widen the box to the face, and try a low and then a higher
+   **Denoising Strength**. **Accept** the one you like.
+5. **A see-through visor.** Paint a blue band on a new layer, lower its
+   **Opacity**, mask it, describe the visor, and use a high denoise. Accept
+   doesn't put the picture in the gallery: use **Save To Gallery**.
 
-You can skip it. To see it again, press **Show tutorial** in SlopTweak.
+You can leave between stages: SlopTweak remembers where you were, even on
+your next GPU. You can skip it or minimize it. To see it again, press
+**Show tutorial** in SlopTweak.
 
 ## 5. Stop, and where your images are
 
