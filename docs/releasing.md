@@ -43,9 +43,11 @@ says so in the release notes.
    `requirements.txt`): run `python instance/build_assets.py` and put the new hash
    in `ASSETS_SHA256` in `config.rs`. CI rebuilds the bundle and fails the release
    if the hash doesn't match the pin. Then run a real-Vast acceptance with a debug
-   build, pointing `SLOPTWEAK_DEV_ASSETS_URL` at a test upload of the new bundle
-   (debug builds use the `instance-v0.1.1` pre-release by default, because
-   `vX.Y.Z` doesn't exist yet).
+   build, pointing `SLOPTWEAK_DEV_ASSETS_URL` at a test upload of the new bundle.
+   Debug builds default to the pre-release named in `DEV_ASSETS_URL`
+   (config.rs; currently `instance-v0.1.2`), because `vX.Y.Z` doesn't exist
+   yet. Publish a new `instance-v0.1.N` and move it whenever the bundle
+   changes.
 3. Merge to `main` with CI green. Optionally run the **Release** workflow by hand
    (Actions → Release → Run workflow) for a dry run: it builds and signs
    everything and keeps the files as a workflow artifact, with no release.
