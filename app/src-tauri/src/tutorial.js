@@ -31,14 +31,19 @@
   // Numbers, seeds, and tags tuned on real GPUs (PLAN §4 Phase 6; results in
   // docs/findings.md → "Phase 6 tuning").
   const TUNE = {
-    // Tuned live 2026-09-26 (docs/findings.md → "Phase 6 tuning"). A model
-    // with no seed here leaves Random on.
+    // Tuned live 2026-09-26 at the ✨ settings below (docs/findings.md →
+    // "Phase 6 tuning" and "Re-tune at the catalog settings"). A model with
+    // no seed here leaves Random on.
     seed: { "banana-splitz-xxl": 42, "anima-aesthetic": 42, "anima-turbo": 123 },
-    // Our portrait: 0.3 turns the eyes a muddy olive and keeps the broken
-    // pupils (Banana Splitz) or leaves them red (Anima); 0.55 gives clean
-    // green eyes. Turbo at CFG 1 follows the prompt more loosely: 0.55-0.6
-    // stay olive, 0.65-0.7 turn green.
+    // Our portrait: 0.3 leaves Anima's eyes red and turns Banana Splitz's a
+    // yellowish green (pupils fixed); 0.55 gives clean green eyes. Turbo at
+    // CFG 1 follows the prompt more loosely: 0.55-0.6 stay olive, 0.65-0.7
+    // turn green.
     eyeDenoiseLow: "0.3",
+    eyeLowResult: {
+      "banana-splitz-xxl": "the eyes only turn a yellowish green",
+    },
+    eyeLowResultDefault: "the eyes barely change and stay red",
     eyeDenoiseHigh: { "anima-turbo": "0.65" },
     eyeDenoiseHighDefault: "0.55",
     // With a ~50% blue band painted: a clear see-through visor at 0.6–0.75,
@@ -67,12 +72,14 @@
         negative: "worst quality, low quality, artist name, blurry, jpeg artifacts, chromatic aberration",
       },
     },
-    // Settings a model needs that Invoke's defaults (CFG 7.5, 30 steps) get
-    // wrong; the catalog description says the same.
+    // What the ✨ button (Invoke's "Use default settings", by the model name)
+    // should show under Advanced Options once clicked. SlopTweak writes these
+    // into each model's Invoke config from the catalog (docs/findings.md →
+    // "Model default settings"); Invoke doesn't apply them on its own.
     settings: {
-      "anima-turbo":
-        "Turbo needs its own settings: in the <b>Generation</b> section, open <b>Advanced Options</b> " +
-        "and set <b>CFG Scale</b> to <code>1</code> and <b>Steps</b> to <code>10</code>. ",
+      "banana-splitz-xxl": "<b>Scheduler</b> Euler Ancestral, <b>CFG Scale</b> <code>5</code>, <b>Steps</b> <code>30</code>",
+      "anima-aesthetic": "<b>CFG Scale</b> <code>4.5</code>, <b>Steps</b> <code>35</code>",
+      "anima-turbo": "<b>CFG Scale</b> <code>1</code>, <b>Steps</b> <code>10</code>",
     },
     // At CFG 1 there's no negative guidance, so a negative prompt does nothing.
     noNegative: { "anima-turbo": true },
@@ -182,7 +189,12 @@
           title: "Set up the Generate tab",
           body: () =>
             "Click the <b>Generate</b> tab on the left. " +
-            (TUNE.settings[CFG.modelId] || "") +
+            "Next to the model's name in the <b>Generation</b> section is a small sparkle button. Invoke " +
+            "starts every model on the same general settings; click the sparkle to load the ones this " +
+            'model was made for ("Model Defaults Loaded" appears). ' +
+            (TUNE.settings[CFG.modelId]
+              ? `Under <b>Advanced Options</b> you should now see ${TUNE.settings[CFG.modelId]}. `
+              : "") +
             "In the <b>Image</b> section, set " +
             `<b>Width</b> to <code>${WIDTH}</code> and <b>Height</b> to <code>${HEIGHT}</code>. ` +
             `Then put this in the prompt box: ${promptBlock} ${copyBtn("positive")}`,
@@ -315,8 +327,9 @@
           title: "Now a bit stronger",
           watch: true,
           body: () =>
-            `At <code>${TUNE.eyeDenoiseLow}</code> the eyes barely change, or turn a muddy half-green ` +
-            "that keeps any old smudges: low denoise keeps most of the old picture. Set " +
+            `At <code>${TUNE.eyeDenoiseLow}</code> ` +
+            esc(TUNE.eyeLowResult[CFG.modelId] || TUNE.eyeLowResultDefault) +
+            ": low denoise keeps most of the old picture. Set " +
             `<b>Denoising Strength</b> to <code>${eyeHigh}</code> and press <b>Invoke</b> again.`,
         },
         {

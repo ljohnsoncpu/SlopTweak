@@ -23,7 +23,8 @@ Test control (called directly on this port, never through the sidecar):
 
 Overlay mode (`--overlay`), for looking at the tutorial in any browser
 without the app: every page load gets `tutorial.js` with a test config
-(query `?stage=N&autoShow=0&force=1` on the page URL override it), and the
+(query `?stage=N&autoShow=0&force=1&model=<catalog id>` on the page URL
+override it), and the
 overlay's signal navigations (/__sloptweak/tutorial/...) are answered with
 204, so the page stays, as it does in the app. They're listed in
 /__fake/state under "signals".
@@ -58,6 +59,13 @@ OVERLAY = "--overlay" in sys.argv
 signals: list[str] = []
 
 
+MODEL_NAMES = {
+    "banana-splitz-xxl": "Banana Splitz XXL",
+    "anima-aesthetic": "Anima Aesthetic",
+    "anima-turbo": "Anima Turbo",
+}
+
+
 def overlay_js(q: dict[str, list[str]]) -> bytes:
     """tutorial.js wrapped the way remote.rs does it, with a test config."""
 
@@ -69,8 +77,8 @@ def overlay_js(q: dict[str, list[str]]) -> bytes:
         "force": one("force", "0") == "1",
         "stage": int(one("stage", "1")),
         "stages": 5,
-        "modelId": "banana-splitz-xxl",
-        "modelName": "Banana Splitz XXL",
+        "modelId": one("model", "banana-splitz-xxl"),
+        "modelName": MODEL_NAMES.get(one("model", "banana-splitz-xxl"), "Test Model"),
         "modelPage": True,
         "portrait": base64.b64encode(
             (SRC / "assets" / "tutorial-portrait.webp").read_bytes()

@@ -1071,6 +1071,49 @@ user's file carried only an sRGB ICC chunk (Google 2016, no EXIF/XMP); it
 was rewritten as a plain `RIFF/WEBP/VP8 ` container with the same bitstream
 (pixels identical, 49,480 bytes). Uploaded as `image/webp`.
 
+### Re-tune at the catalog settings (live, 2026-09-26) ✅
+
+The Phase 6 numbers for Banana Splitz and Anima Aesthetic were tuned at
+Invoke's generic CFG 7.5 / 30 steps. Stage 1 now has the user click ✨, so
+they were re-checked at the catalog settings: Banana Splitz Euler a / CFG 5
+/ 30, Aesthetic CFG 4.5 / 35 (Anima scheduler unchanged, `euler`). Turbo
+was already tuned at CFG 1 / 10.
+
+- **How:** one instance with both models (`launch_dev.py create --model`
+  ×2), then the saved Phase 6 graphs (`graph-generate.json`,
+  `graph-inpaint.json`) replayed through the sidecar with the bearer:
+  model keys and hashes remapped to the new instance, the saved eye and
+  visor crops and masks re-uploaded, settings, seed, prompt and denoise
+  edited, then `POST /api/v1/queue/default/enqueue_batch` with
+  `{"batch": {"graph", "runs": 1}, "prepend": false}`, polling
+  `GET /api/v1/queue/default/i/{id}`. 44 images, no UI. The script was a
+  one-off in the agent's scratchpad (not committed).
+- **Instance 52807964**, offer 43619154, RTX 5060 Ti 16 GB, British
+  Columbia, $0.1543/hr incl. storage, $0.0026/GB down. The first choice
+  (offer 48529478) was gone at create time, and nothing was rented then.
+  Ready in **609 s** (cold). Banana Splitz ~13 s per 832×1216 image; Anima
+  Aesthetic ~35 s per image. Spend **$0.086** (credit $10.6420 →
+  $10.5557).
+
+| | Banana Splitz (Euler a, CFG 5, 30) | Anima Aesthetic (CFG 4.5, 35) |
+| --- | --- | --- |
+| Stage 1, 8 seeds at 832×1216 | all usable, SFW; **42** still a clean front view | all usable, SFW, less flat and oversaturated than at 7.5; **42** clean front view |
+| Eyes at 0.3 | **changed:** yellowish green, broken pupils fixed (at 7.5: muddy olive, pupils broken) | still red |
+| Eyes at 0.45 | green | red to brownish |
+| Eyes at 0.55 | clean green | green (seed 1 clean) |
+| Eyes at 0.65 | green | green |
+| Visor, 50 % band | see-through visor at 0.6–0.75, **0.7** clean on both seeds | flat at 0.6, glassier at **0.7**–0.75 |
+
+Kept: seeds 42 / 42 / 123, eyes 0.3 → 0.55 (Turbo 0.65), visor 0.7. The
+only copy change is what 0.3 does, now per model (`TUNE.eyeLowResult`).
+
+### Re-tune rental log (all destroyed; none running)
+
+| Instance | Offer | Outcome |
+| --- | --- | --- |
+| — | 48529478 (RTX 3060, NB) | Create refused (offer gone); nothing rented |
+| 52807964 | 43619154 (RTX 5060 Ti, BC) | 44/44 images; destroyed by the runner |
+
 ## Still open
 
 - ~~Live upstream catalog edit~~ **done (2026-09-25).** Merging PR #3
@@ -1097,6 +1140,7 @@ was rewritten as a plain `RIFF/WEBP/VP8 ` container with the same bitstream
   acceptance), and the Banana Splitz template live. Dev scripts that use the
   main window's CDP port need the installed SlopTweak closed (same WebView2
   profile, so the debug port is ignored).
-- Invoke's per-model defaults (CFG 7.5, 30 steps) don't match Anima's
-  recommendations; only the catalog description tells users. Setting the
-  model's default settings at install would fix it for everyone.
+- ~~Invoke's per-model defaults don't match the models~~ **done
+  (2026-09-26, PR #9):** the catalog's `default_settings` are in each
+  model's Invoke config, and stage 1 has the user click ✨ to load them. The
+  tutorial numbers were re-tuned at those settings (below).
