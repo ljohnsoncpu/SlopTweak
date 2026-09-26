@@ -14,6 +14,7 @@
 // Usage (from app/):  node dev/vast-acceptance.mjs [r1] [r2] [r3]
 //   TEST_MODEL=<catalog id>  pick this model before Start (default: first)
 //   GENERATE=1               in R1, type a prompt in Invoke and make one image
+//   MAX_DPH=0.5 MAX_SESSION_MINUTES=60   the app's price and session caps
 
 import { spawn, execSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, appendFileSync } from "node:fs";
@@ -33,6 +34,9 @@ const HEARTBEAT_MINUTES = 3;
 const runs = process.argv.slice(2).length ? process.argv.slice(2) : ["r1", "r2", "r3"];
 const TEST_MODEL = process.env.TEST_MODEL ?? "";
 const GENERATE = process.env.GENERATE === "1";
+// Spend limits the app runs with (its own max $/hr and session cap).
+const MAX_DPH = Number(process.env.MAX_DPH ?? 0.5);
+const MAX_SESSION_MINUTES = Number(process.env.MAX_SESSION_MINUTES ?? 60);
 
 mkdirSync(OUT, { recursive: true });
 const LOG = join(OUT, "acceptance.log");
@@ -379,7 +383,7 @@ const settingsFile = join(CONFIG_DIR, "settings.json");
 const settingsBackup = existsSync(settingsFile) ? readFileSync(settingsFile, "utf8") : null;
 writeFileSync(
   settingsFile,
-  JSON.stringify({ heartbeat_minutes: HEARTBEAT_MINUTES, max_session_minutes: 60, max_dph: 0.5 }, null, 2),
+  JSON.stringify({ heartbeat_minutes: HEARTBEAT_MINUTES, max_session_minutes: MAX_SESSION_MINUTES, max_dph: MAX_DPH }, null, 2),
 );
 if (existsSync(join(DATA_DIR, "active_instance.json"))) {
   say("refusing to run: an active_instance.json record exists");

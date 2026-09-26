@@ -1114,6 +1114,20 @@ only copy change is what 0.3 does, now per model (`TUNE.eyeLowResult`).
 | — | 48529478 (RTX 3060, NB) | Create refused (offer gone); nothing rented |
 | 52807964 | 43619154 (RTX 5060 Ti, BC) | 44/44 images; destroyed by the runner |
 
+## Release 0.2.2 check (2026-09-26) ✅
+
+`releasing.md` step 2 with the 0.2.2 debug build (bundle `instance-v0.1.2`,
+pin `16e68e06…`): `TEST_MODEL=banana-splitz-xxl GENERATE=1 MAX_DPH=0.25
+MAX_SESSION_MINUTES=30 node dev/vast-acceptance.mjs r1` (the two caps are
+new env overrides). The app picked offer 38666258, RTX 3090, Bulgaria,
+$0.2106/hr + $0.018 download, instance 52819603. Ready in **162 s** (image
+cached); one image in 15 s; Invoke in the app window, remote IPC denied,
+model registered, cost title, Stop destroys, record cleared, machine
+remembered as good: **11/11**. Spend ~$0.025 (credit $10.5524 → $10.5273).
+$0 checks at the same commit: cargo test 144, clippy, `npm run build`,
+mock-ui-check 65/65, webview-check 26/26, sync-check 50/50, instance
+pytest 33, ruff/mypy, `build_assets.py --check-pin`.
+
 ## Still open
 
 - ~~Live upstream catalog edit~~ **done (2026-09-25).** Merging PR #3
