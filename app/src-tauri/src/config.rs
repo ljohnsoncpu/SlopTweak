@@ -86,6 +86,16 @@ pub struct Settings {
     pub loras: Vec<Lora>,
     /// The Invoke-window tutorial was finished or skipped (Phase 4).
     pub tutorial_done: bool,
+    /// Tutorial stage the user is on, 1..=TUTORIAL_STAGES (Phase 6), so it
+    /// resumes on the next GPU.
+    pub tutorial_stage: u8,
+}
+
+/// Stages in the Invoke-window tutorial (PLAN §4 Phase 6).
+pub const TUTORIAL_STAGES: u8 = 5;
+
+fn first_stage() -> u8 {
+    1
 }
 
 impl Default for Settings {
@@ -111,6 +121,7 @@ impl Default for Settings {
             output_dir: None,
             loras: Vec::new(),
             tutorial_done: false,
+            tutorial_stage: 1,
         }
     }
 }
@@ -129,6 +140,8 @@ pub struct UserSettings {
     pub loras: Vec<Lora>,
     #[serde(default)]
     pub tutorial_done: bool,
+    #[serde(default = "first_stage")]
+    pub tutorial_stage: u8,
 }
 
 impl UserSettings {
@@ -145,6 +158,9 @@ impl UserSettings {
         }
         if !(0.0..=1000.0).contains(&self.min_credit) {
             return Err("Minimum credit must be between $0 and $1000.".into());
+        }
+        if !(1..=TUTORIAL_STAGES).contains(&self.tutorial_stage) {
+            return Err("Unknown tutorial stage.".into());
         }
         if let Some(d) = &self.output_dir {
             if d.trim().is_empty() || !Path::new(d).is_absolute() {
@@ -177,6 +193,7 @@ impl Settings {
             output_dir: self.output_dir.clone(),
             loras: self.loras.clone(),
             tutorial_done: self.tutorial_done,
+            tutorial_stage: self.tutorial_stage.clamp(1, TUTORIAL_STAGES),
         }
     }
 
@@ -392,6 +409,8 @@ mod tests {
             Box::new(|u| u.max_session_minutes = 10),
             Box::new(|u| u.min_credit = -1.0),
             Box::new(|u| u.output_dir = Some("relative-dir".into())),
+            Box::new(|u| u.tutorial_stage = 0),
+            Box::new(|u| u.tutorial_stage = TUTORIAL_STAGES + 1),
         ];
         for mutate in cases {
             let mut u = ok.clone();
@@ -538,5 +557,27 @@ mod tests {
         let s = Settings::load(dir.path());
         assert_eq!(s.max_dph, 0.3);
         assert_eq!(s.max_attempts, 3);
+        assert_eq!(s.tutorial_stage, 1);
+    }
+
+    #[test]
+    fn tutorial_stage_resumes_and_is_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        // A Phase 4 file has tutorial_done but no stage.
+        std::fs::write(Settings::path(dir.path()), r#"{"tutorial_done": true}"#).unwrap();
+        let mut u = Settings::load(dir.path()).user();
+        assert_eq!(u.tutorial_stage, 1);
+        u.tutorial_stage = 3;
+        assert_eq!(
+            Settings::save_user(dir.path(), &u).unwrap().tutorial_stage,
+            3
+        );
+        assert_eq!(Settings::load(dir.path()).tutorial_stage, 3);
+        // A hand-edited stage out of range is clamped, not an error.
+        std::fs::write(Settings::path(dir.path()), r#"{"tutorial_stage": 42}"#).unwrap();
+        assert_eq!(
+            Settings::load(dir.path()).user().tutorial_stage,
+            TUTORIAL_STAGES
+        );
     }
 }

@@ -604,6 +604,8 @@ Spend ~$0.018 (credit $11.3423 → $11.3247). The title check is also in
 
 ### Tutorial (as built)
 
+(v1, replaced in Phase 6: see "Tutorial v2 (as built)" below.)
+
 - An overlay injected into the Invoke window as a Tauri initialization
   script (`remote.rs`, `tutorial.js`). It's plain page JS in a shadow DOM:
   the window still has no capability (webview-check 21/21 with it
@@ -904,6 +906,214 @@ Checked against the `v6.14.1` tag (commit `027be7e2`), then live (below).
 | 52802144 | 48529478 (RTX 3060, NB) | Stopped while loading; gone on check |
 | 52802661 | 48529478 (RTX 3060, NB) | 3/3 PASS; destroyed by the runner |
 
+## Tutorial v2 groundwork (Invoke 6.14.1 source, 2026-09-26)
+
+Read from `en.json`, `useHotkeyData.ts`, and `useAutoFitBBoxToMasks.ts`
+at tag `v6.14.1`. Not yet checked in a live instance.
+
+- **Fit Bbox To Masks**: a canvas toolbar button, hotkey **Shift+B**
+  (**Fit Bbox To Layers** is Shift+N). One-time action, not a mode. It fits
+  the union of visible inpaint masks, pads by `maskBlur + 8` px, and snaps
+  to the bbox grid. For a small mask (eyes) that leaves almost no context,
+  so enlarge the bbox by hand afterward.
+- **Scale Before Processing**: *Auto* scales the bbox area to the model's
+  best size before generating; *Manual* sets Scaled W/H. This is Invoke's
+  version of "inpaint only masked at full resolution".
+- Denoise controls: **Denoising Strength**; per-mask **Denoise Limit** and
+  **Image Noise**; **Optimized Image-to-Image** (Flux only, beta).
+  Blending: **Mask Blur**, **Coherence Pass** (Mode, Edge Size, Min
+  Denoise).
+- **Prompt Templates** (code calls them "style presets"): positive and
+  negative prompts with a `{prompt}` placeholder; **Create Prompt
+  Template**, **Flatten selected template into current prompt**, import
+  from CSV/JSON (columns `name`, `prompt`/`positive_prompt`,
+  `negative_prompt`). Not tied to a model. **Trigger Phrases** (Model
+  Manager) is a separate insert-by-hand picker.
+- Gallery → canvas: **New Canvas from Image → As Raster Layer (Resize)**
+  (already used by v1); **Send To Canvas** also exists.
+
+### Label check for the v2 copy (source, tag `v6.14.1` = commit `027be7e`)
+
+Every label and hotkey the Phase 6 copy names, read from `en.json` and the
+components at the tag. Still to confirm live during tuning.
+
+| Copy says | Source | Where it is |
+| --- | --- | --- |
+| **Generate** tab | `ui.tabs.generate` | left tab bar |
+| **Width** / **Height** | `parameters.width/height` (`Dimensions*.tsx`) | **Image** accordion (Generate tab); 832×1216 are multiples of 64, so no snapping |
+| **Add Negative Prompt** | `common.addNegativePrompt`, `NegativePromptToggleButton.tsx` | ⚠️ the negative box is **hidden by default** (`negativePrompt: null`); a ± icon button on the positive prompt box shows it |
+| **Seed**, **Random** | `parameters.seed`, `common.random` | **Image** accordion; Random is a switch |
+| Prompt templates | `StylePresetMenuTrigger.tsx`: a bar above the prompt showing **Choose Prompt Template** (`stylePresets.choosePromptTemplate`) with a caret (**View Template List**) | menu has **My Templates** / **Default Templates**, and a **+** button **Create Prompt Template** |
+| Template form | **Name**, **Positive Prompt**, **Negative Prompt**, **Insert placeholder**, **Save** | placeholder is literally `{prompt}` (`PRESET_PLACEHOLDER`); without it the template is appended to the end |
+| **New Canvas from Image → As Raster Layer (Resize)** | `ContextMenuItemNewCanvasFromImageSubMenu.tsx` | gallery right-click. `withInpaintMask: true`: it resets the canvas, adds the image as a raster layer, then adds an empty **Inpaint Mask** and selects it. "(Resize)" re-uploads the image at the model's optimal area (`calculateNewSize`), as an intermediate |
+| **Brush** **B**, **Bbox** **C**, **Eraser** **E**, **Move** **V**, **Undo** Ctrl+Z | `useHotkeyData.ts` | canvas hotkeys |
+| **Fit Bbox To Masks** **Shift+B** | `CanvasToolbarFitBboxToMasksButton.tsx` (tooltip `controlLayers.fitBboxToMasks`) | canvas toolbar |
+| **Reset Layer** **Shift+C** | `hotkeys.canvas.resetSelected` | clears the selected Inpaint Mask / Regional Guidance |
+| **Scale Before Processing**: None / **Auto** / Manual | `BboxScaleMethod.tsx` | Canvas tab → **Image** accordion → **Advanced Options** expander. **Default is Auto** (`scaleMethod: 'auto'`), so stage 4 only has to point at it |
+| **Denoising Strength** | `ParamDenoisingStrength.tsx` | top of the canvas **Layers** panel; disabled with a badge when there's no raster content |
+| **Opacity** | `EntityListSelectedEntityActionBarOpacity.tsx` | the bar above the layer list; applies to the **selected** layer; 0–100 % number box with a slider dropdown |
+| **Add Layer** (+) → **Raster Layer** | `EntityListGlobalActionBarAddLayerMenu.tsx` | bar under the layer list (groups **Regional** / **Layers**) |
+| Brush colour | `ToolFillColorPicker.tsx`: **Foreground Color** / **Background Color** swatch (aria **Fill Color**); **D** resets, **X** swaps | canvas toolbar |
+| **Accept (Enter)**, **Save To Gallery** | `StagingAreaToolbarAcceptButton.tsx` (Enter hotkey), `…SaveSelectedToGalleryButton.tsx` | staging toolbar under the canvas |
+
+- **Accept doesn't touch the mask** (`StagingArea/context.tsx`): the result
+  becomes a new raster layer, the staging session resets, and the Inpaint
+  Mask keeps what was painted. Stage 5 therefore tells the user to clear it
+  (**Shift+C** with the mask selected) before masking the visor.
+- Upload API (`routers/images.py`): any `image/*` content type that PIL
+  opens is accepted (415 otherwise), so the fallback can stay **WebP**.
+
+### Tutorial v2 (as built, before live tuning)
+
+- Replaces the v1 vase tour (`tutorial-sample.jpg` and
+  `dev/make-tutorial-sample.py` are gone). Same injection and isolation as
+  v1 ("Tutorial (as built)" above): plain page JS in an open shadow root,
+  no capability, requests only to its own origin.
+- A home card (Start / **Continue stage N**, and a list to jump to any
+  stage), then stages 1–5 with 3, 3, 2, 6, and 5 cards. Stages 4 and 5
+  entered from the home card get one extra first card ("Get the picture on
+  the canvas": paste the prompt, **Use ours instead**, open it on the
+  canvas), because a new GPU has an empty gallery and canvas.
+- **Resume across GPUs:** localStorage is per tunnel origin, so the app keeps
+  the stage. New signals, both same-origin navigations that `on_navigation`
+  blocks: `/__sloptweak/tutorial/stage/<1-5>` (strict: one digit, nothing
+  after it) saves `tutorial_stage` in settings.json, and `…/model-page`
+  opens the current model's catalog page in the browser. The page could
+  fake either; the worst it can do is set a stage number or open that one
+  validated page (https, `civitai.com` / `huggingface.co`, no port or
+  userinfo; `Model::page_url`), at most once per 5 s. Skip keeps the stage
+  (sets `tutorial_done`); Done sets `tutorial_done` and resets the stage to 1.
+- Auto-advance (queue `completed` above a per-card baseline) on the cards
+  that end with **Invoke**: 1.2, 4.4, 4.5, 5.4 (numbered from 1).
+- Tuned numbers, seeds, and tags are in one `TUNE` object at the top of
+  `tutorial.js` (values: "Phase 6 tuning" below).
+- `fake_invoke.py --overlay` serves the overlay on every page load and
+  answers the signal URLs with 204 (the page stays, as in the app), listing
+  them in `/__fake/state`. It also rejects non-`image/*` uploads with 415,
+  like Invoke. Checked in the browser pane: all five stages, auto-advance on
+  fake generations, the WebP upload (decodes at 832×1216), stage signals
+  `stage/2`…`stage/5` then `done`, and a new-GPU resume at stage 5. The
+  tallest card is 338 px (fits a 720 px window).
+
+### Phase 6 tuning (live, 2026-09-26) ✅
+
+Three held sessions (`dev/phase6-session.mjs`), one per catalog model; all
+on an **RTX 5060 Ti 16 GB** (Blackwell, cc 12.0, Connecticut, $0.1559/hr),
+which the app picked as the cheapest offer. **Blackwell works** with the
+pinned Invoke 6.14.1 image (first time on this GPU generation). Each stage
+was done once through the real UI over CDP (label check + graph capture),
+then varied by replaying the captured graph through
+`POST /api/v1/queue/default/enqueue_batch` with edited seed / denoise /
+crop / mask (`dev/phase6-lib.mjs`). Outputs in `.dev/phase6/` (not
+committed).
+
+**Live UI checks** (Banana Splitz and Anima Aesthetic): every label the copy
+names is on screen: Generate, Width, Height, Seed, Random, Add Negative
+Prompt (± on the prompt box; the negative box then appears), Choose Prompt
+Template, View Template List, Assets, New Canvas from Image → As Raster
+Layer (Resize) (`[role=menuitem]`), Inpaint Mask, Raster Layer, Denoising
+Strength, Opacity, Advanced Options, Scale Before Processing (**Auto** by
+default), Fit Bbox To Masks, Add Layer, Fill Color, Accept (Enter), Save To
+Gallery, Discard All, CFG Scale, Steps. **Shift+B** fits both eye masks
+(Bbox 264×144 → Scaled Bbox 1392×760); **Shift+C** clears the selected
+mask. New live facts:
+
+- The canvas's top-left corner shows **Bbox: W×H px / Scaled Bbox: W×H px**,
+  the visible proof of Scale Before Processing. Stage 4 points at it.
+- **While tries are staged, the canvas can't be painted** (brush, Shift+C do
+  nothing) and Invoke re-runs the old bbox. Stage 5 says to Accept first.
+- A bbox with no raster content under it makes a plain txt2img graph and
+  disables Denoising Strength.
+- Tight bbox on one eye at the default 0.75: the model drew a whole tiny
+  woman inside the eye. The "the bbox is what the model sees" lesson, live.
+- "(Resize)" on Anima makes the layer 848×1240 (its optimal area), not
+  832×1216.
+- Invoke's defaults are **CFG 7.5, 30 steps** for every model: Anima
+  Aesthetic comes out oversaturated (its card says CFG 4–5), and Turbo
+  looks burned (card: CFG 1, 8–12 steps).
+
+**Results** (seeds 1/2/3 for the inpaints; our portrait unless noted):
+
+| | Banana Splitz XXL | Anima Aesthetic | Anima Turbo (CFG 1, 10 steps) |
+| --- | --- | --- | --- |
+| Stage 1, 8 seeds at 832×1216 | all usable, SFW; **42** clean front view | all usable, SFW (flat, oversaturated at CFG 7.5); **42** | defaults burned; at CFG 1 three of four seeds carry a watermark/signature; **123** clean |
+| Eyes at 0.3 | muddy olive, broken pupils stay (own seed-42 image: still red) | still red | still red |
+| Eyes at 0.55 | clean green, artifacts fixed | green | olive; **0.65** green (0.7: one seed winks) |
+| Visor, 50 % blue band painted | clear see-through blue visor at 0.6–0.75, cleanest **0.7** | blue visor at all; flat at 0.6, glassier 0.7–0.75 | visor at 0.7–0.75 |
+| Visor, no paint, 0.7 | thin clear glasses / face lines, no blue visor | nothing / small cyan strip | nothing / faint gray strip |
+| Template (page tags) | not tried live | visibly better: less oversaturated, real shading | — |
+
+- At **CFG 1 the negative prompt does nothing** (no negative guidance), so
+  `nsfw` can't keep Turbo safe. The Turbo copy adds `safe,` to the prompt
+  (Anima's own safety tag); all Turbo tests were SFW.
+- Chosen: seed 42 / 42 / 123; eye denoise 0.3 then 0.55 (Turbo 0.65);
+  visor band layer at 50 % opacity, denoise 0.7 (0.6–0.75). The plan's
+  alternative (lower the accepted result's opacity) isn't needed.
+- Harness notes: model keys are per install (a graph's `vae_model` /
+  `qwen3_encoder_model` keys from one instance fail with
+  `UnknownModelException` on another); the queue helper must count
+  `failed` too or it waits forever.
+
+### Phase 6 rental log (all destroyed; none running)
+
+| Instance | Model | Ready in | Held | Cost |
+| --- | --- | --- | --- | --- |
+| 52786625 | Banana Splitz XXL | 356 s (cold) | 23.5 min | ~$0.069 |
+| 52790099 | Anima Aesthetic | 163 s | 20 min | ~$0.063 |
+| 52793084 | Anima Turbo | 218 s | 21.7 min | ~$0.079 |
+
+Phase 6 total **~$0.21** (credit $10.9484 → $10.7341; late charges may post).
+
+### Tutorial v2 fallback asset
+
+`app/src-tauri/assets/tutorial-portrait.webp` (832×1216, lossy VP8). The
+user's file carried only an sRGB ICC chunk (Google 2016, no EXIF/XMP); it
+was rewritten as a plain `RIFF/WEBP/VP8 ` container with the same bitstream
+(pixels identical, 49,480 bytes). Uploaded as `image/webp`.
+
+### Re-tune at the catalog settings (live, 2026-09-26) ✅
+
+The Phase 6 numbers for Banana Splitz and Anima Aesthetic were tuned at
+Invoke's generic CFG 7.5 / 30 steps. Stage 1 now has the user click ✨, so
+they were re-checked at the catalog settings: Banana Splitz Euler a / CFG 5
+/ 30, Aesthetic CFG 4.5 / 35 (Anima scheduler unchanged, `euler`). Turbo
+was already tuned at CFG 1 / 10.
+
+- **How:** one instance with both models (`launch_dev.py create --model`
+  ×2), then the saved Phase 6 graphs (`graph-generate.json`,
+  `graph-inpaint.json`) replayed through the sidecar with the bearer:
+  model keys and hashes remapped to the new instance, the saved eye and
+  visor crops and masks re-uploaded, settings, seed, prompt and denoise
+  edited, then `POST /api/v1/queue/default/enqueue_batch` with
+  `{"batch": {"graph", "runs": 1}, "prepend": false}`, polling
+  `GET /api/v1/queue/default/i/{id}`. 44 images, no UI. The script was a
+  one-off in the agent's scratchpad (not committed).
+- **Instance 52807964**, offer 43619154, RTX 5060 Ti 16 GB, British
+  Columbia, $0.1543/hr incl. storage, $0.0026/GB down. The first choice
+  (offer 48529478) was gone at create time, and nothing was rented then.
+  Ready in **609 s** (cold). Banana Splitz ~13 s per 832×1216 image; Anima
+  Aesthetic ~35 s per image. Spend **$0.086** (credit $10.6420 →
+  $10.5557).
+
+| | Banana Splitz (Euler a, CFG 5, 30) | Anima Aesthetic (CFG 4.5, 35) |
+| --- | --- | --- |
+| Stage 1, 8 seeds at 832×1216 | all usable, SFW; **42** still a clean front view | all usable, SFW, less flat and oversaturated than at 7.5; **42** clean front view |
+| Eyes at 0.3 | **changed:** yellowish green, broken pupils fixed (at 7.5: muddy olive, pupils broken) | still red |
+| Eyes at 0.45 | green | red to brownish |
+| Eyes at 0.55 | clean green | green (seed 1 clean) |
+| Eyes at 0.65 | green | green |
+| Visor, 50 % band | see-through visor at 0.6–0.75, **0.7** clean on both seeds | flat at 0.6, glassier at **0.7**–0.75 |
+
+Kept: seeds 42 / 42 / 123, eyes 0.3 → 0.55 (Turbo 0.65), visor 0.7. The
+only copy change is what 0.3 does, now per model (`TUNE.eyeLowResult`).
+
+### Re-tune rental log (all destroyed; none running)
+
+| Instance | Offer | Outcome |
+| --- | --- | --- |
+| — | 48529478 (RTX 3060, NB) | Create refused (offer gone); nothing rented |
+| 52807964 | 43619154 (RTX 5060 Ti, BC) | 44/44 images; destroyed by the runner |
+
 ## Still open
 
 - ~~Live upstream catalog edit~~ **done (2026-09-25).** Merging PR #3
@@ -925,3 +1135,12 @@ Checked against the `v6.14.1` tag (commit `027be7e2`), then live (below).
 - Tutorial copy was checked against Invoke 6.14.1. A future image bump must
   re-check the labels (`tutorial.js` header) and the queue/image API shapes
   (`sync.rs`).
+- Phase 6: tuned and label-checked live (above). Not done: a full
+  click-through of all five stages by a person on a clean install (PLAN
+  acceptance), and the Banana Splitz template live. Dev scripts that use the
+  main window's CDP port need the installed SlopTweak closed (same WebView2
+  profile, so the debug port is ignored).
+- ~~Invoke's per-model defaults don't match the models~~ **done
+  (2026-09-26, PR #9):** the catalog's `default_settings` are in each
+  model's Invoke config, and stage 1 has the user click ✨ to load them. The
+  tutorial numbers were re-tuned at those settings (below).

@@ -18,7 +18,7 @@ mod updater;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
@@ -38,7 +38,7 @@ use crate::provider::mock::{parse_script, MockProvider, MockTimings};
 use crate::provider::offers;
 use crate::provider::vast::VastProvider;
 use crate::provider::GpuProvider;
-use crate::remote::{RemoteWindows, TutorialSignal};
+use crate::remote::{RemoteWindows, TutorialSignal, TutorialStart};
 use crate::secrets::{KeyringStore, SecretStore};
 use crate::session::{Deps, Orphan, SessionManager, SessionState, Timing, Ui};
 use crate::sidecar::HttpSidecar;
@@ -67,9 +67,9 @@ impl Ui for TauriUi {
     }
 
     fn open_remote(&self, url: Url) {
-        // First sessions get the tutorial until it's finished or skipped.
-        let tutorial = !self.app.state::<AppState>().settings().tutorial_done;
-        if let Err(e) = self.remote.open(url, tutorial) {
+        let st = self.app.state::<AppState>();
+        let tutorial = tutorial_start(&st.settings(), &st.catalog.lock().unwrap());
+        if let Err(e) = self.remote.open(url, &tutorial) {
             eprintln!("[sloptweak] couldn't open the Invoke window: {e}");
         }
     }
@@ -707,6 +707,67 @@ async fn open_output_folder(app: AppHandle, st: State<'_, AppState>) -> Result<(
         .map_err(|e| e.to_string())
 }
 
+/// Where the tutorial overlay starts. First sessions get it on their own
+/// until it's finished or skipped; it resumes at the saved stage.
+fn tutorial_start(settings: &Settings, catalog: &Catalog) -> TutorialStart {
+    let model = settings.model_id.as_deref().and_then(|id| catalog.find(id));
+    TutorialStart {
+        auto_show: !settings.tutorial_done,
+        stage: settings.tutorial_stage,
+        model_id: model.map(|m| m.id.clone()).unwrap_or_default(),
+        model_name: model.map(|m| m.name.clone()).unwrap_or_default(),
+        has_model_page: model.and_then(Model::page_url).is_some(),
+    }
+}
+
+/// Save what the tutorial overlay reported, or open the model page it asked
+/// for. The page can fake these (remote.rs), so a model-page request opens
+/// only the current model's validated catalog page, at most once per 5 s.
+fn on_tutorial_signal(app: &AppHandle, sig: TutorialSignal, last_page: &Mutex<Option<Instant>>) {
+    eprintln!("[sloptweak] tutorial {sig:?}");
+    let st = app.state::<AppState>();
+    let saved = match sig {
+        TutorialSignal::ModelPage => {
+            let mut last = last_page.lock().unwrap();
+            if last.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
+                return;
+            }
+            *last = Some(Instant::now());
+            let page = st.settings().model_id.and_then(|id| {
+                st.catalog
+                    .lock()
+                    .unwrap()
+                    .find(&id)
+                    .and_then(Model::page_url)
+            });
+            if let Some(url) = page {
+                if let Err(e) = app.opener().open_url(url.as_str(), None::<&str>) {
+                    eprintln!("[sloptweak] couldn't open the model page: {e}");
+                }
+            }
+            return;
+        }
+        TutorialSignal::Stage(n) => update_settings(&st, |u| {
+            u.tutorial_stage = n;
+            Ok(())
+        }),
+        // Finished: next time "Show tutorial" starts from the top.
+        TutorialSignal::Done => update_settings(&st, |u| {
+            u.tutorial_done = true;
+            u.tutorial_stage = 1;
+            Ok(())
+        }),
+        // Skipped (or closed): stop showing it by itself, keep the stage.
+        TutorialSignal::Skipped => update_settings(&st, |u| {
+            u.tutorial_done = true;
+            Ok(())
+        }),
+    };
+    if let Err(e) = saved {
+        eprintln!("[sloptweak] couldn't save the tutorial state: {e}");
+    }
+}
+
 /// Show the Invoke-window tutorial again (in the open window, or by opening it).
 #[tauri::command]
 async fn show_tutorial(st: State<'_, AppState>) -> Result<(), String> {
@@ -1092,16 +1153,8 @@ pub fn run() {
             let handle = app.handle().clone();
             let on_tutorial = {
                 let h = handle.clone();
-                Arc::new(move |sig: TutorialSignal| {
-                    eprintln!("[sloptweak] tutorial {sig:?}");
-                    let st = h.state::<AppState>();
-                    if let Err(e) = update_settings(&st, |u| {
-                        u.tutorial_done = true;
-                        Ok(())
-                    }) {
-                        eprintln!("[sloptweak] couldn't save the tutorial state: {e}");
-                    }
-                })
+                let last_page = Mutex::new(None);
+                Arc::new(move |sig: TutorialSignal| on_tutorial_signal(&h, sig, &last_page))
             };
             let ui = Arc::new(TauriUi {
                 app: handle.clone(),
@@ -1246,7 +1299,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::fixed_link;
+    use super::{fixed_link, tutorial_start, Catalog, Settings};
 
     #[test]
     fn links_are_fixed_https_pages() {
@@ -1264,5 +1317,30 @@ mod tests {
         }
         assert_eq!(fixed_link("https://evil.example/"), None);
         assert_eq!(fixed_link("file:///C:/Windows"), None);
+    }
+
+    #[test]
+    fn tutorial_starts_from_saved_state_and_model() {
+        let catalog = Catalog {
+            models: crate::catalog::bundled(),
+            source: crate::catalog::Source::Bundled,
+            fetched_unix: None,
+            skipped: Vec::new(),
+        };
+        let mut s = Settings::default();
+        let t = tutorial_start(&s, &catalog);
+        assert_eq!((t.auto_show, t.stage), (true, 1));
+        assert!(t.model_id.is_empty() && !t.has_model_page);
+
+        s.model_id = Some("banana-splitz-xxl".into());
+        s.tutorial_done = true;
+        s.tutorial_stage = 4;
+        let t = tutorial_start(&s, &catalog);
+        assert_eq!((t.auto_show, t.stage), (false, 4));
+        assert_eq!(t.model_name, "Banana Splitz XXL");
+        assert!(t.has_model_page);
+
+        s.model_id = Some("gone".into());
+        assert!(!tutorial_start(&s, &catalog).has_model_page);
     }
 }

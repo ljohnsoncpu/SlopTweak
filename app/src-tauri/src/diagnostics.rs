@@ -151,9 +151,10 @@ pub fn report(i: &Inputs, known: &[&str], home: Option<&str>) -> String {
     );
     let _ = writeln!(
         s,
-        "output folder {} · tutorial done {}",
+        "output folder {} · tutorial done {} · stage {}",
         st.output_dir.as_deref().unwrap_or("default"),
-        st.tutorial_done
+        st.tutorial_done,
+        st.tutorial_stage
     );
     for l in &st.loras {
         let _ = writeln!(
