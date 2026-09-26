@@ -470,6 +470,11 @@ struct Inner {
     sync_report: Option<SyncReport>,
 }
 
+/// The sidecar and tunnel normally answer within a minute or two of `running`.
+const SILENT_SIDECAR: Duration = Duration::from_secs(4 * 60);
+const SETUP_NEVER_STARTED: &str = "the machine shut itself down because SlopTweak's setup \
+     never started on it (it may not have been able to download its setup files)";
+
 enum Provisioned {
     Ready(Url),
     /// Destroy this instance and try the next offer.
@@ -994,7 +999,8 @@ impl SessionManager {
                 Err(e) => {
                     let reason = if e.create_may_have_succeeded() {
                         format!(
-                            "Couldn't rent the GPU: {e}. If a GPU shows up in the Vast console                              anyway, SlopTweak offers to shut it down next time it starts."
+                            "Couldn't rent the GPU: {e}. If a GPU shows up in the Vast console \
+                             anyway, SlopTweak offers to shut it down next time it starts."
                         )
                     } else {
                         format!("Couldn't rent the GPU: {e}")
@@ -1111,6 +1117,11 @@ impl SessionManager {
         let mut sidecar_errors = 0u32;
         let mut last_host_status: Option<(Option<String>, Option<String>)> = None;
         let mut last_progress = Instant::now();
+        // When the host first said `running`, and whether the sidecar has
+        // answered since: the sidecar and tunnel come up first in provision.sh.
+        let mut running_since: Option<Instant> = None;
+        let mut sidecar_seen = false;
+        let mut warned_silent = false;
         loop {
             if started.elapsed() >= ready_timeout {
                 return Provisioned::Retry(format!(
@@ -1119,7 +1130,15 @@ impl SessionManager {
                 ));
             }
             match self.deps.provider.instance(instance_id).await {
-                Ok(None) => return Provisioned::Gone("the GPU host removed the machine".into()),
+                Ok(None) => {
+                    // onstart's deadman destroys an instance whose sidecar
+                    // never came up; the host didn't remove it.
+                    return Provisioned::Gone(if running_since.is_some() && !sidecar_seen {
+                        SETUP_NEVER_STARTED.into()
+                    } else {
+                        "the GPU host removed the machine".into()
+                    });
+                }
                 Ok(Some(info)) => {
                     let host_status = (info.actual_status.clone(), info.status_msg.clone());
                     if last_host_status.as_ref() != Some(&host_status) {
@@ -1135,6 +1154,9 @@ impl SessionManager {
                         info.health(started.elapsed(), last_progress.elapsed())
                     {
                         return Provisioned::Retry(r);
+                    }
+                    if running_since.is_none() && info.actual_status.as_deref() == Some("running") {
+                        running_since = Some(Instant::now());
                     }
                     if base.is_none() {
                         base = self.deps.provider.sidecar_url(&info);
@@ -1153,6 +1175,7 @@ impl SessionManager {
                 match self.deps.sidecar.heartbeat(b, secret).await {
                     Ok(st) => {
                         sidecar_errors = 0;
+                        sidecar_seen = true;
                         if let Some(r) = &st.destroying {
                             return Provisioned::Retry(format!(
                                 "the machine shut itself down because {}",
@@ -1196,6 +1219,22 @@ impl SessionManager {
                         }
                     }
                 }
+            }
+            if !sidecar_seen
+                && !warned_silent
+                && running_since.is_some_and(|t| t.elapsed() >= SILENT_SIDECAR)
+            {
+                warned_silent = true;
+                self.log(format!(
+                    "host has reported running for {} min but SlopTweak's setup on it hasn't \
+                     answered ({}); it may have failed to download its setup files",
+                    SILENT_SIDECAR.as_secs() / 60,
+                    if base.is_some() {
+                        "tunnel published, sidecar unreachable"
+                    } else {
+                        "no tunnel published"
+                    }
+                ));
             }
             if self.wait(rx, self.timing.poll).await {
                 return Provisioned::Stopped;

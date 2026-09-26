@@ -43,6 +43,9 @@ pub enum MockBehavior {
     /// A slow host: `loading` with changing pull progress for this long,
     /// then behaves normally.
     SlowPull(Duration),
+    /// Runs, but its sidecar never starts (asset fetch failed): no tunnel,
+    /// and onstart's deadman destroys it after this long.
+    NoSidecar(Duration),
 }
 
 /// Parse `SLOPTWEAK_MOCK_SCRIPT`, e.g. `daemon,dead,normal`, so failure paths
@@ -62,6 +65,7 @@ pub fn parse_script(script: &str) -> Vec<MockBehavior> {
                 120,
             ))),
             "slowpull" => Some(MockBehavior::SlowPull(Duration::from_secs(60))),
+            "nosidecar" => Some(MockBehavior::NoSidecar(Duration::from_secs(60))),
             _ => None,
         })
         .collect()
@@ -330,6 +334,9 @@ impl MockProvider {
                 info.cur_state = Some("stopped".into());
             }
             MockBehavior::DaemonError | MockBehavior::DeadHost | MockBehavior::NeverStarts => {}
+            MockBehavior::NoSidecar(_) if age >= t.running_after => {
+                info.actual_status = Some("running".into());
+            }
             MockBehavior::SlowPull(d) if inst.created.elapsed() < d => {
                 let secs = inst.created.elapsed().as_secs();
                 info.status_msg = Some(format!("layer{}: Downloading {}s", secs / 20, secs));
@@ -348,6 +355,11 @@ impl MockProvider {
     fn reap(&self, s: &mut State) {
         // Simulate the instance watchdog destroying itself.
         for inst in s.instances.values_mut() {
+            if let MockBehavior::NoSidecar(d) = inst.behavior {
+                if inst.created.elapsed() >= d {
+                    inst.destroyed = true;
+                }
+            }
             if let (MockBehavior::SelfDestructAfterReady(d), Some(r)) =
                 (&inst.behavior, inst.ready_at)
             {

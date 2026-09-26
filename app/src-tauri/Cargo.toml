@@ -1,6 +1,6 @@
 [package]
 name = "sloptweak"
-version = "0.2.0"
+version = "0.2.1"
 description = "SlopTweak launcher"
 license = "MIT"
 edition = "2021"

@@ -810,6 +810,34 @@ $0 checks at this point: `cargo test` 127 passed (117 + 10 new); clippy -D warni
 18/18; instance pytest 25 + release-script tests 4; ruff/mypy clean. No Vast
 spend in Phase 5 so far.
 
+## First release build on real Vast (2026-09-26)
+
+The user installed the `v0.2.0` installer from the **draft** release and
+pressed Start. A draft's files aren't public:
+`releases/download/v0.2.0/instance-assets.tar.gz` returned **404**. So
+`onstart.sh` failed at the `curl`, the sidecar never started, no tunnel was
+published, and the onstart deadman destroyed each instance ~10 min after
+it started (13 min from create). The app retried 3 times (RTX 3070 CA,
+RTX 3090 US, RTX 3090 BG; ~$0.10 total, all destroyed) and blamed the host
+("the GPU host removed the machine"). Its diagnostics showed `stage: null`
+throughout and nothing pointing at the bundle.
+
+Fixed in 0.2.1:
+- **Pre-rent asset check** (`assets.rs`): in Vast mode, `start_session`
+  downloads the bundle the way `onstart.sh` does and checks
+  `ASSETS_SHA256` before renting. It was checked live: the draft URL gives
+  "HTTP 404 … release may not be published yet. No GPU was rented.",
+  `instance-v0.1.1` passes, and `instance-v0.1.0` fails the hash.
+- An instance that the host reported `running` but whose sidecar never
+  answered, and which then vanished, is reported as "SlopTweak's setup never
+  started on it", not as a host removal.
+- A log line (so it shows in diagnostics) once the host has said `running`
+  for 4 min with no sidecar answer, saying whether a tunnel was published.
+- Mock behaviour `nosidecar` and session tests for both paths.
+
+Lesson for releasing: don't press Start on a draft build (already in
+`docs/releasing.md` step 6); the app now refuses at $0 instead.
+
 ## Still open
 
 - ~~Live upstream catalog edit~~ **done (2026-09-25).** Merging PR #3

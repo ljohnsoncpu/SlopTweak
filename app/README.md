@@ -17,7 +17,7 @@ SLOPTWEAK_PROVIDER=mock npx tauri dev
 ```
 
 `SLOPTWEAK_MOCK_SCRIPT=daemon,dead,normal` scripts per-create failures
-(`daemon`, `dead`, `stuck`, `taken`, `provfail`, `selfdestruct`, `slowpull`, `normal`)
+(`daemon`, `dead`, `stuck`, `taken`, `provfail`, `selfdestruct`, `slowpull`, `nosidecar`, `normal`)
 so the retry and failure paths can be seen in the UI.
 
 ## Module map
@@ -41,6 +41,7 @@ so the retry and failure paths can be seen in the UI.
 | `catalog.rs` | Catalog fetch from GitHub, validation, cache, bundled fallback |
 | `civitai.rs` | CivitAI key check (`/me`) and LoRA links → verified file metadata |
 | `cost.rs` | Low-balance gate and cost bar (pure) |
+| `assets.rs` | Pre-rent check: download the instance asset bundle and verify its SHA-256 (Vast mode) |
 
 ## Dev-only hooks (debug builds only)
 
