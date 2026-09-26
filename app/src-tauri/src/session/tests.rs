@@ -433,6 +433,32 @@ async fn slow_pull_with_progress_is_kept() {
     h.mgr.stop_and_wait(Duration::from_secs(300)).await;
 }
 
+/// The asset-bundle failure seen live: the host runs the container, the
+/// sidecar never comes up, and onstart's deadman destroys it. Say so, and
+/// don't blame the host.
+#[tokio::test(start_paused = true)]
+async fn instance_whose_setup_never_starts_is_reported_as_such() {
+    let h = harness(vec![MockBehavior::NoSidecar(Duration::from_secs(10 * 60))]);
+    start(&h);
+    wait_for(&h.mgr, is_ready).await;
+    assert_eq!(h.mock.created_offers().len(), 2, "moved to the next offer");
+    let log = h.ui.lines.lock().unwrap().join("\n");
+    assert!(log.contains("setup never started"), "{log}");
+    assert!(!log.contains("host removed"), "{log}");
+    assert!(log.contains("no tunnel published"), "{log}");
+    h.mgr.stop_and_wait(Duration::from_secs(300)).await;
+
+    let d = Duration::from_secs(10 * 60);
+    let h = harness(vec![MockBehavior::NoSidecar(d); 3]);
+    start(&h);
+    let s = wait_for(&h.mgr, |s| matches!(s, SessionState::Failed { .. })).await;
+    let SessionState::Failed { reason } = s else {
+        panic!()
+    };
+    assert!(reason.contains("setup never started"), "{reason}");
+    assert!(h.mock.live_ids().is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn unavailable_offer_is_retried_elsewhere() {
     let h = harness(vec![MockBehavior::Unavailable]);

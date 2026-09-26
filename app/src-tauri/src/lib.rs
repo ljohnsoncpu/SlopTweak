@@ -1,5 +1,6 @@
 //! SlopTweak launcher: Tauri shell, commands, and wiring.
 
+mod assets;
 mod catalog;
 mod civitai;
 mod config;
@@ -507,6 +508,11 @@ async fn start_session(st: State<'_, AppState>, model_id: String) -> Result<(), 
     st.remember_credit(credit);
     if let Gate::Refuse(msg) = cost::gate(credit, settings.min_credit, None, 0.0) {
         return Err(msg);
+    }
+    // An instance that can't fetch the asset bundle never starts and costs
+    // ~10 minutes per attempt, so check it before renting (Vast mode only).
+    if matches!(st.mode, Mode::Vast) {
+        assets::check(&config::assets_url(), config::ASSETS_SHA256).await?;
     }
     let civitai = st.secret(secrets::CIVITAI_TOKEN);
     let installing = st.installing.lock().await;
