@@ -211,6 +211,70 @@ completes on a clean install.
 **Accept:** signed installer installs without SmartScreen block; auto-update
 works from vN to vN+1; beta users complete a session unassisted.
 
+### Phase 6 — Tutorial v2 (user decisions 2026-09-26)
+Replaces the vase tour. One character carries through every stage, and
+each stage teaches one idea. Stages are resumable: the user can leave
+between them and pick up where they left off. Skip and minimize stay.
+
+The fixed prompt (user-supplied), 832×1216:
+
+- Positive: `a woman standing in front of a white background,` then on
+  its own line `solo, female, human, white background, black tank top,
+  black jeans, red eyes, red hair, simple background, front view,
+  forehead, standing, medium shot, smile`
+- Negative: `nsfw`
+
+1. **Prompting.** In the Generate tab, generate the character above. Say
+   briefly what the two parts of the prompt are: the first line is a
+   natural-language sentence and the second is tags. Each model was
+   trained on its own caption style, so check the model page (CivitAI
+   example images, the description) for what it expects. The negative
+   prompt teaches positive vs. negative, and `nsfw` there keeps a first
+   generation safe on an NSFW-capable model (Banana Splitz).
+2. **Prompt Templates.** From the model page, take the tags that appear
+   in every example (quality/style tags) and put them in a Prompt
+   Template (**Create Prompt Template**, with `{prompt}` where the user's
+   words go). This is how users set up their first templates. Point out
+   that a template isn't tied to a model. Which tags to suggest for each
+   catalog model gets decided during tuning.
+3. **Generated image → canvas.** Right-click the result in the gallery →
+   **New Canvas from Image → As Raster Layer (Resize)**. A **Use ours
+   instead** button uploads the bundled fallback portrait
+   (`app/src-tauri/assets/tutorial-portrait.webp`, user-supplied, made from
+   this prompt) if the user's generation is unusable.
+4. **Small edit: fix and recolor the eyes** (red → green; not blue, so it
+   doesn't mix with the visor). The fallback's eyes have visible artifacts;
+   this step fixes them too. Mask the eyes, press **Shift+B** (Fit Bbox To
+   Masks), then drag the bbox out to include the whole face. The mask is
+   what gets redrawn; the bbox is what the model sees. In a medium shot the
+   face is small, so this shows off Scale Before Processing (Auto):
+   generating the small bbox at full model resolution is what fixes the
+   detail. Denoising Strength: try about 0.3 (barely changes), then about
+   0.55.
+5. **Big edit: transparent cyberpunk visor.** Add a Raster Layer, paint a
+   rough blue band across the eyes, and **lower that layer's opacity** so
+   the eyes show through. That teaches layer opacity and gives the model a
+   see-through tint to work from. Mask over the band, add the visor to the
+   prompt, and use a higher denoise, about 0.6–0.75. Contrast with step 4:
+   small edits need no paint, big ones do. Tuning decides between that and
+   the alternative (lower the opacity of the accepted result layer), which
+   risks ghosting the whole bbox area. Finish with Accept / Save To
+   Gallery (see findings: Accept alone doesn't save).
+
+Invoke facts this relies on are in `docs/findings.md` → "Tutorial v2
+groundwork".
+
+**Before building copy that depends on numbers:** tune the suggested
+seed, denoise values, visor opacity, and template tags on real GPUs with
+each catalog base (Illustrious, Anima). This needs a paid rental; get
+approval first (GPU, $/hr, duration, cap). The overlay structure,
+stage persistence, fallback upload, and mock tests can be built before
+that.
+
+**Accept:** a clean install goes through all five stages on each catalog
+model using the given values; the fallback path works; every label named
+in the copy matches the pinned Invoke version (checked live).
+
 ---
 
 ## 5. Security checklist
@@ -251,6 +315,7 @@ works from vN to vN+1; beta users complete a session unassisted.
 | 3 Wizard/catalog/cost | 2–3 sessions |
 | 4 Sync + tutorial | 2 sessions |
 | 5 Ship | 2 sessions + beta time |
+| 6 Tutorial v2 | 2 sessions + one tuning rental |
 
 ## 9. Open questions — ask the user, don't assume
 1. **Watchdog credential.** If Vast has no instance-scoped or restricted key

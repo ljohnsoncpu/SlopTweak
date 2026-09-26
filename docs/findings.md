@@ -838,6 +838,32 @@ Fixed in 0.2.1:
 Lesson for releasing: don't press Start on a draft build (already in
 `docs/releasing.md` step 6); the app now refuses at $0 instead.
 
+## Tutorial v2 groundwork (Invoke 6.14.1 source, 2026-09-26)
+
+Read from `en.json`, `useHotkeyData.ts`, and `useAutoFitBBoxToMasks.ts`
+at tag `v6.14.1`. Not yet checked in a live instance.
+
+- **Fit Bbox To Masks**: a canvas toolbar button, hotkey **Shift+B**
+  (**Fit Bbox To Layers** is Shift+N). One-time action, not a mode. It fits
+  the union of visible inpaint masks, pads by `maskBlur + 8` px, and snaps
+  to the bbox grid. For a small mask (eyes) that leaves almost no context,
+  so enlarge the bbox by hand afterward.
+- **Scale Before Processing**: *Auto* scales the bbox area to the model's
+  best size before generating; *Manual* sets Scaled W/H. This is Invoke's
+  version of "inpaint only masked at full resolution".
+- Denoise controls: **Denoising Strength**; per-mask **Denoise Limit** and
+  **Image Noise**; **Optimized Image-to-Image** (Flux only, beta).
+  Blending: **Mask Blur**, **Coherence Pass** (Mode, Edge Size, Min
+  Denoise).
+- **Prompt Templates** (code calls them "style presets"): positive and
+  negative prompts with a `{prompt}` placeholder; **Create Prompt
+  Template**, **Flatten selected template into current prompt**, import
+  from CSV/JSON (columns `name`, `prompt`/`positive_prompt`,
+  `negative_prompt`). Not tied to a model. **Trigger Phrases** (Model
+  Manager) is a separate insert-by-hand picker.
+- Gallery → canvas: **New Canvas from Image → As Raster Layer (Resize)**
+  (already used by v1); **Send To Canvas** also exists.
+
 ## Still open
 
 - ~~Live upstream catalog edit~~ **done (2026-09-25).** Merging PR #3
