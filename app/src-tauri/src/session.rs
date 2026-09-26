@@ -33,7 +33,7 @@ use crate::config::{self, Settings};
 use crate::persist::{now_unix, ActiveRecord, RecordFile};
 use crate::provider::machines::MachineFile;
 use crate::provider::offers::{self, RankedOffer};
-use crate::provider::{GpuProvider, Health, InstanceInfo, ProviderError};
+use crate::provider::{self, GpuProvider, Health, InstanceInfo, ProviderError};
 use crate::redact::redact;
 use crate::secrets::{self, SecretStore};
 use crate::sidecar::{auth_url, Deadlines, SidecarApi, SidecarError, SidecarStatus};
@@ -175,6 +175,47 @@ fn name(s: &SessionState) -> &'static str {
         SessionState::Stopping { .. } => "Stopping",
         SessionState::Failed { .. } => "Failed",
     }
+}
+
+/// One line for the diagnostics history: set when the state kind changes,
+/// or a provisioning attempt moves to a new instance or setup stage (not on
+/// every progress tick). Not redacted; callers redact.
+pub fn history_entry(old: &SessionState, new: &SessionState) -> Option<String> {
+    use SessionState as S;
+    let describe = |s: &SessionState| match s {
+        S::Idle { notice: None } => "Idle".to_string(),
+        S::Idle { notice: Some(n) } => format!("Idle (notice: {n})"),
+        S::Renting {
+            attempt,
+            max_attempts,
+            offer,
+        } => match offer {
+            Some(o) => format!(
+                "Renting attempt {attempt}/{max_attempts}: offer {} {} ${:.4}/hr",
+                o.offer_id, o.gpu_name, o.hourly
+            ),
+            None => format!("Renting attempt {attempt}/{max_attempts}"),
+        },
+        S::Provisioning {
+            attempt,
+            instance_id,
+            stage,
+            ..
+        } => format!(
+            "Provisioning attempt {attempt}: instance {instance_id} stage {}",
+            stage.as_deref().unwrap_or("-")
+        ),
+        S::Ready {
+            instance_id, offer, ..
+        } => format!("Ready: instance {instance_id} {}", offer.gpu_name),
+        S::Stopping { instance_id } => match instance_id {
+            Some(id) => format!("Stopping instance {id}"),
+            None => "Stopping".to_string(),
+        },
+        S::Failed { reason } => format!("Failed: {reason}"),
+    };
+    let (a, b) = (describe(old), describe(new));
+    (a != b).then(|| format!("{} -> {b}", name(old)))
 }
 
 pub fn next(state: &SessionState, event: &Event) -> Result<SessionState, InvalidTransition> {
@@ -420,6 +461,8 @@ struct Inner {
     active: Option<Active>,
     task: Option<JoinHandle<()>>,
     log: VecDeque<String>,
+    /// State and stage changes, for diagnostics (already redacted).
+    history: VecDeque<String>,
     /// Output sync for the Ready instance, and its polling task.
     sync: Option<Arc<AsyncMutex<OutputSync>>>,
     sync_task: Option<JoinHandle<()>>,
@@ -446,11 +489,19 @@ pub struct SessionManager {
 }
 
 const LOG_LINES: usize = 300;
+const HISTORY_LINES: usize = 200;
 
 pub fn new_launch_secret() -> String {
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Random hex for a per-attempt instance label.
+fn new_nonce() -> String {
+    let mut bytes = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 pub fn sha256_hex(s: &str) -> String {
@@ -492,6 +543,7 @@ impl SessionManager {
                 active: None,
                 task: None,
                 log: VecDeque::new(),
+                history: VecDeque::new(),
                 sync: None,
                 sync_task: None,
                 sync_report: None,
@@ -537,6 +589,21 @@ impl SessionManager {
         self.inner.lock().unwrap().log.iter().cloned().collect()
     }
 
+    /// State machine and setup-stage history, oldest first.
+    pub fn history(&self) -> Vec<String> {
+        self.inner.lock().unwrap().history.iter().cloned().collect()
+    }
+
+    /// The launch secret of the current instance, so diagnostics can mask it.
+    pub fn active_secret(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .active
+            .as_ref()
+            .map(|a| a.secret.clone())
+    }
+
     /// When the current instance started billing, if there is one.
     pub fn billing_since(&self) -> Option<u64> {
         let inner = self.inner.lock().unwrap();
@@ -553,12 +620,21 @@ impl SessionManager {
             .is_some_and(|t| !t.is_finished())
     }
 
+    /// Every secret this session could echo: the launch secret and the
+    /// user's keys (a provider or sidecar message may contain them).
+    fn known_secrets(&self) -> Vec<String> {
+        let mut known: Vec<String> = [secrets::VAST_API_KEY, secrets::CIVITAI_TOKEN]
+            .into_iter()
+            .filter_map(|n| self.deps.secrets.get(n).ok().flatten())
+            .collect();
+        known.extend(self.active_secret());
+        known
+    }
+
     pub fn log(&self, msg: impl AsRef<str>) {
-        let line = {
-            let inner = self.inner.lock().unwrap();
-            let known: Vec<&str> = inner.active.iter().map(|a| a.secret.as_str()).collect();
-            redact(msg.as_ref(), &known)
-        };
+        let known = self.known_secrets();
+        let known: Vec<&str> = known.iter().map(String::as_str).collect();
+        let line = redact(msg.as_ref(), &known);
         let stamped = format!("{} {line}", now_unix());
         {
             let mut inner = self.inner.lock().unwrap();
@@ -574,10 +650,19 @@ impl SessionManager {
     /// Apply an event. Returns false (and changes nothing) if it isn't valid
     /// in the current state.
     fn apply(&self, ev: Event) -> bool {
+        let known = self.known_secrets();
+        let known: Vec<&str> = known.iter().map(String::as_str).collect();
         let new = {
             let mut inner = self.inner.lock().unwrap();
             match next(&inner.state, &ev) {
                 Ok(s) => {
+                    if let Some(entry) = history_entry(&inner.state, &s) {
+                        let line = format!("{} {}", now_unix(), redact(&entry, &known));
+                        if inner.history.len() >= HISTORY_LINES {
+                            inner.history.pop_front();
+                        }
+                        inner.history.push_back(line);
+                    }
                     inner.state = s.clone();
                     s
                 }
@@ -873,14 +958,28 @@ impl SessionManager {
             }
 
             let secret = self.launch_secret();
-            let spec =
+            let mut spec =
                 config::launch_spec(&model, &settings, &sha256_hex(&secret), civitai.as_deref());
-            let instance_id = match self
+            spec.label = provider::attempt_label(&new_nonce());
+            let created = match self
                 .deps
                 .provider
                 .create_instance(best.offer.id, &spec)
                 .await
             {
+                Err(e) if e.create_may_have_succeeded() => {
+                    self.log(format!(
+                        "create on offer {} failed ({e}); checking whether it went through",
+                        best.offer.id
+                    ));
+                    match self.find_created(&spec.label).await {
+                        Some(id) => Ok(id),
+                        None => Err(e),
+                    }
+                }
+                other => other,
+            };
+            let instance_id = match created {
                 Ok(id) => id,
                 Err(ProviderError::OfferUnavailable) => {
                     self.log(format!("offer {} was taken", best.offer.id));
@@ -893,9 +992,14 @@ impl SessionManager {
                     continue;
                 }
                 Err(e) => {
-                    self.apply(Event::Fail {
-                        reason: format!("Couldn't rent the GPU: {e}"),
-                    });
+                    let reason = if e.create_may_have_succeeded() {
+                        format!(
+                            "Couldn't rent the GPU: {e}. If a GPU shows up in the Vast console                              anyway, SlopTweak offers to shut it down next time it starts."
+                        )
+                    } else {
+                        format!("Couldn't rent the GPU: {e}")
+                    };
+                    self.apply(Event::Fail { reason });
                     return;
                 }
             };
@@ -1359,6 +1463,27 @@ impl SessionManager {
         self.forget(instance_id);
         self.deps.ui.close_remote();
         self.apply(Event::InstanceGone { reason });
+    }
+
+    /// After a create call failed ambiguously: the instance it may have made,
+    /// found by its per-attempt label.
+    async fn find_created(&self, label: &str) -> Option<u64> {
+        for attempt in 1..=4 {
+            if attempt > 1 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            match self.deps.provider.list_instances().await {
+                Ok(list) => {
+                    if let Some(i) = list.iter().find(|i| i.label.as_deref() == Some(label)) {
+                        self.log(format!("the create went through: instance {}", i.id));
+                        return Some(i.id);
+                    }
+                }
+                Err(e) => self.log(format!("couldn't list instances: {e}")),
+            }
+        }
+        self.log("no instance was created");
+        None
     }
 
     /// Destroy, then poll until the provider no longer lists the instance.

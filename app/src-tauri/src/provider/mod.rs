@@ -12,9 +12,16 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-/// Label every SlopTweak instance carries. The instance rewrites it to
-/// `sloptweak:<tunnel host>` once its tunnel is up.
+/// Label every SlopTweak instance carries. Each create uses
+/// [`attempt_label`]; the instance rewrites it to `sloptweak:<tunnel host>`
+/// once its tunnel is up.
 pub const LABEL: &str = "sloptweak";
+
+/// `sloptweak-<nonce>`: unique per create call, so an instance whose create
+/// response was lost can still be found in the instance list.
+pub fn attempt_label(nonce: &str) -> String {
+    format!("{LABEL}-{nonce}")
+}
 
 /// A rentable machine, normalised from the provider's search results.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -140,9 +147,9 @@ fn is_pull_output(msg: &str) -> bool {
 
 impl InstanceInfo {
     pub fn is_ours(&self) -> bool {
-        self.label
-            .as_deref()
-            .is_some_and(|l| l == LABEL || l.starts_with("sloptweak:"))
+        self.label.as_deref().is_some_and(|l| {
+            l == LABEL || l.starts_with("sloptweak:") || l.starts_with("sloptweak-")
+        })
     }
 
     /// The raw host part of a `sloptweak:<host>` label, unvalidated.
@@ -215,6 +222,18 @@ pub enum ProviderError {
     Network(String),
     #[error("unexpected response from Vast: {0}")]
     Parse(String),
+}
+
+impl ProviderError {
+    /// A create call that failed this way may still have created the
+    /// instance (e.g. the response was lost), so check before moving on.
+    pub fn create_may_have_succeeded(&self) -> bool {
+        match self {
+            Self::Network(_) | Self::Parse(_) => true,
+            Self::Http { status, .. } => *status >= 500,
+            Self::Auth | Self::OfferUnavailable => false,
+        }
+    }
 }
 
 #[async_trait]
@@ -382,6 +401,9 @@ mod tests {
         i.label = Some("sloptweak:abc.trycloudflare.com".into());
         assert!(i.is_ours());
         assert_eq!(i.label_host(), Some("abc.trycloudflare.com"));
+        i.label = Some(attempt_label("0123abcd"));
+        assert!(i.is_ours());
+        assert_eq!(i.label_host(), None);
         i.label = Some("sloptweakish".into());
         assert!(!i.is_ours());
     }

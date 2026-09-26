@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SignPath artifact configuration "app-exe": the launcher exe, signed
+     before it is packed into the installer (release.yml, pass 1). The
+     GitHub artifact is a zip holding sloptweak.exe. -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <!-- Passed by release.yml; must match the file's ProductVersion resource. -->
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file path="sloptweak.exe" product-name="SlopTweak" product-version="${version}">
+      <authenticode-sign />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

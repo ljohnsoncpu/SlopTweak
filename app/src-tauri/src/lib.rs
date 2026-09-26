@@ -4,6 +4,7 @@ mod catalog;
 mod civitai;
 mod config;
 mod cost;
+mod diagnostics;
 mod persist;
 mod provider;
 mod redact;
@@ -12,6 +13,7 @@ mod secrets;
 mod session;
 mod sidecar;
 mod sync;
+mod updater;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -19,8 +21,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_updater::UpdaterExt;
 use url::Url;
 
 use crate::catalog::{Catalog, Model};
@@ -38,6 +42,7 @@ use crate::secrets::{KeyringStore, SecretStore};
 use crate::session::{Deps, Orphan, SessionManager, SessionState, Timing, Ui};
 use crate::sidecar::HttpSidecar;
 use crate::sync::{SyncReport, SyncStore};
+use crate::updater::UpdateInfo;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -77,6 +82,13 @@ impl Ui for TauriUi {
     }
 }
 
+/// An update found by `check_update`, waiting for the user to install it.
+enum PendingUpdate {
+    Real(Box<tauri_plugin_updater::Update>),
+    /// Mock mode (`SLOPTWEAK_MOCK_UPDATE`): nothing is downloaded or run.
+    Mock,
+}
+
 /// Provider plus the matching sidecar client.
 type Backends = (Arc<dyn GpuProvider>, Arc<dyn sidecar::SidecarApi>);
 
@@ -94,6 +106,11 @@ struct AppState {
     credit: Mutex<Option<(f64, u64)>>,
     /// Serialises read-modify-write of settings.json.
     settings_lock: Mutex<()>,
+    update: Mutex<Option<(UpdateInfo, PendingUpdate)>>,
+    /// True while an update downloads and installs. Starting (or
+    /// reattaching) a session and installing exclude each other through this
+    /// lock: the installer exits the app, skipping the last sync and destroy.
+    installing: tokio::sync::Mutex<bool>,
 }
 
 fn output_dir(config_dir: &std::path::Path, default: &std::path::Path) -> PathBuf {
@@ -318,6 +335,7 @@ struct SettingsView {
 #[derive(Serialize)]
 struct Snapshot {
     mode: Mode,
+    version: String,
     state: SessionState,
     log: Vec<String>,
     has_vast_key: bool,
@@ -351,7 +369,7 @@ fn settings_view(st: &AppState, s: &Settings) -> SettingsView {
 // ----- commands ----------------------------------------------------------------
 
 #[tauri::command]
-async fn get_snapshot(st: State<'_, AppState>) -> Result<Snapshot, String> {
+async fn get_snapshot(app: AppHandle, st: State<'_, AppState>) -> Result<Snapshot, String> {
     let (state, log, sync) = match st.manager() {
         Ok(m) => (m.state(), m.log_lines(), m.sync_report()),
         Err(_) => (SessionState::idle(), vec![], None),
@@ -360,6 +378,7 @@ async fn get_snapshot(st: State<'_, AppState>) -> Result<Snapshot, String> {
     let settings = st.settings();
     Ok(Snapshot {
         mode: st.mode,
+        version: app.package_info().version.to_string(),
         cost: st.cost_bar(),
         state,
         log,
@@ -490,8 +509,14 @@ async fn start_session(st: State<'_, AppState>, model_id: String) -> Result<(), 
         return Err(msg);
     }
     let civitai = st.secret(secrets::CIVITAI_TOKEN);
+    let installing = st.installing.lock().await;
+    if *installing {
+        return Err(UPDATING.into());
+    }
     m.start(model, settings, civitai)
 }
+
+const UPDATING: &str = "SlopTweak is installing an update and will restart.";
 
 #[tauri::command]
 async fn stop_session(st: State<'_, AppState>) -> Result<(), String> {
@@ -736,6 +761,7 @@ fn fixed_link(id: &str) -> Option<&'static str> {
         "civitai_signup" => "https://civitai.com/login",
         "civitai_keys" => "https://civitai.com/user/account",
         "civitai_terms" => "https://civitai.com/content/tos",
+        "release_notes" => updater::RELEASES_PAGE,
         _ => return None,
     })
 }
@@ -778,6 +804,10 @@ async fn destroy_orphan(st: State<'_, AppState>, instance_id: u64) -> Result<(),
 
 #[tauri::command]
 async fn reattach_orphan(st: State<'_, AppState>, instance_id: u64) -> Result<(), String> {
+    let installing = st.installing.lock().await;
+    if *installing {
+        return Err(UPDATING.into());
+    }
     st.manager()?.reattach(instance_id).await
 }
 
@@ -792,6 +822,201 @@ async fn confirm_close(app: AppHandle, st: State<'_, AppState>) -> Result<(), St
         );
     }
     st.ui.remote.close();
+    app.exit(0);
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct Diagnostics {
+    /// False if the clipboard was busy; the UI then lets the user copy `text`.
+    copied: bool,
+    text: String,
+}
+
+/// A redacted report for bug reports, copied to the clipboard.
+#[tauri::command]
+async fn copy_diagnostics(app: AppHandle, st: State<'_, AppState>) -> Result<Diagnostics, String> {
+    let settings = st.settings();
+    let manager = st.manager.lock().unwrap().clone();
+    let (state, history, log, sync, launch) = match &manager {
+        Some(m) => (
+            m.state(),
+            m.history(),
+            m.log_lines(),
+            m.sync_report(),
+            m.active_secret(),
+        ),
+        None => (SessionState::idle(), vec![], vec![], None, None),
+    };
+    let record = RecordFile::new(&st.data_dir).load();
+    // Every secret this app holds, masked by value (patterns catch the rest).
+    let mut known: Vec<String> = [secrets::VAST_API_KEY, secrets::CIVITAI_TOKEN]
+        .into_iter()
+        .filter_map(|n| st.secret(n))
+        .collect();
+    known.extend(launch);
+    if let Some(r) = &record {
+        known.extend(st.secret(&secrets::launch_secret_name(r.instance_id)));
+    }
+    let known: Vec<&str> = known.iter().map(String::as_str).collect();
+    let catalog = {
+        let c = st.catalog.lock().unwrap();
+        format!(
+            "{:?}, {} models, fetched {:?}, skipped {:?}",
+            c.source,
+            c.models.len(),
+            c.fetched_unix,
+            c.skipped
+        )
+    };
+    let update = st
+        .update
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|(i, _)| format!("{} available", i.version));
+    let version = app.package_info().version.to_string();
+    let home = app.path().home_dir().ok();
+    let text = diagnostics::report(
+        &diagnostics::Inputs {
+            app_version: &version,
+            mode: match st.mode {
+                Mode::Vast => "vast",
+                Mode::Mock => "mock",
+            },
+            os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            webview: tauri::webview_version().ok(),
+            generated_unix: now_unix(),
+            state: &state,
+            history: &history,
+            log: &log,
+            settings: &settings,
+            catalog,
+            sync: sync.as_ref(),
+            has_vast_key: st.secret(secrets::VAST_API_KEY).is_some(),
+            has_civitai_key: st.secret(secrets::CIVITAI_TOKEN).is_some(),
+            record: record.as_ref(),
+            credit: st.credit.lock().unwrap().map(|(c, _)| c),
+            update,
+            image: config::IMAGE,
+            assets_url: &config::assets_url(),
+            assets_sha256: config::ASSETS_SHA256,
+        },
+        &known,
+        home.as_deref().and_then(|h| h.to_str()),
+    );
+    let copied = match app.clipboard().write_text(text.as_str()) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[sloptweak] clipboard: {e}");
+            false
+        }
+    };
+    Ok(Diagnostics { copied, text })
+}
+
+/// Look for a newer release. `None` when up to date.
+async fn find_update(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
+    let st = app.state::<AppState>();
+    let current = app.package_info().version.to_string();
+    let found = match st.mode {
+        // Dev: `SLOPTWEAK_MOCK_UPDATE=<version>` pretends a release exists.
+        Mode::Mock => std::env::var("SLOPTWEAK_MOCK_UPDATE")
+            .ok()
+            .filter(|v| cfg!(debug_assertions) && !v.is_empty())
+            .map(|v| {
+                (
+                    UpdateInfo {
+                        version: v,
+                        current: current.clone(),
+                        notes: updater::short_notes(Some("Mock release notes.")),
+                    },
+                    PendingUpdate::Mock,
+                )
+            }),
+        Mode::Vast => app
+            .updater()
+            .map_err(|e| e.to_string())?
+            .check()
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|u| {
+                (
+                    UpdateInfo {
+                        version: u.version.clone(),
+                        current: current.clone(),
+                        notes: updater::short_notes(u.body.as_deref()),
+                    },
+                    PendingUpdate::Real(Box::new(u)),
+                )
+            }),
+    };
+    let info = found.as_ref().map(|(i, _)| i.clone());
+    *st.update.lock().unwrap() = found;
+    Ok(info)
+}
+
+#[tauri::command]
+async fn check_update(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
+    find_update(&app)
+        .await
+        .map_err(|e| format!("Couldn't check for updates ({e})."))
+}
+
+/// Download, verify, and run the installer. On Windows the installer
+/// replaces the app and restarts it, so a success doesn't return.
+#[tauri::command]
+async fn install_update(app: AppHandle, st: State<'_, AppState>) -> Result<(), String> {
+    {
+        let mut installing = st.installing.lock().await;
+        if *installing {
+            return Err("The update is already being installed.".into());
+        }
+        updater::may_install(session_active(&app))?;
+        *installing = true;
+    }
+    let result = install_pending(&app, &st).await;
+    // Only reached if nothing was installed (mock mode or an error).
+    *st.installing.lock().await = false;
+    result
+}
+
+async fn install_pending(app: &AppHandle, st: &AppState) -> Result<(), String> {
+    let Some((info, pending)) = st.update.lock().unwrap().take() else {
+        return Err("No update is waiting. Check for updates first.".into());
+    };
+    eprintln!("[sloptweak] installing update {}", info.version);
+    let update = match pending {
+        PendingUpdate::Mock => {
+            eprintln!("[sloptweak] mock: would install {}", info.version);
+            let _ = app.emit_to("main", "update-progress", 100.0);
+            return Ok(());
+        }
+        PendingUpdate::Real(u) => u,
+    };
+    let mut received = 0usize;
+    let progress_app = app.clone();
+    let bytes = update
+        .download(
+            move |chunk, total| {
+                received += chunk;
+                if let Some(t) = total.filter(|t| *t > 0) {
+                    let pct = (received as f64 / t as f64 * 100.0).min(100.0);
+                    let _ = progress_app.emit_to("main", "update-progress", pct);
+                }
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| format!("The update didn't download ({e}). SlopTweak wasn't changed."))?;
+    // `installing` has kept sessions from starting since the check above;
+    // check again right before the installer takes over, to be sure.
+    updater::may_install(session_active(app))?;
+    // The installer closes this process: close the Invoke window first.
+    st.ui.remote.close();
+    update
+        .install(bytes)
+        .map_err(|e| format!("The update didn't install ({e}). SlopTweak wasn't changed."))?;
     app.exit(0);
     Ok(())
 }
@@ -831,9 +1056,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            // Mock mode (and every SLOPTWEAK_MOCK_* hook, read only in it) is
+            // dev-only: a release build always talks to Vast.
             let mode = match std::env::var("SLOPTWEAK_PROVIDER").as_deref() {
-                Ok("mock") => Mode::Mock,
+                Ok("mock") if cfg!(debug_assertions) => Mode::Mock,
                 _ => Mode::Vast,
             };
             // Mock mode gets its own credential service and folders, so fake
@@ -905,6 +1134,8 @@ pub fn run() {
                 civitai,
                 credit: Mutex::new(None),
                 settings_lock: Mutex::new(()),
+                update: Mutex::new(None),
+                installing: tokio::sync::Mutex::new(false),
             });
             eprintln!("[sloptweak] provider mode: {mode:?}");
             // Created here rather than from config so dev builds can attach a
@@ -940,6 +1171,20 @@ pub fn run() {
             let h = handle.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = fetch_catalog(&h).await;
+            });
+            // Check for a new version shortly after launch; the home screen
+            // offers it. Failures (offline, no release yet) stay quiet.
+            let h = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                match find_update(&h).await {
+                    Ok(Some(info)) => {
+                        eprintln!("[sloptweak] update available: {}", info.version);
+                        let _ = h.emit_to("main", "update-available", &info);
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("[sloptweak] update check failed: {e}"),
+                }
             });
             tauri::async_runtime::spawn(cost_loop(handle));
             Ok(())
@@ -983,6 +1228,9 @@ pub fn run() {
             destroy_orphan,
             reattach_orphan,
             confirm_close,
+            copy_diagnostics,
+            check_update,
+            install_update,
         ])
         // A hard exit skips cleanup by design: the instance watchdog destroys
         // the GPU once heartbeats stop, and the next launch finds the record.
@@ -1004,6 +1252,7 @@ mod tests {
             "civitai_signup",
             "civitai_keys",
             "civitai_terms",
+            "release_notes",
         ] {
             assert!(fixed_link(id).unwrap().starts_with("https://"), "{id}");
         }

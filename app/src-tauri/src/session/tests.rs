@@ -444,6 +444,23 @@ async fn unavailable_offer_is_retried_elsewhere() {
     h.mgr.stop_and_wait(Duration::from_secs(300)).await;
 }
 
+/// Money rule: an instance whose create response was lost is still found,
+/// recorded, and eventually destroyed.
+#[tokio::test(start_paused = true)]
+async fn lost_create_response_is_reconciled_by_label() {
+    let h = harness(vec![MockBehavior::LostCreateResponse]);
+    start(&h);
+    let s = wait_for(&h.mgr, is_ready).await;
+    let id = s.instance_id().unwrap();
+    assert_eq!(h.mock.created_offers().len(), 1, "no second rental");
+    assert_eq!(
+        RecordFile::new(h.dir.path()).load().unwrap().instance_id,
+        id
+    );
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+    assert!(h.mock.live_ids().is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn three_failures_give_a_plain_message_and_leave_nothing_running() {
     let h = harness(vec![
@@ -807,6 +824,43 @@ async fn failed_downloads_are_retried() {
     h.mgr.stop_and_wait(Duration::from_secs(300)).await;
 }
 
+/// An image that keeps failing is never dropped: quick passes stop trying it,
+/// but it stays missing and the last pass before shutdown tries again.
+#[tokio::test(start_paused = true)]
+async fn repeatedly_failing_image_is_retried_by_the_final_pass() {
+    let h = harness(vec![]);
+    let id = ready_instance(&h).await;
+    h.mock.fail_image("a.png", 5);
+    h.mock.add_image(id, gallery("a.png"));
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    let r = h.mgr.sync_report().unwrap();
+    assert_eq!((r.saved, r.missing), (0, 1), "{r:?}");
+    assert!(!SyncStore::new(h.dir.path())
+        .load(id)
+        .ignored
+        .contains("a.png"));
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+    let r = h.mgr.sync_report().unwrap();
+    assert_eq!((r.phase, r.saved, r.missing), (Phase::Done, 1, 0), "{r:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn image_that_never_downloads_leaves_the_session_incomplete() {
+    let h = harness(vec![]);
+    let id = ready_instance(&h).await;
+    h.mock.fail_image("a.png", 1000);
+    h.mock.add_image(id, gallery("a.png"));
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+    let r = h.mgr.sync_report().unwrap();
+    assert_eq!(
+        (r.phase, r.saved, r.missing),
+        (Phase::Incomplete, 0, 1),
+        "{r:?}"
+    );
+    assert!(h.mock.live_ids().is_empty());
+}
+
 /// Money rule: a stuck final sync never keeps the GPU alive.
 #[tokio::test(start_paused = true)]
 async fn slow_final_sync_times_out_and_still_destroys() {
@@ -882,4 +936,82 @@ async fn self_destruct_still_saves_the_last_images() {
     wait_for(&h.mgr, |s| matches!(s, SessionState::Idle { .. })).await;
     assert_eq!(pngs(&out_dir(h.dir.path())).len(), 1);
     assert!(h.mock.live_ids().is_empty());
+}
+
+// ----- diagnostics history -----------------------------------------------------
+
+#[test]
+fn history_records_kind_and_stage_changes_only() {
+    let p = provisioning(1);
+    let staged = |stage: &str, progress: f64| {
+        next(
+            &p,
+            &Event::Stage(SidecarStatus {
+                stage: stage.into(),
+                progress: Some(progress),
+                ..Default::default()
+            }),
+        )
+        .unwrap()
+    };
+    let d10 = staged("downloading", 10.0);
+    let d50 = staged("downloading", 50.0);
+    let e = history_entry(&p, &d10).unwrap();
+    assert_eq!(
+        e,
+        "Provisioning -> Provisioning attempt 1: instance 42 stage downloading"
+    );
+    // Progress ticks inside one stage are not history.
+    assert_eq!(history_entry(&d10, &d50), None);
+    let failed = SessionState::Failed {
+        reason: "no GPU".into(),
+    };
+    assert_eq!(
+        history_entry(&d50, &failed).unwrap(),
+        "Provisioning -> Failed: no GPU"
+    );
+    assert_eq!(history_entry(&failed, &failed.clone()), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn manager_keeps_a_redacted_history() {
+    let h = harness(vec![MockBehavior::DaemonError]);
+    start(&h);
+    wait_for(&h.mgr, is_ready).await;
+    assert!(h.mgr.active_secret().is_some());
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+    let hist = h.mgr.history();
+    let text = hist.join("\n");
+    for want in [
+        "Idle -> Renting attempt 1/3",
+        "Renting attempt 2/3",
+        "-> Ready: instance",
+        "Ready -> Stopping instance",
+        "Stopping -> Idle",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in\n{text}");
+    }
+    // Each line is stamped with a unix time.
+    assert!(hist
+        .iter()
+        .all(|l| l.split(' ').next().unwrap().parse::<u64>().is_ok()));
+    assert_eq!(h.mgr.active_secret(), None);
+}
+
+/// Provider or sidecar text is logged; the user's keys never reach the log,
+/// even when they're too short for the pattern redaction or URL-encoded.
+#[tokio::test(start_paused = true)]
+async fn session_log_masks_the_users_keys() {
+    let h = harness(vec![]);
+    h.secrets
+        .set(secrets::CIVITAI_TOKEN, "a1b2c3d4e5f6a7b8c9d0")
+        .unwrap();
+    h.secrets
+        .set(secrets::VAST_API_KEY, "vast/key+with=odd")
+        .unwrap();
+    h.mgr
+        .log("status: a1b2c3d4e5f6a7b8c9d0 and ?key=vast%2Fkey%2Bwith%3Dodd");
+    let line = h.mgr.log_lines().pop().unwrap();
+    assert!(!line.contains("a1b2c3") && !line.contains("odd"), "{line}");
+    assert_eq!(line.matches("[REDACTED]").count(), 2, "{line}");
 }

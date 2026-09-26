@@ -29,6 +29,9 @@
     "allow-scan-orphans",
     "allow-destroy-orphan",
     "allow-reattach-orphan",
-    "allow-confirm-close"
+    "allow-confirm-close",
+    "allow-copy-diagnostics",
+    "allow-check-update",
+    "allow-install-update"
   ]
 }

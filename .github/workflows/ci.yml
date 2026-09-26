@@ -1,0 +1,70 @@
+# $0 checks on every PR and push to main. No secrets, no Vast calls.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: app/src-tauri
+      - name: TypeScript
+        working-directory: app
+        run: npm ci && npm run build
+      - name: Rust
+        working-directory: app/src-tauri
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
+  instance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Python (ruff, mypy, pytest)
+        working-directory: instance
+        run: |
+          uv sync --locked
+          uv run ruff check . ../.github/scripts
+          uv run ruff format --check . ../.github/scripts
+          uv run mypy
+          uv run mypy --strict ../.github/scripts/release_files.py
+          uv run python -m pytest -q
+          uv run pytest -q ../.github/scripts --rootdir ../.github/scripts
+      - name: Shell
+        run: shellcheck instance/provision.sh instance/onstart.sh
+      - name: Instance bundle matches the app's pin
+        run: python3 instance/build_assets.py --check-pin --out /tmp/instance-assets.tar.gz

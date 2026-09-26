@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SignPath artifact configuration "installer": the NSIS installer
+     (release.yml, pass 2). The GitHub artifact is a zip holding
+     SlopTweak_<version>_x64-setup.exe. Both configurations take the release
+     version and require it in the PE ProductVersion, with ProductName
+     SlopTweak (SignPath Foundation terms). -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <!-- Passed by release.yml; must match the file's ProductVersion resource. -->
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file path="SlopTweak_${version}_x64-setup.exe" product-name="SlopTweak" product-version="${version}">
+      <authenticode-sign />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

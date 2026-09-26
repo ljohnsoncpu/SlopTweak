@@ -24,6 +24,17 @@
       <div id="view-home" class="view" hidden>
         <section id="orphans" class="card warn" hidden></section>
 
+        <section id="update" class="card notice-card" hidden>
+          <p id="update-text"></p>
+          <p id="update-notes" class="muted small"></p>
+          <div class="actions">
+            <button id="update-install" class="primary">Update now</button>
+            <button id="update-notes-link" class="ghost">What's new</button>
+            <button id="update-later" class="ghost">Later</button>
+          </div>
+          <p id="update-msg" class="muted small"></p>
+        </section>
+
         <section class="card">
           <div class="row">
             <label for="model">Model</label>
@@ -58,6 +69,10 @@
           <summary>Details</summary>
           <p id="catalog-info" class="muted small"></p>
           <pre id="log"></pre>
+          <div class="actions">
+            <button id="diag-copy" class="ghost">Copy diagnostics</button>
+            <span id="diag-msg" class="muted small"></span>
+          </div>
         </details>
       </div>
 
@@ -114,6 +129,21 @@
           <div class="actions">
             <button id="rerun-wizard" class="ghost">Run setup again</button>
           </div>
+        </section>
+
+        <section class="card">
+          <h2>About and help</h2>
+          <p id="about-version" class="muted"></p>
+          <div class="actions">
+            <button id="update-check">Check for updates</button>
+            <button id="diag-copy-2" class="ghost">Copy diagnostics</button>
+          </div>
+          <p id="about-msg" class="muted small"></p>
+          <p class="muted small">
+            Diagnostics are a text report for bug reports: app version, what the app did, and your
+            settings. Keys, tokens, and your Windows user name are removed. Nothing is sent anywhere;
+            it's copied for you to paste.
+          </p>
         </section>
 
         <section class="card">

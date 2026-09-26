@@ -10,12 +10,15 @@ import argparse
 import gzip
 import hashlib
 import io
+import re
 import tarfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 FILES = {"provision.sh": 0o755, "sidecar.py": 0o644, "requirements.txt": 0o644}
 ONSTART_LIMIT = 4048
+CONFIG_RS = HERE.parent / "app" / "src-tauri" / "src" / "config.rs"
+PIN_RE = re.compile(r'pub const ASSETS_SHA256: &str = "([0-9a-f]{64})";')
 
 
 def build(out: Path) -> str:
@@ -45,13 +48,33 @@ def onstart_script() -> str:
     return script
 
 
+def pinned_sha256(config: Path = CONFIG_RS) -> str:
+    """The SHA-256 the app pins (config.rs ASSETS_SHA256)."""
+    m = PIN_RE.search(config.read_text(encoding="utf-8"))
+    if not m:
+        raise SystemExit(f"ASSETS_SHA256 not found in {config}")
+    return m.group(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=HERE / "dist" / "instance-assets.tar.gz")
+    parser.add_argument(
+        "--check-pin",
+        action="store_true",
+        help="fail unless the bundle's SHA-256 equals ASSETS_SHA256 in config.rs",
+    )
     args = parser.parse_args()
     digest = build(args.out)
     onstart_script()
     print(f"{digest}  {args.out}")
+    if args.check_pin:
+        pin = pinned_sha256()
+        if digest != pin:
+            raise SystemExit(
+                f"bundle SHA-256 {digest} != pinned {pin}; update ASSETS_SHA256 in config.rs"
+            )
+        print("matches the pin in config.rs")
 
 
 if __name__ == "__main__":

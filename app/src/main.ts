@@ -100,6 +100,7 @@ interface SyncReport {
 
 interface Snapshot {
   mode: "vast" | "mock";
+  version: string;
   state: SessionState;
   log: string[];
   has_vast_key: boolean;
@@ -122,6 +123,12 @@ interface Estimate {
   usable_offers: number;
   credit: number;
   gate: Gate;
+}
+
+interface UpdateInfo {
+  version: string;
+  current: string;
+  notes: string | null;
 }
 
 interface KeyCheck {
@@ -233,6 +240,19 @@ const ui = {
   rerunWizard: el<HTMLButtonElement>("rerun-wizard"),
   catalogStatus: el("catalog-status"),
   catalogRefresh: el<HTMLButtonElement>("catalog-refresh"),
+  update: el("update"),
+  updateText: el("update-text"),
+  updateNotes: el("update-notes"),
+  updateInstall: el<HTMLButtonElement>("update-install"),
+  updateNotesLink: el<HTMLButtonElement>("update-notes-link"),
+  updateLater: el<HTMLButtonElement>("update-later"),
+  updateMsg: el("update-msg"),
+  updateCheck: el<HTMLButtonElement>("update-check"),
+  aboutVersion: el("about-version"),
+  aboutMsg: el("about-msg"),
+  diagCopy: el<HTMLButtonElement>("diag-copy"),
+  diagCopy2: el<HTMLButtonElement>("diag-copy-2"),
+  diagMsg: el("diag-msg"),
   modal: el("modal"),
   modalMsg: el("modal-msg"),
   modalOk: el<HTMLButtonElement>("modal-ok"),
@@ -248,6 +268,10 @@ let sync: SyncReport | null = null;
 let credit: number | null = null;
 let estimate: Estimate | null = null;
 let view: "wizard" | "home" | "settings" = "home";
+let update: UpdateInfo | null = null;
+let updateDismissed = false;
+/** An update is downloading/installing; the app will exit, so no new session. */
+let installing = false;
 let wizardStep = 0;
 let tick: number | undefined;
 
@@ -353,7 +377,20 @@ function elapsed(fromUnix: number): string {
   return duration(Date.now() / 1000 - fromUnix);
 }
 
+function renderUpdate(): void {
+  const show = update !== null && !updateDismissed;
+  ui.update.hidden = !show;
+  if (!update) return;
+  ui.updateText.textContent = `SlopTweak ${update.version} is available (you have ${update.current}).`;
+  ui.updateNotes.textContent = update.notes ?? "";
+  const busy = active();
+  ui.updateInstall.disabled = busy || installing;
+  if (busy) ui.updateMsg.textContent = "You can update after you stop the GPU. Updating closes and reopens SlopTweak.";
+  else if (ui.updateMsg.textContent?.startsWith("You can update")) ui.updateMsg.textContent = "";
+}
+
 function render(): void {
+  renderUpdate();
   const s = state;
   const keysOk =
     !!snapshot?.has_vast_key &&
@@ -361,7 +398,7 @@ function render(): void {
   const refused = !active() && estimate?.gate.kind === "refuse";
 
   ui.start.hidden = active();
-  ui.start.disabled = !keysOk || refused || !currentModel();
+  ui.start.disabled = !keysOk || refused || !currentModel() || installing;
   ui.stop.hidden = !active() || s.kind === "stopping";
   ui.open.hidden = s.kind !== "ready";
   ui.tutorial.hidden = s.kind !== "ready";
@@ -919,6 +956,7 @@ async function loraAction(p: Promise<unknown>): Promise<void> {
 async function load(): Promise<void> {
   snapshot = await invoke<Snapshot>("get_snapshot");
   ui.mode.hidden = snapshot.mode !== "mock";
+  ui.aboutVersion.textContent = `SlopTweak ${snapshot.version}`;
   state = snapshot.state;
   cost = snapshot.cost;
   sync = snapshot.sync;
@@ -1015,6 +1053,68 @@ ui.catalogRefresh.onclick = async () => {
   renderSettings();
 };
 
+async function copyDiagnostics(msg: HTMLElement): Promise<void> {
+  msg.textContent = "Collecting…";
+  try {
+    const d = await invoke<{ copied: boolean; text: string }>("copy_diagnostics");
+    if (d.copied) {
+      msg.textContent = "Copied. Paste it into your message; keys and tokens were removed.";
+      return;
+    }
+    // Clipboard busy: show the report selected so Ctrl+C works.
+    ui.log.closest("details")?.setAttribute("open", "");
+    ui.log.textContent = d.text;
+    const range = document.createRange();
+    range.selectNodeContents(ui.log);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+    msg.textContent = "Couldn't copy automatically. The report is selected under Details: press Ctrl+C.";
+  } catch (e) {
+    msg.textContent = String(e);
+  }
+}
+
+ui.diagCopy.onclick = () => void copyDiagnostics(ui.diagMsg);
+ui.diagCopy2.onclick = () => void copyDiagnostics(ui.aboutMsg);
+
+ui.updateCheck.onclick = async () => {
+  ui.aboutMsg.textContent = "Checking…";
+  ui.updateCheck.disabled = true;
+  try {
+    update = await invoke<UpdateInfo | null>("check_update");
+    updateDismissed = false;
+    ui.aboutMsg.textContent = update
+      ? `SlopTweak ${update.version} is available. Go back to the home screen to install it.`
+      : "You have the latest version.";
+  } catch (e) {
+    ui.aboutMsg.textContent = String(e);
+  } finally {
+    ui.updateCheck.disabled = false;
+  }
+  render();
+};
+ui.updateLater.onclick = () => {
+  updateDismissed = true;
+  render();
+};
+ui.updateNotesLink.onclick = () => void openLink("release_notes");
+ui.updateInstall.onclick = async () => {
+  installing = true;
+  render();
+  ui.updateMsg.textContent = "Downloading the update…";
+  try {
+    await invoke("install_update");
+    // Real updates close the app here; mock mode returns.
+    ui.updateMsg.textContent = "Installed. SlopTweak will restart.";
+    installing = false;
+    render();
+  } catch (e) {
+    installing = false;
+    render();
+    ui.updateMsg.textContent = String(e);
+  }
+};
+
 ui.modalCancel.onclick = () => {
   ui.modal.hidden = true;
 };
@@ -1055,6 +1155,14 @@ await listen("catalog-updated", async () => {
   await load();
   if (view === "settings") renderSettings();
   if (view === "home") void refreshEstimate();
+});
+await listen<UpdateInfo>("update-available", (e) => {
+  update = e.payload;
+  render();
+});
+await listen<number>("update-progress", (e) => {
+  ui.updateMsg.textContent =
+    e.payload >= 100 ? "Starting the installer…" : `Downloading the update… ${Math.round(e.payload)}%`;
 });
 await listen("close-requested", () => {
   ui.modalMsg.textContent = "";

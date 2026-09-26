@@ -34,6 +34,8 @@ pub enum MockBehavior {
     NeverStarts,
     /// The create call fails: offer gone.
     Unavailable,
+    /// The instance is created but the create response is lost.
+    LostCreateResponse,
     /// Provisioning reports `failed` with this detail.
     ProvisionFails(String),
     /// Becomes ready, then the watchdog destroys it after this long.
@@ -54,6 +56,7 @@ pub fn parse_script(script: &str) -> Vec<MockBehavior> {
             "dead" => Some(MockBehavior::DeadHost),
             "stuck" => Some(MockBehavior::NeverStarts),
             "taken" => Some(MockBehavior::Unavailable),
+            "lostcreate" => Some(MockBehavior::LostCreateResponse),
             "provfail" => Some(MockBehavior::ProvisionFails("download failed: mock".into())),
             "selfdestruct" => Some(MockBehavior::SelfDestructAfterReady(Duration::from_secs(
                 120,
@@ -92,6 +95,7 @@ impl Default for MockTimings {
 #[derive(Debug)]
 struct MockInstance {
     offer_id: u64,
+    label: String,
     created: Instant,
     behavior: MockBehavior,
     token_hash: String,
@@ -308,7 +312,7 @@ impl MockProvider {
             actual_status: Some("loading".into()),
             intended_status: Some("running".into()),
             cur_state: Some("running".into()),
-            label: Some(super::LABEL.into()),
+            label: Some(inst.label.clone()),
             dph_total: self
                 .offers
                 .iter()
@@ -421,6 +425,7 @@ impl GpuProvider for MockProvider {
             id,
             MockInstance {
                 offer_id,
+                label: spec.label.clone(),
                 created: Instant::now(),
                 behavior,
                 token_hash,
@@ -432,6 +437,9 @@ impl GpuProvider for MockProvider {
                 auto_made: 0,
             },
         );
+        if s.instances[&id].behavior == MockBehavior::LostCreateResponse {
+            return Err(ProviderError::Network("mock: response lost".into()));
+        }
         Ok(id)
     }
 

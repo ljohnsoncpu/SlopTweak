@@ -31,6 +31,8 @@ log = "0.4"
 tauri-plugin-opener = "2.5"
 tauri-plugin-dialog = "2.7"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tauri-plugin-updater = "2.12"
+tauri-plugin-clipboard-manager = "2.3"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
