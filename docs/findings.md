@@ -543,9 +543,8 @@ Spend ~$0.018 (credit $11.3423 → $11.3247). The title check is also in
   machine memory ✅. 11/11 checks, ~$0.028 (credit $11.3235 → $11.2956).
   Anima Turbo wasn't run live (same pipeline, different main file); it needs
   CFG 1 and 8–12 steps, which its description tells the user.
-- Follow-up idea: set Invoke's per-model `default_settings` (steps/CFG) at
-  registration, so Turbo works out of the box. That needs a provision.sh
-  change and a new instance-asset release.
+- Follow-up: per-model `default_settings`. Built; see "Model default
+  settings" below.
 - CivitAI's `baseModel` "Anima" maps to the `anima` family for LoRAs.
 
 ## Phase 4 findings (2026-09-25)
@@ -837,6 +836,73 @@ Fixed in 0.2.1:
 
 Lesson for releasing: don't press Start on a draft build (already in
 `docs/releasing.md` step 6); the app now refuses at $0 instead.
+
+## Model default settings (Invoke 6.14.1 source, 2026-09-26)
+
+Checked against the `v6.14.1` tag (commit `027be7e2`), then live (below).
+
+- ⚠️ **Invoke doesn't apply a model's `default_settings` when you select
+  it.** Only the ✨ **Use default settings** button (`PiSparkleFill`, by the
+  main model picker, `UseDefaultSettingsButton.tsx`) dispatches
+  `setDefaultSettings`. Its tooltip lists the settings that don't match, and
+  it's disabled when everything already matches. `modelSelected`,
+  `modelsLoaded` and `appStarted` never read `default_settings`. That's why
+  the Phase 6 sessions showed the UI's own 7.5 / 30 for every model.
+- Invoke already sets defaults at registration
+  (`MainModelDefaultSettings.from_base`, called from
+  `ModelConfigFactory`): SDXL gets only 1024×1024, and **Anima gets 35
+  steps, CFG 4.5, 1024×1024, the same for Turbo** (Invoke has no Anima Turbo
+  variant). So without our override, the button would put Turbo on 35 / 4.5.
+- Update: `PATCH /api/v2/models/i/{key}`, body `ModelRecordChanges`
+  (`{"default_settings": {...}}`). It **replaces `default_settings` as a
+  whole** (`model_records_sql.update_model` copies each field that is set),
+  so read the record first and merge. `MainModelDefaultSettings` has
+  `extra="forbid"`: `vae, vae_precision, scheduler, steps (>0),
+  cfg_scale (≥1), cfg_rescale_multiplier, width, height, guidance,
+  cpu_only, fp8_storage`. The body field is a union with the LoRA,
+  control-adapter and external-API settings types, and `{width, height}`
+  alone would also match the external one, so always send a main-only key
+  (cfg/steps/scheduler).
+- Find the key with `GET /api/v2/models/?model_type=main` → `{models:
+  [...]}`. An in-place install records the absolute path as `path` and
+  `source`.
+- `scheduler` is Invoke's SD scheduler list (`euler_a` = Euler Ancestral).
+  **Anima has its own `animaScheduler` parameter** (default `euler`), so
+  `default_settings.scheduler` does nothing for Anima; the catalog rejects
+  it there.
+- Catalog values: **Banana Splitz** `euler_a` / CFG 5 / 30 steps. The card
+  says v3.0+ is "for Euler a sampler only" and gives no CFG or steps. The
+  CFG and steps come from its v1.2.1 CivitAI gallery: of 174 images with
+  metadata, CFG 3.5–5 and 30 steps are the most common (20 and 14 steps
+  also common). **Anima Aesthetic** CFG 4.5 / 35 (card: 30–50 steps,
+  CFG 4–5; same as Invoke's own). **Anima Turbo** CFG 1 / 10 (card: CFG 1,
+  8–12 steps; 10 is what Phase 6 tuning used).
+- As built: the catalog carries `default_settings` (validated in
+  `catalog.rs`); `launch_spec` puts it on the main file's `MODELS_B64` entry;
+  `instance/model_defaults.py` (stdlib only) merges and PATCHes after
+  registration, and a failure is only logged (`model-defaults.log`). Asset pin
+  → `16e68e06…`; debug builds point at pre-release `instance-v0.1.2`
+  (published 2026-09-26; downloaded back, SHA-256 matches the pin). Older apps ignore the new catalog field, and older
+  bundles ignore the new MODELS_B64 key.
+- ✅ **Live (2026-09-26, instance 52802661, offer 48529478, RTX 3060 12 GB,
+  New Brunswick, $0.0838/hr incl. storage, $0.0039/GB down):** all three
+  models on one instance (`launch_dev.py create --model …` ×3; 5 files,
+  16.7 GB, shared Anima files once). Image was cached: downloading after
+  93 s, Ready at **532 s** (downloads ~50–110 MB/s). `GET /api/v2/models/`
+  via the sidecar with the bearer showed, for each main model, the catalog
+  values plus Invoke's own 1024×1024 kept: Banana Splitz `euler_a` / 30 /
+  CFG 5.0; Anima Aesthetic 35 / 4.5; Anima Turbo 10 / 1.0. ⏳ The ✨ click in
+  the UI wasn't done (the agent's permission check blocked reading the login
+  ticket); what the button does is from source only. Spend **$0.079**
+  (credit $10.7214 → $10.6420). An earlier attempt (52802144) was stopped
+  while loading and cost $0.0002.
+
+## Rental log, model default settings
+
+| Instance | Offer | Outcome |
+| --- | --- | --- |
+| 52802144 | 48529478 (RTX 3060, NB) | Stopped while loading; gone on check |
+| 52802661 | 48529478 (RTX 3060, NB) | 3/3 PASS; destroyed by the runner |
 
 ## Still open
 

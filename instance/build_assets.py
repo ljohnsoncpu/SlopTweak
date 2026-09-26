@@ -1,6 +1,6 @@
 """Build the instance asset bundle reproducibly and print its SHA-256.
 
-The bundle (provision.sh, sidecar.py, requirements.txt) is what onstart downloads
+The bundle (provision.sh, sidecar.py, model_defaults.py, requirements.txt) is what onstart downloads
 and verifies. Same inputs always give the same bytes, so the pinned hash is stable.
 """
 
@@ -15,7 +15,12 @@ import tarfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-FILES = {"provision.sh": 0o755, "sidecar.py": 0o644, "requirements.txt": 0o644}
+FILES = {
+    "provision.sh": 0o755,
+    "sidecar.py": 0o644,
+    "model_defaults.py": 0o644,
+    "requirements.txt": 0o644,
+}
 ONSTART_LIMIT = 4048
 CONFIG_RS = HERE.parent / "app" / "src-tauri" / "src" / "config.rs"
 PIN_RE = re.compile(r'pub const ASSETS_SHA256: &str = "([0-9a-f]{64})";')

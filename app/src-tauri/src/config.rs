@@ -23,13 +23,13 @@ pub const ASSETS_URL: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "/instance-assets.tar.gz"
 );
-pub const ASSETS_SHA256: &str = "ea4bd0bc22da9dfb0c0f49612388ca9346ece88211df1ddfdd8eca5c0afcaa99";
+pub const ASSETS_SHA256: &str = "16e68e06a67dbcd2a43bf5da510490d5c639abc966998720abae32de60461255";
 /// Debug builds of a version that has no release yet fetch the same bytes
-/// from the `instance-v0.1.1` dev pre-release; `SLOPTWEAK_DEV_ASSETS_URL` overrides it
+/// from the `instance-v0.1.2` dev pre-release; `SLOPTWEAK_DEV_ASSETS_URL` overrides it
 /// (the instance still checks [`ASSETS_SHA256`]).
 #[cfg(debug_assertions)]
 const DEV_ASSETS_URL: &str =
-    "https://github.com/ljohnsoncpu/SlopTweak/releases/download/instance-v0.1.1/instance-assets.tar.gz";
+    "https://github.com/ljohnsoncpu/SlopTweak/releases/download/instance-v0.1.2/instance-assets.tar.gz";
 
 /// Where instances fetch the bundle from.
 pub fn assets_url() -> String {
@@ -264,17 +264,25 @@ pub fn launch_spec(
     launch_token_hash: &str,
     civitai_token: Option<&str>,
 ) -> LaunchSpec {
+    // The catalog's recommended settings ride on the main file, which is the
+    // Invoke model they belong to (instance/model_defaults.py).
+    let main_idx = model.files.iter().position(|f| f.kind == "main");
     let files: Vec<_> = model
         .files
         .iter()
-        .map(|f| {
-            json!({
+        .enumerate()
+        .map(|(i, f)| {
+            let mut v = json!({
                 "url": f.url,
                 "sha256": f.sha256.to_ascii_lowercase(),
                 "size_bytes": f.size_bytes,
                 "filename": f.filename,
                 "requires_civitai_token": f.requires_civitai_token,
-            })
+            });
+            if let (Some(d), true) = (&model.default_settings, Some(i) == main_idx) {
+                v["default_settings"] = json!(d);
+            }
+            v
         })
         .collect();
     let models_b64 =
@@ -473,6 +481,46 @@ mod tests {
         assert_eq!(offer_query(&model, &s).min_compute_cap, 800);
         model.min_compute_cap = Some(600);
         assert_eq!(offer_query(&model, &s).min_compute_cap, 750);
+    }
+
+    fn decoded_models(spec: &LaunchSpec) -> serde_json::Value {
+        let b64 = &spec.env.iter().find(|(k, _)| k == "MODELS_B64").unwrap().1;
+        serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn default_settings_ride_on_the_main_file_only() {
+        let s = Settings::default();
+        let turbo = catalog::bundled()
+            .into_iter()
+            .find(|m| m.id == "anima-turbo")
+            .unwrap();
+        let m = with_loras(&turbo, &[lora(1, "Anima", "a.safetensors")]);
+        let files = decoded_models(&launch_spec(&m, &s, &"a".repeat(64), None));
+        let files = files.as_array().unwrap();
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0]["filename"], "anima-turbo-v1.1.safetensors");
+        assert_eq!(
+            files[0]["default_settings"],
+            json!({"cfg_scale": 1.0, "steps": 10})
+        );
+        assert!(files[1..]
+            .iter()
+            .all(|f| f.get("default_settings").is_none()));
+
+        let mut plain = turbo.clone();
+        plain.default_settings = None;
+        let files = decoded_models(&launch_spec(&plain, &s, &"a".repeat(64), None));
+        assert!(files
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f.get("default_settings").is_none()));
     }
 
     #[test]
