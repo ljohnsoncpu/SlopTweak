@@ -839,7 +839,7 @@ Lesson for releasing: don't press Start on a draft build (already in
 
 ## Model default settings (Invoke 6.14.1 source, 2026-09-26)
 
-Checked against the `v6.14.1` tag (commit `027be7e2`); ⏳ not yet run live.
+Checked against the `v6.14.1` tag (commit `027be7e2`), then live (below).
 
 - ⚠️ **Invoke doesn't apply a model's `default_settings` when you select
   it.** Only the ✨ **Use default settings** button (`PiSparkleFill`, by the
@@ -882,8 +882,27 @@ Checked against the `v6.14.1` tag (commit `027be7e2`); ⏳ not yet run live.
   `instance/model_defaults.py` (stdlib only) merges and PATCHes after
   registration, and a failure is only logged (`model-defaults.log`). Asset pin
   → `16e68e06…`; debug builds point at pre-release `instance-v0.1.2`
-  (⏳ not yet published). Older apps ignore the new catalog field, and older
+  (published 2026-09-26; downloaded back, SHA-256 matches the pin). Older apps ignore the new catalog field, and older
   bundles ignore the new MODELS_B64 key.
+- ✅ **Live (2026-09-26, instance 52802661, offer 48529478, RTX 3060 12 GB,
+  New Brunswick, $0.0838/hr incl. storage, $0.0039/GB down):** all three
+  models on one instance (`launch_dev.py create --model …` ×3; 5 files,
+  16.7 GB, shared Anima files once). Image was cached: downloading after
+  93 s, Ready at **532 s** (downloads ~50–110 MB/s). `GET /api/v2/models/`
+  via the sidecar with the bearer showed, for each main model, the catalog
+  values plus Invoke's own 1024×1024 kept: Banana Splitz `euler_a` / 30 /
+  CFG 5.0; Anima Aesthetic 35 / 4.5; Anima Turbo 10 / 1.0. ⏳ The ✨ click in
+  the UI wasn't done (the agent's permission check blocked reading the login
+  ticket); what the button does is from source only. Spend **$0.079**
+  (credit $10.7214 → $10.6420). An earlier attempt (52802144) was stopped
+  while loading and cost $0.0002.
+
+## Rental log, model default settings
+
+| Instance | Offer | Outcome |
+| --- | --- | --- |
+| 52802144 | 48529478 (RTX 3060, NB) | Stopped while loading; gone on check |
+| 52802661 | 48529478 (RTX 3060, NB) | 3/3 PASS; destroyed by the runner |
 
 ## Still open
 
