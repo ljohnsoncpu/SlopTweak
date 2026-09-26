@@ -56,6 +56,90 @@ pub struct Model {
     /// model only.
     #[serde(default)]
     pub min_compute_cap: Option<u32>,
+    /// Recommended generation settings. The instance writes them into the
+    /// model's Invoke config (`default_settings`) after registering it.
+    #[serde(default)]
+    pub default_settings: Option<DefaultSettings>,
+}
+
+/// A subset of Invoke's `MainModelDefaultSettings` (6.14.1). Invoke's UI
+/// applies them when the user clicks "Use default settings" (the sparkle
+/// button by the model picker), not on model select (findings → "Model
+/// default settings").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DefaultSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfg_scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<u32>,
+    /// An Invoke `SCHEDULER_NAME_VALUES` name. SD-family bases only: Invoke
+    /// gives Anima and FLUX their own scheduler setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<String>,
+}
+
+/// `SCHEDULER_NAME_VALUES` in Invoke 6.14.1
+/// (invokeai/backend/stable_diffusion/schedulers/schedulers.py).
+const SCHEDULERS: &[&str] = &[
+    "ddim",
+    "ddpm",
+    "deis",
+    "deis_k",
+    "lms",
+    "lms_k",
+    "pndm",
+    "heun",
+    "heun_k",
+    "euler",
+    "euler_k",
+    "euler_a",
+    "kdpm_2",
+    "kdpm_2_k",
+    "kdpm_2_a",
+    "kdpm_2_a_k",
+    "dpmpp_2s",
+    "dpmpp_2s_k",
+    "dpmpp_2m",
+    "dpmpp_2m_k",
+    "dpmpp_2m_sde",
+    "dpmpp_2m_sde_k",
+    "dpmpp_3m",
+    "dpmpp_3m_k",
+    "dpmpp_sde",
+    "dpmpp_sde_k",
+    "er_sde",
+    "unipc",
+    "unipc_k",
+    "lcm",
+    "tcd",
+];
+
+/// Catalog bases whose Invoke graphs use the shared `scheduler` parameter.
+const SCHEDULER_BASES: &[&str] = &["sd1", "sd2", "sdxl"];
+
+fn validate_defaults(d: &DefaultSettings, base: &str) -> Result<(), String> {
+    if d.cfg_scale.is_none() && d.steps.is_none() && d.scheduler.is_none() {
+        // Invoke would read `{}` as another model type's settings.
+        return Err("empty default_settings".into());
+    }
+    // Invoke requires cfg_scale >= 1 and steps > 0; the upper bounds are the UI's.
+    if d.cfg_scale.is_some_and(|c| !(1.0..=200.0).contains(&c)) {
+        return Err("bad default_settings.cfg_scale".into());
+    }
+    if d.steps.is_some_and(|s| !(1..=500).contains(&s)) {
+        return Err("bad default_settings.steps".into());
+    }
+    if let Some(s) = &d.scheduler {
+        if !SCHEDULERS.contains(&s.as_str()) {
+            return Err(format!("unknown default_settings.scheduler {s:?}"));
+        }
+        if !SCHEDULER_BASES.contains(&base) {
+            return Err(format!(
+                "Invoke ignores default_settings.scheduler for {base}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Model {
@@ -201,6 +285,9 @@ fn validate(m: &Model) -> Result<(), String> {
         .is_some_and(|c| !(300..=1300).contains(&c))
     {
         return Err("bad min_compute_cap".into());
+    }
+    if let Some(d) = &m.default_settings {
+        validate_defaults(d, &m.base)?;
     }
     if !m.files.iter().any(|f| f.kind == "main") {
         return Err("no main model file".into());
@@ -420,6 +507,75 @@ mod tests {
         assert!(skipped.iter().any(|s| s.contains("wants the CivitAI key")));
         assert!(skipped.iter().any(|s| s.starts_with("ok: duplicate")));
         assert!(skipped.iter().any(|s| s.contains("needs Invoke 99.0.0")));
+    }
+
+    #[test]
+    fn bundled_default_settings_follow_the_model_cards() {
+        let models = bundled();
+        let get = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .default_settings
+                .clone()
+                .unwrap()
+        };
+        let banana = get("banana-splitz-xxl");
+        assert_eq!(banana.scheduler.as_deref(), Some("euler_a"));
+        let turbo = get("anima-turbo");
+        assert_eq!(turbo.cfg_scale, Some(1.0));
+        assert!((8..=12).contains(&turbo.steps.unwrap()));
+        let aesthetic = get("anima-aesthetic");
+        assert!((4.0..=5.0).contains(&aesthetic.cfg_scale.unwrap()));
+        assert!((30..=50).contains(&aesthetic.steps.unwrap()));
+        assert_eq!(aesthetic.scheduler, None);
+    }
+
+    #[test]
+    fn default_settings_are_validated() {
+        let with = |d: serde_json::Value, base: &str| {
+            let mut e = entry("d");
+            e["base"] = json!(base);
+            e["default_settings"] = d;
+            parse(&catalog(vec![e, entry("ok")])).unwrap()
+        };
+        let ok = with(
+            json!({"cfg_scale": 5, "steps": 30, "scheduler": "euler_a"}),
+            "sdxl",
+        );
+        assert_eq!(ok.0.len(), 2, "{:?}", ok.1);
+        assert_eq!(with(json!({"steps": 10}), "anima").0.len(), 2);
+        // Unknown keys are ignored, like elsewhere in the catalog.
+        assert_eq!(with(json!({"steps": 10, "future": 1}), "anima").0.len(), 2);
+        for (d, base, why) in [
+            (json!({}), "sdxl", "empty"),
+            (json!({"cfg_scale": 0.5}), "sdxl", "cfg_scale"),
+            (json!({"cfg_scale": 500}), "sdxl", "cfg_scale"),
+            (json!({"steps": 0}), "sdxl", "steps"),
+            (json!({"steps": -3}), "sdxl", "invalid"),
+            (json!({"steps": 2.5}), "sdxl", "invalid"),
+            (json!({"scheduler": "Euler a"}), "sdxl", "unknown"),
+            (json!({"scheduler": "euler"}), "anima", "ignores"),
+            (json!({"cfg_scale": "7"}), "sdxl", "invalid"),
+        ] {
+            let (models, skipped) = with(d.clone(), base);
+            assert_eq!(models.len(), 1, "{d} should be rejected");
+            assert!(skipped[0].contains(why), "{d}: {skipped:?}");
+        }
+    }
+
+    #[test]
+    fn default_settings_serialize_without_nulls() {
+        let d = DefaultSettings {
+            cfg_scale: Some(1.0),
+            steps: Some(10),
+            scheduler: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            json!({"cfg_scale": 1.0, "steps": 10})
+        );
     }
 
     #[test]
