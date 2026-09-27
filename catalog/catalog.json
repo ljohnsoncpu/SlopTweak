@@ -141,7 +141,7 @@
     {
       "id": "krea-2-turbo",
       "name": "Krea 2 Turbo",
-      "description": "12B general-purpose model by Krea, strong at photoreal and varied styles. Invoke sets 8 steps and CFG 1 automatically. Needs a 24 GB GPU and a host with plenty of RAM, so it rents for more than the anime models.",
+      "description": "12B general-purpose model by Krea, strong at photoreal and varied styles. SlopTweak sets it to 8 steps and CFG 1 when Invoke opens. Needs a 24 GB GPU and a host with plenty of RAM, so it rents for more than the anime models.",
       "good_for": "Photoreal and general images",
       "price_tier": 2,
       "base": "krea-2",
@@ -238,9 +238,9 @@
     {
       "id": "kroma-turbo",
       "name": "Kroma Turbo",
-      "description": "Community fine-tune of Krea 2 (by lodestones) with its own look; prompts don't always carry over from Krea 2. Use 8-12 steps and CFG 1-1.5. Largest download in the list (31 GB) and needs a 24 GB GPU.",
+      "description": "Community fine-tune of Krea 2 (by lodestones) with its own look; prompts don't always carry over from Krea 2. SlopTweak sets 8 steps and CFG 1 when Invoke opens; up to 12 steps and CFG 1.5 also work. Largest download in the list (31 GB, so the GPU can take 15+ minutes to get ready) and needs a GPU with 32 GB or more, about $0.50-0.65/hr, so raise the price limit in Settings to about $0.70.",
       "good_for": "Krea 2 with a community-tuned style",
-      "price_tier": 2,
+      "price_tier": 3,
       "base": "krea-2",
       "base_variant": "kroma-v0.3-turbo",
       "source": {
@@ -274,7 +274,7 @@
           "requires_civitai_token": false
         }
       ],
-      "min_vram_gb": 24,
+      "min_vram_gb": 32,
       "min_compute_cap": 800,
       "min_ram_gb": 48,
       "nsfw": true,

@@ -547,6 +547,9 @@ mod tests {
             // Invoke reads the Turbo variant from the file name.
             assert!(m.files[0].filename.contains("turbo"));
         }
+        // Kroma's only file is bf16 (25.6 GB): on 24 GB Invoke has to offload.
+        let kroma = models.iter().find(|m| m.id == "kroma-turbo").unwrap();
+        assert!(kroma.min_vram_gb >= 32.0);
     }
 
     #[test]

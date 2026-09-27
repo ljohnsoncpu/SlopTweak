@@ -25,6 +25,8 @@ use url::{Origin, Url};
 pub const LABEL_PREFIX: &str = "remote-";
 
 const TUTORIAL_JS: &str = include_str!("tutorial.js");
+/// Applies the model's own steps/CFG once per GPU (Invoke never does).
+const DEFAULTS_JS: &str = include_str!("defaults.js");
 const TUTORIAL_SAMPLE: &[u8] = include_bytes!("../assets/tutorial-sample.jpg");
 
 /// What the tutorial overlay reports back.
@@ -81,7 +83,8 @@ pub fn tutorial_signal(origin: &Origin, url: &Url) -> Option<TutorialSignal> {
     }
 }
 
-/// The overlay with its config and the sample picture baked in.
+/// The overlay with its config and the sample picture baked in, then the
+/// model-defaults script.
 pub fn tutorial_script(auto_show: bool, force: bool) -> String {
     let cfg = serde_json::json!({
         "autoShow": auto_show,
@@ -89,7 +92,12 @@ pub fn tutorial_script(auto_show: bool, force: bool) -> String {
         "sample": base64::engine::general_purpose::STANDARD.encode(TUTORIAL_SAMPLE),
         "sampleName": "sloptweak-tutorial-room.jpg",
     });
-    format!("{}({cfg});", TUTORIAL_JS.trim_end())
+    format!(
+        "{}({cfg});
+{}",
+        TUTORIAL_JS.trim_end(),
+        DEFAULTS_JS.trim_end()
+    )
 }
 
 impl RemoteWindows {
@@ -298,5 +306,9 @@ mod tests {
         assert!(s.ends_with(");"));
         assert!(s.contains(r#""autoShow":true"#) && s.contains(r#""force":false"#));
         assert!(s.contains("/9j/"), "JPEG sample embedded as base64");
+        assert!(
+            s.contains("/api/v1/recall/default"),
+            "model defaults applied"
+        );
     }
 }

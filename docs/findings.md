@@ -583,6 +583,60 @@ This supersedes the "Krea-2 is gated" note above.
 - **License:** HF lists Kroma as `krea-2-community-license` (base weights);
   the fine-tune delta is MIT. The Krea-2 license terms haven't been reviewed.
 
+### Krea 2 and Kroma live (2026-09-26) ✅ both work
+
+`TEST_MODEL=<id> GENERATE=1 LOCAL_CATALOG=1 node dev/vast-acceptance.mjs r1`,
+11/11 each. Total spend ~$0.58 across all runs below (credit $10.3671 → $9.7833).
+
+- **Registration:** all 3 files per model install through the API as
+  `krea-2/main` (variant `krea2_turbo` for both; Kroma's is read from the
+  filename), `any/qwen3_vl_encoder`, `anima/vae`. The Qwen3-VL config fetch at
+  load time worked.
+- **Krea 2 Turbo** (fp8_scaled) on an RTX 3090 (24 GB, $0.199/hr): Ready in
+  447 s; first image 187 s including the model load.
+- **Kroma Turbo** (bf16, 25.6 GB) on an RTX 3090 ($0.315/hr, 8.8 Gbps): Ready
+  in 541 s; first image 164 s including the load. It runs on 24 GB, but
+  only because Invoke offloads part of it, and the user reports slow gens.
+  **Catalog now asks for 32 GB** (tier $$$; 5090 ≈ $0.59–0.65/hr, A6000
+  $0.48–0.57/hr on 2026-09-26).
+- **Kroma on 48 GB** (RTX A6000, $0.569/hr, 2.4 Gbps): Ready in 905 s (the
+  download alone ~12 min, so a flat 15 min is too tight). First image 99 s
+  including the load (vs 164 s on the 3090); **warm image 12 s at 8 steps /
+  CFG 1**, clean. ~$0.22.
+- ⚠️ **Ready timeout:** Kroma's first try (RTX 3090, 2.3 Gbps listed) took
+  ~14 min to download 31 GB (~36 MB/s) and was dropped at the flat 15 min.
+  The timeout is now `max(setting, 8 + 0.6 min/GB)` (`config::ready_timeout_minutes`;
+  Kroma ≈ 27 min, Krea 2 ≈ 20). The 5-min reattach deadline is unchanged.
+- ⚠️ **Invoke never applies a model's default settings by itself.** Both
+  models were registered with `default_settings` `steps 8, cfg_scale 1`, but
+  the first image used 30 / 7.5 (Krea 2's came out oversaturated with hatching
+  artefacts). In 6.14.1 only `UseDefaultSettingsButton` (the sparkle icon next
+  to the model picker) dispatches `setDefaultSettings`. `modelsLoaded` →
+  `modelSelected` doesn't. Its `aria-label` key `modelManager.useDefaultSettings`
+  is missing from `en.json`.
+- **Fix (as built): `defaults.js`**, injected after `tutorial.js`. Once per
+  origin (a new GPU is a new tunnel origin), when Invoke's UI is up, it reads
+  the main model's `default_settings` and posts `steps`/`cfg_scale` to
+  `POST /api/v1/recall/default`. Invoke stores them as `recall_*` client state
+  and emits `recall_parameters_updated` to connected pages
+  (`setEventListeners.tsx` dispatches `setSteps`/`setCfgScale`). The event is
+  live-only, so the script sends it twice (2 s and 7 s after the UI is up).
+  ✅ **Live:** the POST returned 200 and the open page's Steps/CFG fields
+  changed to 8/1; the next image used 8/1. ⚠️ Invoke's **Invoke button has
+  no aria-label** in 6.14.1, only the text "Invoke" (the first live try
+  waited on the aria-label and never fired). ✅ **End to end** (Krea 2,
+  RTX 3090, 12/12): the script set 8/1 by itself ~8 s after the UI was up,
+  the image used 8/1 and came out clean (55 s including the load). ~$0.07.
+
+| Instance | Offer | Outcome |
+| --- | --- | --- |
+| 52841256 | 30086286, RTX 3090, $0.199/hr | Krea 2 run; destroyed by Stop |
+| 52842700 | 30086286, RTX 3090, $0.201/hr | Kroma; not ready in 15 min, destroyed by the app |
+| 52844373 | 52493301, RTX PRO 4000, $0.306/hr | Kroma retry; run stopped, destroyed via API |
+| 52844585 | 52741273, RTX 3090, $0.315/hr | Kroma run; destroyed by Stop |
+| 52847960 | 52313037, RTX A6000, $0.569/hr | Kroma 48 GB speed run; destroyed by Stop |
+| 52850783 | 52741273, RTX 3090, $0.312/hr | Krea 2 automatic-defaults run; destroyed by Stop |
+
 ## Phase 4 findings (2026-09-25)
 
 ### Canvas results and the gallery (Invoke 6.14.1, source + live)

@@ -927,7 +927,8 @@ impl SessionManager {
         let mut rx = self.stop.subscribe();
         let query = config::offer_query(&model, &settings);
         let costs = config::cost_inputs(&model, &settings);
-        let ready_timeout = Duration::from_secs(u64::from(settings.ready_timeout_minutes) * 60);
+        let ready_timeout =
+            Duration::from_secs(u64::from(config::ready_timeout_minutes(&model, &settings)) * 60);
         let mut tried = offers::Tried::with_memory(self.deps.machines.load(), now_unix());
         loop {
             if self.stopped() {
