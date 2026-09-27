@@ -235,6 +235,7 @@ const ui = {
   outDir: el("out-dir"),
   outPick: el<HTMLButtonElement>("out-pick"),
   outReset: el<HTMLButtonElement>("out-reset"),
+  outLock: el("out-lock"),
   loraLink: el<HTMLInputElement>("lora-link"),
   loraAdd: el<HTMLButtonElement>("lora-add"),
   loraMsg: el("lora-msg"),
@@ -908,6 +909,14 @@ function startWizard(): void {
 
 // ----- settings ----------------------------------------------------------------------
 
+/** The folder can't change while a GPU runs: images saved so far would stay in the old one. */
+function renderOutLock(): void {
+  const locked = active();
+  ui.outPick.disabled = locked;
+  ui.outReset.disabled = locked;
+  ui.outLock.hidden = !locked;
+}
+
 function renderSettings(): void {
   if (!snapshot) return;
   const s = snapshot.settings;
@@ -917,6 +926,7 @@ function renderSettings(): void {
   ui.sMinCredit.value = String(s.min_credit);
   ui.outDir.textContent = s.output_dir_resolved + (s.output_dir ? "" : " (default)");
   ui.outReset.hidden = !s.output_dir;
+  renderOutLock();
   renderLoras();
   ui.accounts.replaceChildren(
     h("p", {}, snapshot.has_vast_key ? "✓ Vast key saved. Paste a new one to replace it." : "No Vast key yet."),
@@ -1189,6 +1199,7 @@ await listen<SessionState>("session-state", (e) => {
   state = e.payload;
   if (!active()) cost = null;
   render();
+  renderOutLock();
   if (was !== "ready" && e.payload.kind === "ready") chime();
   if (was !== state.kind && (state.kind === "idle" || state.kind === "ready" || state.kind === "failed")) {
     void refreshCredit();
