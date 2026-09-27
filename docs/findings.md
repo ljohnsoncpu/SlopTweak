@@ -1376,6 +1376,14 @@ real-Vast run was not repeated; PR #12's live runs cover the app changes.
 $0 checks: cargo test 158, clippy, `npm run build`, mock-ui-check 65/65,
 webview-check 26/26, sync-check 60/60, instance pytest 33, ruff/mypy.
 
+## Release 0.2.4 check (2026-09-27) ✅
+
+The close-Invoke prompt and the beta-risk review fixes (PR #14).
+`instance/` is unchanged (pin `16e68e06…`, `--check-pin` matches), so no
+real-Vast run. $0 checks at PR #14's head (the code on `main`): cargo test
+159, clippy, typecheck, sync-check 65/65, mock-ui-check 65/65,
+webview-check 26/26.
+
 ## Still open
 
 - ~~Live upstream catalog edit~~ **done (2026-09-25).** Merging PR #3
