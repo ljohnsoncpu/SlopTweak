@@ -1173,6 +1173,28 @@ has no scheduler case, so there the card still says to click ✨.
 sync-check covers the docs step, the placement, and the centered home card;
 ⏳ the ring targets and dragging in v2 aren't checked against live Invoke yet.
 
+### Tutorial v2 copy round (user feedback, 2026-09-26)
+
+- Audience: not assumed technical. The copy keeps Invoke's own UI terms
+  (bbox, Scaled Bbox, Denoising Strength) so the UI makes sense, but drops
+  internals (scheduler, CFG, Scale Before Processing). No talking down:
+  "NSFW content", not "adult pictures".
+- Prompting advice: match the captions the model was trained on. Templates
+  are framed as automating the repeated part (quality tags, standard
+  negative), not a second lesson on reading the model page.
+- "Use ours instead" is always optional; nothing says the GPU starts empty.
+- Regenerating is mentioned twice (stage 1 end, "Keep the best one"), with
+  the note that Random must be on or the same seed gives the same picture.
+- Eye recolor first try is **0.2** (0.3 turned Banana Splitz's eyes too
+  green for the "too weak" demo); the follow-up says the eyes barely change.
+- The visor text goes at the **start** of the prompt (earlier words weigh
+  more). 0.7 was tuned with it at the end; the user judged it fine without a
+  re-tune.
+- Stage 5 moves the card to the bottom left (it covered the layer list); any
+  other stage drops that position, so a replay starts bottom-right again.
+- Checked: all cards in the browser pane via `fake_invoke.py --overlay`;
+  sync-check 60/60, mock-ui 65/65, webview 26/26; cargo test 158, clippy clean.
+
 ### Phase 6 tuning (live, 2026-09-26) ✅
 
 Three held sessions (`dev/phase6-session.mjs`), one per catalog model; all

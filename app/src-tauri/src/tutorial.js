@@ -19,10 +19,11 @@
 // Seed, Random, Choose Prompt Template, Create Prompt Template, Positive
 // Prompt, Negative Prompt, Insert placeholder, Save, Assets, New Canvas from
 // Image, As Raster Layer (Resize), Inpaint Mask, Raster Layer, Add Layer,
-// Fit Bbox To Masks (Shift+B), Bbox (C), Brush (B), Reset Layer (Shift+C),
-// Image, Advanced Options, Scale Before Processing, Auto, Denoising
-// Strength, Opacity, Foreground Color, Accept (Enter), Save To Gallery, Save
-// Canvas To Gallery. A future image bump must re-check them.
+// Fit Bbox To Masks (Shift+B), Bbox (C), Scaled Bbox, B (Brush), Shift+C
+// (Reset Layer), Image, Denoising Strength, Opacity, Accept (Enter), Save To
+// Gallery, Save Canvas To Gallery. A future image bump must re-check them.
+// The copy keeps Invoke's own UI terms (bbox) so the UI makes sense, but
+// skips internals (scheduler, CFG): users aren't assumed technical.
 //
 // The home card opens centered over a dimmed page; step cards start
 // bottom-right and can be dragged by their title line. A highlight ring
@@ -41,21 +42,20 @@
     // "Phase 6 tuning" and "Re-tune at the catalog settings"). A model with
     // no seed here leaves Random on.
     seed: { "banana-splitz-xxl": 42, "anima-aesthetic": 42, "anima-turbo": 123 },
-    // Our portrait: 0.3 leaves Anima's eyes red and turns Banana Splitz's a
-    // yellowish green (pupils fixed); 0.55 gives clean green eyes. Turbo at
-    // CFG 1 follows the prompt more loosely: 0.55-0.6 stay olive, 0.65-0.7
-    // turn green.
-    eyeDenoiseLow: "0.3",
-    eyeLowResult: {
-      "banana-splitz-xxl": "the eyes only turn a yellowish green",
-    },
-    eyeLowResultDefault: "the eyes barely change and stay red",
+    // Our portrait: 0.3 leaves Anima's eyes red but already turns Banana
+    // Splitz's a yellowish green, too green for a "too weak" demo, so the
+    // first try is 0.2 (user feedback 2026-09-26). 0.55 gives clean green
+    // eyes. Turbo at CFG 1 follows the prompt more loosely: 0.55-0.6 stay
+    // olive, 0.65-0.7 turn green.
+    eyeDenoiseLow: "0.2",
     eyeDenoiseHigh: { "anima-turbo": "0.65" },
     eyeDenoiseHighDefault: "0.55",
     // With a ~50% blue band painted: a clear see-through visor at 0.6–0.75,
     // cleanest at 0.7. Without paint the model draws thin glasses instead.
+    // Tuned with the visor text at the END of the prompt; the copy now puts
+    // it first (user feedback 2026-09-26: earlier words weigh more); the
+    // user judged 0.7 still fine there without a re-tune.
     visorDenoise: "0.7",
-    visorDenoiseRange: "0.6–0.75",
     visorOpacity: "50",
     visorPrompt: "transparent blue cyberpunk visor",
     // Per catalog model, from its page (2026-09-26). Checked live on Anima
@@ -78,15 +78,10 @@
         negative: "worst quality, low quality, artist name, blurry, jpeg artifacts, chromatic aberration",
       },
     },
-    // What Advanced Options shows once the model's settings are loaded.
-    // SlopTweak writes these into each model's Invoke config from the
+    // SlopTweak writes each model's settings into its Invoke config from the
     // catalog, and defaults.js applies them when Invoke opens (Invoke doesn't
-    // on its own; the ✨ "Use default settings" button restores them).
-    settings: {
-      "banana-splitz-xxl": "<b>Scheduler</b> Euler Ancestral, <b>CFG Scale</b> <code>5</code>, <b>Steps</b> <code>30</code>",
-      "anima-aesthetic": "<b>CFG Scale</b> <code>4.5</code>, <b>Steps</b> <code>35</code>",
-      "anima-turbo": "<b>CFG Scale</b> <code>1</code>, <b>Steps</b> <code>10</code>",
-    },
+    // on its own; the ✨ "Use default settings" button restores them). The
+    // copy doesn't list them: users needn't know what a scheduler is.
     // Models whose catalog settings include a scheduler: defaults.js can
     // only set steps/CFG (Invoke's recall event ignores the scheduler), so
     // the ✨ button is still needed for these.
@@ -174,7 +169,7 @@
     positive: POSITIVE,
     negative: NEGATIVE,
     green: "green eyes",
-    visor: TUNE.visorPrompt,
+    visor: `${TUNE.visorPrompt}, `,
     tplPositive: tpl ? `${tpl.tags}, {prompt}` : "",
     tplNegative: tpl ? tpl.negative : "",
   };
@@ -186,20 +181,25 @@
   const promptBlock = `<pre>${esc(POSITIVE)}</pre>`;
 
   // Steps with `jumpOnly` show only when the stage was entered from the
-  // home card (a new GPU has an empty gallery and canvas). `watch` moves on
-  // by itself when a generation finishes. `ours` shows the fallback button.
+  // home card, not from the stage before (the prompt and canvas may not be
+  // set up). `watch` moves on by itself when a generation finishes. `ours`
+  // shows the optional "Use ours instead" button. The copy never tells the
+  // user the GPU is empty or that ours is required (user feedback).
   const onCanvas = {
     jumpOnly: true,
     ours: true,
     target: ["As Raster Layer (Resize)", "New Canvas from Image", "Assets"],
-    title: "Get the picture on the canvas",
+    title: "Set up the picture",
     body: () =>
-      "This GPU starts empty, so set things up again. Paste the prompt into the prompt box " +
+      "<p>If the prompt box is empty, paste the prompt in " +
       `${copyBtn("positive")}, and <code>${NEGATIVE}</code> in the negative box ${copyBtn("negative")} ` +
-      "(the <b>±</b> button shows it). " +
-      (st.image ? "Then" : "Then press <b>Use ours instead</b>,") +
-      " open the gallery's <b>Assets</b> tab, right-click our picture and choose " +
-      "<b>New Canvas from Image</b> → <b>As Raster Layer (Resize)</b>.",
+      "(the <b>±</b> button shows it).</p>" +
+      "<p>Then put a picture on the canvas: right-click it in the gallery and choose " +
+      "<b>New Canvas from Image</b> → <b>As Raster Layer (Resize)</b>. " +
+      (st.image
+        ? "Ours is in the gallery's <b>Assets</b> tab.</p>"
+        : "You can use one of yours, or press <b>Use ours instead</b> to follow along with the " +
+          "same picture we used.</p>"),
   };
 
   const STAGES = [
@@ -211,17 +211,14 @@
           target: ["Generate"],
           body: () =>
             "Click the <b>Generate</b> tab on the left. " +
-            "Invoke starts every model on the same general settings. " +
+            "Every model works best with its own settings. " +
             (TUNE.sparkleScheduler[CFG.modelId]
-              ? "SlopTweak has loaded this model's steps and CFG, but Invoke only sets its scheduler " +
-                "from the small sparkle button next to the model's name in the <b>Generation</b> " +
-                'section: click it ("Model Defaults Loaded" appears). '
-              : "SlopTweak has already loaded the ones this model was made for. If you change them, " +
-                "the small sparkle button next to the model's name in the <b>Generation</b> section " +
-                "puts them back. ") +
-            (TUNE.settings[CFG.modelId]
-              ? `Under <b>Advanced Options</b> you should see ${TUNE.settings[CFG.modelId]}. `
-              : "") +
+              ? "SlopTweak has loaded most of them for you; to finish, click the small sparkle button " +
+                "next to the model's name in the <b>Generation</b> section " +
+                '("Model Defaults Loaded" appears). '
+              : "SlopTweak has already loaded them for you. If you ever change them by accident, the " +
+                "small sparkle button next to the model's name in the <b>Generation</b> section puts " +
+                "them back. ") +
             "In the <b>Image</b> section, set " +
             `<b>Width</b> to <code>${WIDTH}</code> and <b>Height</b> to <code>${HEIGHT}</code>. ` +
             `Then put this in the prompt box: ${promptBlock} ${copyBtn("positive")}`,
@@ -233,10 +230,10 @@
           body: () =>
             "Click the <b>±</b> button on the prompt box (<b>Add Negative Prompt</b>) and type " +
             `<code>${NEGATIVE}</code> in the new box ${copyBtn("negative")}. The top box says what you ` +
-            "want; this one says what you don't. Some models can make adult pictures, and " +
-            `<code>${NEGATIVE}</code> here keeps this one safe. ` +
+            "want; this one says what you don't. Some models can make NSFW content, and " +
+            `<code>${NEGATIVE}</code> here keeps this one SFW. ` +
             (TUNE.noNegative[CFG.modelId]
-              ? "One catch for Turbo: at CFG 1 it ignores the negative box, so also put " +
+              ? "One catch: this model skips the negative box, so also put " +
                 "<code>safe,</code> at the start of the prompt. "
               : "") +
             (TUNE.seed[CFG.modelId] !== undefined
@@ -245,12 +242,14 @@
             "Now press <b>Invoke</b>. The first picture can take a minute.",
         },
         {
-          title: "A sentence, then tags",
+          title: "Match the model's captions",
           body: () =>
-            "Your prompt had two parts. The first line is a plain sentence; the second is short tags " +
-            "separated by commas. Every model learned from its own kind of captions, so the best " +
-            `prompts copy its style. For ${model}, look at the example pictures and their prompts on its ` +
-            `page. ${esc(TUNE.captionHint[CFG.modelId] || "")} ${pageBtn}`,
+            "<p>Your prompt had two parts: a plain sentence, then short tags separated by commas. " +
+            "Prompts work best when they match the kind of captions the model was trained on. " +
+            `For ${model}, the example pictures on its page show what those look like. ` +
+            `${esc(TUNE.captionHint[CFG.modelId] || "")} ${pageBtn}</p>` +
+            "<p>Want more options? You can always press <b>Invoke</b> again with the same settings. " +
+            "Turn <b>Random</b> back on next to <b>Seed</b> first, or you'll get the same picture.</p>",
         },
       ],
     },
@@ -258,23 +257,23 @@
       title: "Prompt Templates",
       steps: [
         {
-          title: "Find the model's usual tags",
+          title: "Automate the repeated part",
           body: () =>
-            `On ${model}'s page, look at the prompts of the example pictures. Tags that show up in ` +
-            "nearly every one, usually about quality or style, belong in a template, so you don't " +
-            "have to type them each time. Negative prompts repeat too." +
+            "Some of every prompt stays the same: usually quality tags at the start, and a standard " +
+            "negative prompt. A prompt template adds those for you, so you only type what's new " +
+            "about each picture." +
             (tpl
-              ? ` For this model they are <code>${esc(tpl.tags)}</code>, and in the negative ` +
-                `<code>${esc(tpl.negative)}</code>.`
-              : "") +
-            ` ${pageBtn}`,
+              ? ` For ${model}, the example prompts nearly all start with <code>${esc(tpl.tags)}</code>, ` +
+                `and use <code>${esc(tpl.negative)}</code> as the negative.`
+              : ` To find them, look for tags that show up in nearly every example prompt on ${model}'s page. ${pageBtn}`),
         },
         {
           title: "Make a template",
           target: ["Create Prompt Template", "Choose Prompt Template"],
           body: () =>
             "Above the prompt box, click <b>Choose Prompt Template</b>, then the <b>+</b> " +
-            "(<b>Create Prompt Template</b>). Name it after the model. In <b>Positive Prompt</b>, " +
+            "(<b>Create Prompt Template</b>). Give it any name you like; if you only need one " +
+            "template for this model, naming it after the model makes it easy to find. In <b>Positive Prompt</b>, " +
             "paste the tags, then click <b>Insert placeholder</b>: <code>{prompt}</code> is where your " +
             "own words go" +
             (tpl ? ` ${copyBtn("tplPositive")}` : "") +
@@ -286,9 +285,9 @@
           title: "Use it",
           target: ["Invoke"],
           body: () =>
-            "Pick your template in the list. Your prompt box stays as it is; Invoke puts your words " +
-            "where <code>{prompt}</code> is when you press <b>Invoke</b>. Press it now and compare with " +
-            "your first picture. A template isn't tied to a model, so choose another one when you " +
+            "Pick your template in the list. Your prompt box stays as it is; when you press " +
+            "<b>Invoke</b>, the template's tags are added around your words. Press it now and compare " +
+            "with your first picture. A template isn't tied to a model, so choose another one when you " +
             "switch models.",
         },
       ],
@@ -307,16 +306,16 @@
             " and choose <b>New Canvas from Image</b> → <b>As Raster Layer (Resize)</b>." +
             (st.image
               ? ""
-              : st.jumped
-                ? " This GPU starts with an empty gallery, so press <b>Use ours instead</b>."
-                : " Not happy with it? Use ours; its eyes need fixing, which is next."),
+              : " If you'd rather follow along with the same picture we used, press " +
+                "<b>Use ours instead</b>. Its red eyes need fixing, which is next."),
         },
         {
           title: "What you're looking at",
           body: () =>
             "Your picture is now a <b>Raster Layer</b> (see the layer list on the right). Above it is " +
             "an empty <b>Inpaint Mask</b>, already selected: whatever you paint on it gets redrawn. The " +
-            "box with handles around the picture is the <b>bbox</b>, the area the model looks at.",
+            "box with handles around the picture is the <b>bbox</b> (bounding box): the area the model " +
+            "looks at while it draws.",
         },
       ],
     },
@@ -332,21 +331,19 @@
             "both eyes. Only what you paint gets redrawn.",
         },
         {
-          title: "Fit the box, then give it the face",
+          title: "Fit the bbox, then give it the face",
           body: () =>
             "Press <b>Shift+B</b> (<b>Fit Bbox To Masks</b>): the bbox snaps tight around the eyes. " +
-            "Now press <b>C</b> and drag its corners out until it covers the whole face. The mask is " +
-            "what gets redrawn; the bbox is what the model sees, and it needs the face to draw eyes " +
-            "that fit.",
+            "Now press <b>C</b> (the <b>Bbox</b> tool) and drag its corners out until it covers the " +
+            "whole face. The model only redraws what you masked, but it looks at everything in the " +
+            "bbox, and it needs to see the face to draw eyes that fit.",
         },
         {
-          title: "Why a small box looks sharp",
-          target: ["Scale Before Processing", "Advanced Options"],
+          title: "Why a small bbox looks sharp",
           body: () =>
             "Look at the top left of the canvas: <b>Bbox</b> is small, but <b>Scaled Bbox</b> is " +
-            "much bigger. In the <b>Image</b> section, open <b>Advanced Options</b>: <b>Scale Before " +
-            "Processing</b> is <b>Auto</b>. Invoke enlarges the small bbox to the size the model works " +
-            "best at, draws there, and shrinks the result back. That's what brings back detail in a small face.",
+            "bigger. Invoke zooms in on the bbox, draws at the scaled size in full detail, then fits " +
+            "the result back into your picture. That's why fixing a small area gives sharp results.",
         },
         {
           title: "Recolor them, gently",
@@ -354,26 +351,27 @@
           watch: true,
           body: () =>
             `In the prompt, change <code>red eyes</code> to <code>green eyes</code> ${copyBtn("green")}. ` +
-            `At the top of the layers panel, set <b>Denoising Strength</b> to <code>${TUNE.eyeDenoiseLow}</code> ` +
-            "and press <b>Invoke</b>.",
+            "At the top of the layers panel is <b>Denoising Strength</b>: how much the model may change " +
+            "what you painted. Low keeps it close to the original; high lets it redraw freely. Set it " +
+            `to <code>${TUNE.eyeDenoiseLow}</code> and press <b>Invoke</b>.`,
         },
         {
           title: "Now a bit stronger",
           target: ["Denoising Strength"],
           watch: true,
           body: () =>
-            `At <code>${TUNE.eyeDenoiseLow}</code> ` +
-            esc(TUNE.eyeLowResult[CFG.modelId] || TUNE.eyeLowResultDefault) +
-            ": low denoise keeps most of the old picture. Set " +
-            `<b>Denoising Strength</b> to <code>${eyeHigh}</code> and press <b>Invoke</b> again.`,
+            `At <code>${TUNE.eyeDenoiseLow}</code> the eyes barely change: the model stayed too close ` +
+            `to the old picture. Set <b>Denoising Strength</b> to <code>${eyeHigh}</code> and press ` +
+            "<b>Invoke</b> again.",
         },
         {
           title: "Keep the best one",
           target: ["Accept"],
           body: () =>
             "Your tries show on the canvas with a toolbar under it. Flip through them with the arrows " +
-            "and press <b>Accept</b> (or <b>Enter</b>) on the one you like. SlopTweak saves every try " +
-            "to the <b>Canvas</b> folder in your output folder.",
+            "and press <b>Accept</b> (or <b>Enter</b>) on the one you like. None look right? Press " +
+            "<b>Invoke</b> again for more tries (with <b>Random</b> on next to <b>Seed</b>, each is " +
+            "different). SlopTweak saves every try to the <b>Canvas</b> folder in your output folder.",
         },
       ],
     },
@@ -385,36 +383,41 @@
           title: "Paint a rough visor",
           target: ["Add Layer"],
           body: () =>
-            "If tries still show under the canvas, <b>Accept</b> one first: you can't paint while " +
-            "they're there. Under the layer list, click <b>+</b> (<b>Add Layer</b>) → <b>Raster Layer</b>. " +
-            "Click the color circles at the top left of the canvas (<b>Foreground Color</b>) and pick a " +
-            "bright blue. Press <b>B</b> and paint a thick band across both eyes. Rough is fine.",
+            "<p>First, if your eye tries are still showing under the canvas, press <b>Accept</b> on " +
+            "one. You can't paint until they're gone.</p>" +
+            "<p>Now make a fresh layer to paint on: under the layer list, click <b>+</b> " +
+            "(<b>Add Layer</b>) and choose <b>Raster Layer</b>.</p>" +
+            "<p>Pick a color by clicking the color circles at the top left of the canvas, and choose " +
+            "a bright blue. Then press <b>B</b> for the brush and paint a thick band across both eyes, " +
+            "like sunglasses. It doesn't need to be neat.</p>",
         },
         {
           title: "Make it see-through",
           target: ["Opacity"],
           body: () =>
             "With the new layer selected, set <b>Opacity</b> (just above the layer list) to about " +
-            `<code>${TUNE.visorOpacity}%</code>. The eyes show through the blue: that's the tinted ` +
-            "glass the model will draw.",
+            `<code>${TUNE.visorOpacity}%</code>. Now you can see the eyes through the blue, just like ` +
+            "tinted glass. That's the look the model will copy.",
         },
         {
-          title: "Mask the band",
+          title: "Mark the band for redrawing",
           target: ["Inpaint Mask"],
           body: () =>
-            "Click <b>Inpaint Mask</b> in the layer list and press <b>Shift+C</b> (<b>Reset Layer</b>) " +
-            "to clear the old eye mask. Press <b>B</b> and paint over the whole band. Then " +
-            "<b>Shift+B</b>, and <b>C</b> to drag the bbox out over the head.",
+            "Click <b>Inpaint Mask</b> in the layer list and press <b>Shift+C</b> to wipe the old eye " +
+            "paint. Press <b>B</b> and paint over the whole blue band. Then press <b>Shift+B</b>, and " +
+            "<b>C</b> to drag the bbox out over the head, like before.",
         },
         {
           title: "Describe it, then go big",
           target: ["Denoising Strength"],
           watch: true,
           body: () =>
-            `Add <code>${esc(TUNE.visorPrompt)}</code> to the end of the prompt ${copyBtn("visor")}. ` +
-            `Set <b>Denoising Strength</b> to about <code>${TUNE.visorDenoise}</code> ` +
-            `(${TUNE.visorDenoiseRange}) and press <b>Invoke</b>. The eye fix needed no paint and ` +
-            "little denoise; a big change needs both.",
+            `<p>Add <code>${esc(TUNE.visorPrompt)},</code> to the <b>start</b> of the prompt ` +
+            `${copyBtn("visor")}. Words near the start of a prompt count for more, so put what matters ` +
+            "most first.</p>" +
+            `<p>Set <b>Denoising Strength</b> to about <code>${TUNE.visorDenoise}</code> and press ` +
+            "<b>Invoke</b>. A new eye color only needed a gentle nudge. Adding something new, like a " +
+            "visor, needs a stronger setting and a rough painted hint of what you want.</p>",
         },
         {
           title: "Keep it and save it",
@@ -457,6 +460,7 @@
     .head .sp { flex: 1; }
     h3 { margin: 6px 0 6px; font-size: 16px; color: #fff; }
     p, .body { margin: 0 0 10px; }
+    .body p:last-child { margin-bottom: 0; }
     b { color: #fff; }
     code { background: #2a2f3a; padding: 1px 5px; border-radius: 4px; }
     pre { background: #2a2f3a; padding: 6px 8px; border-radius: 6px; margin: 6px 0 4px;
@@ -519,7 +523,9 @@
     const pos = st.pos || { r: MARGIN, b: MARGIN };
     const maxR = Math.max(0, window.innerWidth - box.offsetWidth);
     const maxB = Math.max(0, window.innerHeight - box.offsetHeight);
-    box.style.right = `${Math.min(Math.max(0, pos.r), maxR)}px`;
+    // `l` pins it to the left edge (stage 5) through window resizes.
+    const r = pos.l !== undefined ? maxR - pos.l : pos.r;
+    box.style.right = `${Math.min(Math.max(0, r), maxR)}px`;
     box.style.bottom = `${Math.min(Math.max(0, pos.b), maxB)}px`;
   }
 
@@ -744,6 +750,18 @@
     st.resume = st.stage;
     store();
     render();
+    // The visor stage works in the layer list, which the card covers at
+    // bottom-right: move it to bottom-left. A later drag still wins.
+    // Other stages drop that move (not a position the user dragged to).
+    if (st.stage === STAGES_N) {
+      st.pos = { l: MARGIN, b: MARGIN };
+      store();
+      place();
+    } else if (st.pos && st.pos.l !== undefined) {
+      delete st.pos;
+      store();
+      place();
+    }
     if (st.signaled !== st.stage) {
       st.signaled = st.stage;
       store();

@@ -289,9 +289,9 @@ async function main() {
     check("app saved stage 4", await savedStage(4));
     check("stage 4 from stage 3 skips the set-up step", (await cardText(r)).includes("Mask the eyes"));
     await clickAct(r, "next");
-    check("stage 4 names Shift+B (Fit Bbox To Masks)", (await cardText(r)).includes("Shift+B") && (await cardText(r)).includes("Fit Bbox To Masks"));
+    check("stage 4 names Shift+B", (await cardText(r)).includes("Shift+B"));
     await clickAct(r, "next");
-    check("stage 4 names Scale Before Processing: Auto", (await cardText(r)).includes("Scale Before Processing") && (await cardText(r)).includes("Auto"));
+    check("stage 4 names Scaled Bbox", (await cardText(r)).includes("Scaled Bbox"));
     await clickAct(r, "next");
     await at(r, "4.3", "low denoise step");
     await generateMovesOn(r, "canvas", "4.3", "4.4");
@@ -304,6 +304,10 @@ async function main() {
     // Stage 5: the visor. Skip here; the next session resumes.
     await at(r, "5.0", "stage 5");
     check("app saved stage 5", await savedStage(5));
+    const left = await r.eval(
+      `(() => { const b = ${TUT}.querySelector('.box').getBoundingClientRect(); return Math.round(b.left); })()`,
+    );
+    check("stage 5 moves the card to the bottom left", left <= 20, `left=${left}`);
     await clickAct(r, "min");
     check("minimize keeps the stage", (await cardText(r)).includes("stage 5 of 5"));
     await clickAct(r, "restore");
@@ -367,7 +371,7 @@ async function main() {
     check("Show tutorial on a new GPU offers the saved stage", back.includes("Welcome back") && back.includes("Continue stage 5"), back.slice(0, 60));
     await clickAct(r, "start");
     await at(r, "5.0", "stage 5 resumed");
-    check("resumed stage starts with the set-up step", (await cardText(r)).includes("Get the picture on the canvas"));
+    check("resumed stage starts with the set-up step", (await cardText(r)).includes("Set up the picture"));
     check("set-up step repeats the prompt copy", await r.eval(`!!${TUT}.querySelector('[data-copy="positive"]') && !!${TUT}.querySelector('[data-copy="negative"]')`));
     await useOurs(r, "5.0");
     for (const pos of ["5.1", "5.2", "5.3", "5.4"]) {
@@ -381,8 +385,8 @@ async function main() {
     // Links only: clicking one would open a real browser tab.
     const docs = await r.eval(`${TUT}?.querySelectorAll('[data-act="doc"]').length || 0`);
     check("last step links to Invoke's docs", docs >= 5, `${docs} links`);
-    const box = await r.eval(`(() => { const b = ${TUT}.querySelector('.box'); return { cls: b.className, right: b.style.right, bottom: b.style.bottom }; })()`);
-    check("step cards sit bottom-right, not centered", !box.cls.includes("center") && box.right === "16px" && box.bottom === "16px", JSON.stringify(box));
+    const box = await r.eval(`(() => { const b = ${TUT}.querySelector('.box'); const g = b.getBoundingClientRect(); return { cls: b.className, left: Math.round(g.left), bottom: b.style.bottom }; })()`);
+    check("stage 5 cards sit bottom-left, not centered", !box.cls.includes("center") && box.left === 16 && box.bottom === "16px", JSON.stringify(box));
     await clickAct(r, "next"); // Done
     await sleep(1500);
     check("Done doesn't navigate the page away", (await r.eval("location.pathname")) === "/");
@@ -396,6 +400,10 @@ async function main() {
     const again = await waitFor(async () => (await cardText(r)) || false, 5000, "reopened").catch(() => "");
     check("Show tutorial after Done starts from the top", again.includes("Welcome to Invoke"), again.slice(0, 40));
     check("home card is centered over a dimmed page", await r.eval(`!!${TUT}.querySelector('.card.center') && !!${TUT}.querySelector('.scrim')`));
+    await clickAct(r, "start");
+    await at(r, "1.0", "replay");
+    const box1 = await r.eval(`(() => { const b = ${TUT}.querySelector('.box'); return { right: b.style.right, bottom: b.style.bottom }; })()`);
+    check("a replay's step cards are back at bottom-right", box1.right === "16px" && box1.bottom === "16px", JSON.stringify(box1));
     await clickAct(r, "skip");
     await sleep(1000);
     check("× closes it again", (await cardText(r)) === "");
