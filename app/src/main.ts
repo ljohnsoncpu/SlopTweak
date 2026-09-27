@@ -1158,11 +1158,38 @@ ui.modalOk.onclick = async () => {
   }
 };
 
+/** A short two-note chime: the Invoke window is open and ready. Synthesized,
+ * so there's no sound file. Pressing Start counts as the user gesture that
+ * WebView2's autoplay policy wants; if it's blocked anyway, stay silent. */
+function chime(): void {
+  try {
+    const ctx = new AudioContext();
+    const t0 = ctx.currentTime;
+    [659.25, 987.77].forEach((hz, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const t = t0 + i * 0.16;
+      osc.type = "sine";
+      osc.frequency.value = hz;
+      gain.gain.setValueAtTime(0, t);
+      gain.gain.linearRampToValueAtTime(0.18, t + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.9);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.95);
+    });
+    window.setTimeout(() => void ctx.close(), 1500);
+  } catch {
+    /* no audio: fine */
+  }
+}
+
 await listen<SessionState>("session-state", (e) => {
   const was = state.kind;
   state = e.payload;
   if (!active()) cost = null;
   render();
+  if (was !== "ready" && e.payload.kind === "ready") chime();
   if (was !== state.kind && (state.kind === "idle" || state.kind === "ready" || state.kind === "failed")) {
     void refreshCredit();
     if (!active()) void refreshEstimate();

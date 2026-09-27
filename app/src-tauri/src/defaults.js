@@ -8,7 +8,9 @@
 // page over its socket (`recall_parameters_updated`), so this posts them once
 // the UI is up. Plain page script, same origin and session cookie as Invoke,
 // no IPC. Once per origin (a new GPU gets a new tunnel origin), so a user's
-// own changes survive a reload.
+// own changes survive a reload. The recall event has no scheduler case in
+// 6.14.1's frontend, so a catalog scheduler (Banana Splitz) still needs the
+// sparkle button; the tutorial says so.
 (function () {
   "use strict";
   if (window.top !== window || window.__slopTweakDefaults) return;

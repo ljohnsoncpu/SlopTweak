@@ -1,7 +1,7 @@
 """Drive a SlopTweak instance by hand (Phase 1). Stdlib only.
 
     python dev/launch_dev.py offers
-    python dev/launch_dev.py create --offer ID --assets-url URL --assets-sha SHA [--model ...]
+    python dev/launch_dev.py create --offer ID --assets-url URL --assets-sha SHA [--model ID]...
     python dev/launch_dev.py watch          # waits for ready, prints login URL, heartbeats
     python dev/launch_dev.py ticket         # fresh one-time login URL
     python dev/launch_dev.py status
@@ -118,16 +118,31 @@ def save_state(state: dict[str, Any]) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def model_entry(name: str) -> dict[str, Any]:
+def model_entries(name: str) -> list[dict[str, Any]]:
+    """MODELS_B64 entries for one model, shaped like the app's launch_spec."""
     if name in DEV_MODELS:
-        return DEV_MODELS[name]
+        return [DEV_MODELS[name]]
     for model in json.loads(CATALOG.read_text())["models"]:
         if model["id"] == name:
-            f = model["files"][0]
-            return {k: f[k] for k in ("url", "sha256", "size_bytes", "filename")} | {
-                "requires_civitai_token": f.get("requires_civitai_token", False)
-            }
+            out = []
+            for f in model["files"]:
+                e = {k: f[k] for k in ("url", "sha256", "size_bytes", "filename")}
+                e["sha256"] = e["sha256"].lower()
+                e["requires_civitai_token"] = f.get("requires_civitai_token", False)
+                if f["kind"] == "main" and model.get("default_settings"):
+                    e["default_settings"] = model["default_settings"]
+                out.append(e)
+            return out
     raise SystemExit(f"unknown model {name!r}")
+
+
+def all_entries(names: list[str]) -> list[dict[str, Any]]:
+    """Entries for several models; files they share (e.g. Anima's) appear once."""
+    seen: dict[str, dict[str, Any]] = {}
+    for name in names:
+        for e in model_entries(name):
+            seen.setdefault(e["filename"], e)
+    return list(seen.values())
 
 
 def instance(iid: int) -> dict[str, Any]:
@@ -170,14 +185,15 @@ def cmd_offers(_: argparse.Namespace) -> None:
 def cmd_create(args: argparse.Namespace) -> None:
     if STATE_FILE.exists():
         raise SystemExit(f"{STATE_FILE} exists; destroy the previous instance first")
-    model = model_entry(args.model)
-    civitai = secret_env("CIVITAI_TOKEN") if model["requires_civitai_token"] else ""
-    if model["requires_civitai_token"] and not civitai:
+    models = all_entries(args.model or ["sd15"])
+    needs_token = any(m["requires_civitai_token"] for m in models)
+    civitai = secret_env("CIVITAI_TOKEN") if needs_token else ""
+    if needs_token and not civitai:
         raise SystemExit("model needs CIVITAI_TOKEN")
     launch_secret = secrets.token_urlsafe(32)
     env = {
         "LAUNCH_TOKEN_HASH": hashlib.sha256(launch_secret.encode()).hexdigest(),
-        "MODELS_B64": base64.b64encode(json.dumps([model]).encode()).decode(),
+        "MODELS_B64": base64.b64encode(json.dumps(models).encode()).decode(),
         "IDLE_MINUTES": str(args.idle),
         "HEARTBEAT_MINUTES": str(args.heartbeat),
         "MAX_SESSION_MINUTES": str(args.max_session),
@@ -201,7 +217,7 @@ def cmd_create(args: argparse.Namespace) -> None:
     resp = vast("PUT", f"/asks/{args.offer}/", body)
     iid = int(resp["new_contract"])
     save_state({"instance_id": iid, "secret": launch_secret, "created": time.time()})
-    print(f"created instance {iid} (offer {args.offer}, model {args.model})")
+    print(f"created instance {iid} (offer {args.offer}, models {args.model or ['sd15']})")
 
 
 def sidecar(state: dict[str, Any], host: str, method: str, path: str) -> tuple[int, Any]:
@@ -306,7 +322,9 @@ def main() -> None:
     c.add_argument("--offer", type=int, required=True)
     c.add_argument("--assets-url", required=True)
     c.add_argument("--assets-sha", required=True)
-    c.add_argument("--model", default="sd15")
+    c.add_argument(
+        "--model", action="append", help="catalog id or sd15; repeat for several (default sd15)"
+    )
     c.add_argument("--disk", type=int, default=50)
     c.add_argument("--idle", type=float, default=20)
     c.add_argument("--heartbeat", type=float, default=10)

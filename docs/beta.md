@@ -31,7 +31,7 @@ the person running the beta.
 1. Install SlopTweak from this link.
 2. Set it up with your own Vast.ai and CivitAI accounts.
 3. Make an image of anything you like.
-4. Do the inpainting tutorial: change one part of the sample picture.
+4. Do the tutorial in the Invoke window, all five stages.
 5. Stop, and find your images on your PC.
 6. Close SlopTweak and check on Vast's website that nothing is still running.
 
@@ -46,7 +46,7 @@ the person running the beta.
 | CivitAI account + key | | | |
 | Start → Invoke opens | | | |
 | First image | | | |
-| Tutorial (inpaint) | | | |
+| Tutorial (5 stages) | | | |
 | Stop → images found | | | |
 | Nothing left running on Vast | | | |
 

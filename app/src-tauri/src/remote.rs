@@ -8,11 +8,15 @@
 //! * Navigation is pinned to the tunnel origin, and popups are denied.
 //!
 //! The tutorial (tutorial.js) is injected as an initialization script: plain
-//! page JS, no IPC. Its only ways back are navigations to
-//! `/__sloptweak/tutorial/<done|skipped>` and `/__sloptweak/docs/<key>`,
-//! which are intercepted here and blocked. A page could fake them, but all
-//! they do is mark the tutorial as seen or open one of a few fixed Invoke
-//! docs pages in the user's browser.
+//! page JS, no IPC. Its only way back is a navigation to
+//! `/__sloptweak/tutorial/<done|skipped|stage/N|model-page>` or
+//! `/__sloptweak/docs/<key>`, which is intercepted here and blocked. A page
+//! could fake those, but all they do is mark the tutorial as seen, remember a
+//! stage number, or open the current model's catalog page or one of a few
+//! fixed Invoke docs pages (rate-limited, see lib.rs).
+//!
+//! defaults.js is injected after it: it applies the model's own steps/CFG
+//! through Invoke's API, once per GPU.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,20 +26,41 @@ use tauri::webview::NewWindowResponse;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use url::{Origin, Url};
 
+use crate::config::TUTORIAL_STAGES;
+
 pub const LABEL_PREFIX: &str = "remote-";
 
 const TUTORIAL_JS: &str = include_str!("tutorial.js");
 /// Applies the model's own steps/CFG once per GPU (Invoke never does).
 const DEFAULTS_JS: &str = include_str!("defaults.js");
-const TUTORIAL_SAMPLE: &[u8] = include_bytes!("../assets/tutorial-sample.jpg");
+/// The fallback portrait for stage 3 ("Use ours instead"), user-supplied.
+const TUTORIAL_PORTRAIT: &[u8] = include_bytes!("../assets/tutorial-portrait.webp");
 
 /// What the tutorial overlay reports back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TutorialSignal {
     Done,
     Skipped,
-    /// Open this fixed docs page in the user's browser.
+    /// The user moved to this stage (1..=TUTORIAL_STAGES).
+    Stage(u8),
+    /// Open the current model's page in the user's browser.
+    ModelPage,
+    /// Open this fixed Invoke docs page (from `invoke_docs`) in the browser.
     Docs(&'static str),
+}
+
+/// What the overlay starts from: the app's saved tutorial state and the
+/// session's model.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TutorialStart {
+    /// Show it without being asked (not finished or skipped yet).
+    pub auto_show: bool,
+    /// Stage to resume at, 1..=TUTORIAL_STAGES.
+    pub stage: u8,
+    pub model_id: String,
+    pub model_name: String,
+    /// The app can open this model's page (ModelPage signal).
+    pub has_model_page: bool,
 }
 
 pub type TutorialHandler = Arc<dyn Fn(TutorialSignal) + Send + Sync>;
@@ -54,8 +79,8 @@ pub fn allowed(origin: &Origin, url: &Url) -> bool {
     &url.origin() == origin
 }
 
-/// Invoke docs pages the tutorial's last step links to. The page sends a
-/// key, never a URL. Keys must match `DOCS` in tutorial.js.
+/// Invoke's own docs, by the key the tutorial sends. The page never sends a
+/// URL. Checked 2026-09-26: the old invoke-ai.github.io docs 301 to invoke.ai.
 pub fn invoke_docs(key: &str) -> Option<&'static str> {
     Some(match key {
         "home" => "https://invoke.ai/",
@@ -73,24 +98,37 @@ pub fn tutorial_signal(origin: &Origin, url: &Url) -> Option<TutorialSignal> {
     if &url.origin() != origin {
         return None;
     }
-    match url.path() {
-        "/__sloptweak/tutorial/done" => Some(TutorialSignal::Done),
-        "/__sloptweak/tutorial/skipped" => Some(TutorialSignal::Skipped),
-        p => p
-            .strip_prefix("/__sloptweak/docs/")
-            .and_then(invoke_docs)
-            .map(TutorialSignal::Docs),
+    if let Some(key) = url.path().strip_prefix("/__sloptweak/docs/") {
+        return invoke_docs(key).map(TutorialSignal::Docs);
+    }
+    match url.path().strip_prefix("/__sloptweak/tutorial/")? {
+        "done" => Some(TutorialSignal::Done),
+        "skipped" => Some(TutorialSignal::Skipped),
+        "model-page" => Some(TutorialSignal::ModelPage),
+        rest => {
+            let n = match rest.strip_prefix("stage/")?.as_bytes() {
+                [c @ b'1'..=b'9'] => c - b'0',
+                _ => return None,
+            };
+            (n <= TUTORIAL_STAGES).then_some(TutorialSignal::Stage(n))
+        }
     }
 }
 
-/// The overlay with its config and the sample picture baked in, then the
+/// The overlay with its config and the fallback portrait baked in, then the
 /// model-defaults script.
-pub fn tutorial_script(auto_show: bool, force: bool) -> String {
+pub fn tutorial_script(start: &TutorialStart, force: bool) -> String {
     let cfg = serde_json::json!({
-        "autoShow": auto_show,
+        "autoShow": start.auto_show,
         "force": force,
-        "sample": base64::engine::general_purpose::STANDARD.encode(TUTORIAL_SAMPLE),
-        "sampleName": "sloptweak-tutorial-room.jpg",
+        "stage": start.stage.clamp(1, TUTORIAL_STAGES),
+        "stages": TUTORIAL_STAGES,
+        "modelId": start.model_id,
+        "modelName": start.model_name,
+        "modelPage": start.has_model_page,
+        "portrait": base64::engine::general_purpose::STANDARD.encode(TUTORIAL_PORTRAIT),
+        "portraitName": "sloptweak-tutorial-portrait.webp",
+        "portraitType": "image/webp",
     });
     format!(
         "{}({cfg});
@@ -131,9 +169,9 @@ impl RemoteWindows {
         false
     }
 
-    /// Open (or re-point) the Invoke window. `tutorial` shows the tutorial
-    /// on its own unless the user already closed it on this instance.
-    pub fn open(&self, url: Url, tutorial: bool) -> Result<(), String> {
+    /// Open (or re-point) the Invoke window, with the tutorial overlay
+    /// starting from `tutorial`.
+    pub fn open(&self, url: Url, tutorial: &TutorialStart) -> Result<(), String> {
         let origin = url.origin();
         let mut current = self.current.lock().unwrap();
         if let Some((label, o)) = current.as_ref() {
@@ -266,19 +304,36 @@ mod tests {
             Some(TutorialSignal::Skipped)
         );
         assert_eq!(
+            sig("https://a-b.trycloudflare.com/__sloptweak/tutorial/model-page"),
+            Some(TutorialSignal::ModelPage)
+        );
+        assert_eq!(
             sig("https://a-b.trycloudflare.com/__sloptweak/docs/canvas"),
             Some(TutorialSignal::Docs(
                 "https://invoke.ai/features/canvas/layers-and-drops/"
             ))
         );
+        for n in 1..=TUTORIAL_STAGES {
+            let u = format!("https://a-b.trycloudflare.com/__sloptweak/tutorial/stage/{n}");
+            assert_eq!(sig(&u), Some(TutorialSignal::Stage(n)));
+        }
         for no in [
             "https://evil.trycloudflare.com/__sloptweak/tutorial/done",
+            "https://evil.trycloudflare.com/__sloptweak/tutorial/stage/2",
+            "https://a-b.trycloudflare.com/__sloptweak/tutorial/done/x",
+            "https://a-b.trycloudflare.com/__sloptweak/tutorial/",
+            "https://a-b.trycloudflare.com/__sloptweak/tutorial/stage/0",
+            "https://a-b.trycloudflare.com/__sloptweak/tutorial/stage/6",
+            "https://a-b.trycloudflare.com/__sloptweak/tutorial/stage/12",
+            "https://a-b.trycloudflare.com/__sloptweak/tutorial/stage/+1",
+            "https://a-b.trycloudflare.com/__sloptweak/tutorial/stage/",
+            "https://a-b.trycloudflare.com/__sloptweak/tutorial/stage/1/x",
+            "https://a-b.trycloudflare.com/__sloptweak/tutorial/model-page/x",
+            "https://a-b.trycloudflare.com/x/__sloptweak/tutorial/done",
             "https://evil.trycloudflare.com/__sloptweak/docs/home",
             "https://a-b.trycloudflare.com/__sloptweak/docs/",
             "https://a-b.trycloudflare.com/__sloptweak/docs/https%3A%2F%2Fevil.com",
             "https://a-b.trycloudflare.com/__sloptweak/docs/home/x",
-            "https://a-b.trycloudflare.com/__sloptweak/tutorial/done/x",
-            "https://a-b.trycloudflare.com/__sloptweak/tutorial/",
             "https://a-b.trycloudflare.com/",
         ] {
             assert_eq!(sig(no), None, "{no}");
@@ -301,14 +356,38 @@ mod tests {
 
     #[test]
     fn tutorial_script_is_one_call() {
-        let s = tutorial_script(true, false);
+        let start = TutorialStart {
+            auto_show: true,
+            stage: 3,
+            model_id: "m".into(),
+            model_name: "Test".into(),
+            has_model_page: true,
+        };
+        let s = tutorial_script(&start, false);
         assert!(s.starts_with("//") && s.contains("(function (CFG)"));
         assert!(s.ends_with(");"));
         assert!(s.contains(r#""autoShow":true"#) && s.contains(r#""force":false"#));
-        assert!(s.contains("/9j/"), "JPEG sample embedded as base64");
+        assert!(s.contains(r#""stage":3"#) && s.contains(r#""modelPage":true"#));
+        assert!(s.contains(r#""portraitType":"image/webp""#));
         assert!(
             s.contains("/api/v1/recall/default"),
             "model defaults applied"
         );
+        // "RIFF" in base64: the portrait is embedded as WebP.
+        let b64 = base64::engine::general_purpose::STANDARD.encode(TUTORIAL_PORTRAIT);
+        assert!(b64.starts_with("UklGR") && s.contains(&b64));
+        // An out-of-range stage from a hand-edited file is clamped.
+        let s = tutorial_script(&TutorialStart { stage: 0, ..start }, true);
+        assert!(s.contains(r#""stage":1"#) && s.contains(r#""force":true"#));
+    }
+
+    #[test]
+    fn tutorial_portrait_is_plain_webp() {
+        // RIFF/WEBP with a single lossy VP8 chunk: no VP8X, so no ICC,
+        // EXIF, or XMP chunks can ride along.
+        let p = TUTORIAL_PORTRAIT;
+        assert_eq!((&p[..4], &p[8..16]), (&b"RIFF"[..], &b"WEBPVP8 "[..]));
+        let n = u32::from_le_bytes(p[16..20].try_into().unwrap()) as usize;
+        assert_eq!(20 + n + (n & 1), p.len());
     }
 }

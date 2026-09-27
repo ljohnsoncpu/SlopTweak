@@ -31,7 +31,7 @@ so the retry and failure paths can be seen in the UI.
 | `session.rs` | Pure state machine (`next`) and the `SessionManager` driver |
 | `sidecar.rs` | Client for `instance/sidecar.py` (heartbeat, status, ticket, Invoke image list + full-res download) |
 | `sync.rs` | Output sync: gallery → output folder, Canvas tries → `Canvas\`, per-instance ledger |
-| `remote.rs` | The isolated Invoke window, plus the injected tutorial overlay (`tutorial.js`, `assets/tutorial-sample.jpg`) |
+| `remote.rs` | The isolated Invoke window, plus the injected tutorial overlay (`tutorial.js`, and `assets/tutorial-portrait.webp` for its **Use ours instead**) |
 | `secrets.rs` | Credential Manager via `keyring` |
 | `persist.rs` | Active-instance record for crash recovery |
 | `redact.rs` | Secret redaction for logs and diagnostics |
@@ -56,7 +56,7 @@ so the retry and failure paths can be seen in the UI.
 | `SLOPTWEAK_DEV_REMOTE_URL` | Open the remote window at this URL on startup |
 | `SLOPTWEAK_MOCK_IMAGES=N` | Mock mode: after Ready, the fake sidecar makes N gallery images (one per 3 s) plus Canvas tries and scratch intermediates |
 | `SLOPTWEAK_MOCK_UPDATE=<version>` | Mock mode: pretend that version is released (update banner, install is a no-op) |
-| `SLOPTWEAK_DEV_ASSETS_URL` | Where instances fetch the asset bundle (default: the `instance-v0.1.1` pre-release, same bytes as the pin). Release builds always use `releases/download/v<version>/` |
+| `SLOPTWEAK_DEV_ASSETS_URL` | Where instances fetch the asset bundle (default: the `instance-v0.1.2` pre-release, same bytes as the pin). Release builds always use `releases/download/v<version>/` |
 | `SLOPTWEAK_MOCK_SIDECAR=http` + `SLOPTWEAK_DEV_LAUNCH_SECRET` | Mock mode: talk to a real `sidecar.py` at `SLOPTWEAK_MOCK_REMOTE` with this fixed launch secret (`dev/sync-check.mjs`) |
 
 Mock mode saves its fake images to `%LOCALAPPDATA%\com.sloptweak.launcher\mock\output`,
@@ -65,10 +65,12 @@ not to Pictures.
 ## Checks in `dev/`
 
 - `webview-check.mjs`: $0. Remote-window isolation against a local sidecar.
-- `sync-check.mjs`: $0. Phase 4 end to end: the real app + real `sidecar.py` in
-  front of `fake_invoke.py`. Tutorial (auto-show, sample upload, steps,
-  auto-advance, Done recorded, re-open), sync while running, and images made
-  right before Stop on disk after it.
+- `sync-check.mjs`: $0. Phase 4 and 6 end to end: the real app + real
+  `sidecar.py` in front of `fake_invoke.py`. Tutorial v2 (auto-show, all five
+  stages, the fixed prompt, auto-advance, each stage saved by the app, the
+  WebP fallback upload, skip then resume in a new session, Done recorded,
+  re-open), sync while running, and images made right before Stop on disk
+  after it.
 - `mock-ui-check.mjs`: $0. Wizard, estimate, low-balance gate, settings, LoRAs,
   upstream catalog edit (local server), restart persistence, cost bar, update
   offer, Copy diagnostics (redaction, clipboard), close-to-destroy. All against
@@ -81,9 +83,18 @@ not to Pictures.
   makes the first image; the script checks, stops, and restarts.
 - `phase4-acceptance.mjs`: **spends money.** Phase 4 acceptance: the tutorial
   on a clean tutorial state (driven in the real Invoke UI; falls back to a
-  person), then 10 images, Stop, and all 10 on disk.
+  person), then 10 images, Stop, and all 10 on disk. Its tutorial part drives
+  the retired v1 (vase) tour; Phase 6 acceptance gets its own script during
+  live tuning.
+- `phase6-session.mjs`: **spends money.** Holds one real session open for
+  tutorial tuning (`MODEL`, `MINUTES`, `CAP_USD`); stops on a `STOP` file in
+  `.dev/phase6/`, the time or spend cap, or Ctrl+C, and destroys everything
+  it created. `phase6-lib.mjs` has the CDP and Invoke-API helpers that drive
+  that session (UI steps, uploads, graph replays through the queue).
 - `fake_invoke.py`: the stand-in Invoke API those checks use.
-  `make-tutorial-sample.py` redraws the tutorial picture.
+  `python dev/fake_invoke.py 9090 --overlay` also injects the tutorial on
+  every page load, to try it in any browser without the app
+  (`/?stage=5&autoShow=0&force=1` sets its start config).
 
 All scripts refuse to run if :1420 serves another checkout's UI (a vite left
 running elsewhere keeps the port despite `--strictPort`).

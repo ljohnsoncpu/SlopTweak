@@ -17,7 +17,7 @@
 //                            to time a warm model) images; logs model/steps/
 //                            CFG, checks they're the model's defaults, saves
 //                            the images to OUT
-//   MAX_DPH=<$/hr>           price cap for the run (default 0.5)
+//   MAX_DPH=0.5 MAX_SESSION_MINUTES=60   the app's price and session caps
 //   LOCAL_CATALOG=1          serve this checkout's catalog/catalog.json to the
 //                            app instead of the one on main
 //   READY_TIMEOUT=<minutes>  the app's ready_timeout_minutes (default 15)
@@ -41,7 +41,9 @@ const HEARTBEAT_MINUTES = 3;
 const runs = process.argv.slice(2).length ? process.argv.slice(2) : ["r1", "r2", "r3"];
 const TEST_MODEL = process.env.TEST_MODEL ?? "";
 const GENERATE = Number(process.env.GENERATE ?? 0);
+// Spend limits the app runs with (its own max $/hr and session cap).
 const MAX_DPH = Number(process.env.MAX_DPH ?? 0.5);
+const MAX_SESSION_MINUTES = Number(process.env.MAX_SESSION_MINUTES ?? 60);
 const LOCAL_CATALOG = process.env.LOCAL_CATALOG === "1";
 const CATALOG_PORT = 18557;
 const READY_TIMEOUT = Number(process.env.READY_TIMEOUT ?? 15);
@@ -446,7 +448,7 @@ if (!existsSync(backupFile)) {
 writeFileSync(
   settingsFile,
   JSON.stringify(
-    { heartbeat_minutes: HEARTBEAT_MINUTES, max_session_minutes: 60, max_dph: MAX_DPH, ready_timeout_minutes: READY_TIMEOUT },
+    { heartbeat_minutes: HEARTBEAT_MINUTES, max_session_minutes: MAX_SESSION_MINUTES, max_dph: MAX_DPH, ready_timeout_minutes: READY_TIMEOUT },
     null,
     2,
   ),

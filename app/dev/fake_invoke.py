@@ -30,13 +30,22 @@ Test control (called directly on this port, never through the sidecar):
 * GET  /__fake/catalog.json     this checkout's catalog/catalog.json
 * GET  /__fake/state                                   what's stored
 
+Overlay mode (`--overlay`), for looking at the tutorial in any browser
+without the app: every page load gets `tutorial.js` with a test config
+(query `?stage=N&autoShow=0&force=1&model=<catalog id>` on the page URL
+override it), and the
+overlay's signal navigations (/__sloptweak/tutorial/...) are answered with
+204, so the page stays, as it does in the app. They're listed in
+/__fake/state under "signals".
+
 Stdlib only. Binds 127.0.0.1.
 
-    python dev/fake_invoke.py [port]
+    python dev/fake_invoke.py [port] [--overlay]
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import sys
 import threading
@@ -54,6 +63,41 @@ PNG = bytes.fromhex(
     "0d0a2db40000000049454e44ae426082"
 )
 PAGE = b"<!doctype html><title>FAKE INVOKE</title><h1>fake invoke</h1>"
+SRC = Path(__file__).resolve().parent.parent / "src-tauri"
+OVERLAY = "--overlay" in sys.argv
+signals: list[str] = []
+
+
+MODEL_NAMES = {
+    "banana-splitz-xxl": "Banana Splitz XXL",
+    "anima-aesthetic": "Anima Aesthetic",
+    "anima-turbo": "Anima Turbo",
+}
+
+
+def overlay_js(q: dict[str, list[str]]) -> bytes:
+    """tutorial.js wrapped the way remote.rs does it, with a test config."""
+
+    def one(k: str, default: str) -> str:
+        return q.get(k, [default])[0]
+
+    cfg = {
+        "autoShow": one("autoShow", "1") == "1",
+        "force": one("force", "0") == "1",
+        "stage": int(one("stage", "1")),
+        "stages": 5,
+        "modelId": one("model", "banana-splitz-xxl"),
+        "modelName": MODEL_NAMES.get(one("model", "banana-splitz-xxl"), "Test Model"),
+        "modelPage": True,
+        "portrait": base64.b64encode(
+            (SRC / "assets" / "tutorial-portrait.webp").read_bytes()
+        ).decode(),
+        "portraitName": "sloptweak-tutorial-portrait.webp",
+        "portraitType": "image/webp",
+    }
+    js = (SRC / "src" / "tutorial.js").read_text(encoding="utf-8").rstrip()
+    return f"{js}({json.dumps(cfg)});".encode()
+
 
 lock = threading.Lock()
 images: list[dict[str, Any]] = []  # oldest first
@@ -166,6 +210,14 @@ def run(output: dict[str, Any], scratch: dict[str, Any] | None) -> None:
     queue["completed"] += 1
 
 
+def ctype_of(data: bytes) -> str:
+    if data.startswith(b"\x89PNG"):
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         pass
@@ -185,7 +237,18 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         path = u.path
         if path in ("/", "/index.html"):
+            if OVERLAY:
+                tag = f'<script src="/__fake/overlay.js?{u.query}"></script>'.encode()
+                return self.send(200, PAGE + tag, "text/html; charset=utf-8")
             return self.send(200, PAGE, "text/html")
+        if OVERLAY and path == "/__fake/overlay.js":
+            return self.send(200, overlay_js(q), "text/javascript; charset=utf-8")
+        if OVERLAY and path.startswith("/__sloptweak/tutorial/"):
+            with lock:
+                signals.append(path.rsplit("/tutorial/", 1)[1])
+            self.send_response(204)
+            self.end_headers()
+            return None
         if path == "/api/v1/images/":
             want_inter = q.get("is_intermediate", [None])[0]
             cats = q.get("categories")
@@ -215,9 +278,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json({"detail": "Image not found"}, 404)
             if len(parts) == 1:
                 return self.json(meta)
-            return self.send(
-                200, data, "image/png" if data.startswith(b"\x89PNG") else "image/jpeg"
-            )
+            return self.send(200, data, ctype_of(data))
         if path == "/api/v1/queue/default/item_ids":
             with lock:
                 ids = [q["item_id"] for q in reversed(queue_items)]
@@ -287,6 +348,7 @@ class Handler(BaseHTTPRequestHandler):
                         "presets": presets,
                         "preset_images": sorted(preset_images),
                         "workflows": workflows,
+                        "signals": signals,
                     }
                 )
         return self.json({"detail": "Not Found"}, 404)
@@ -305,6 +367,10 @@ class Handler(BaseHTTPRequestHandler):
             data = body[start:end] if start > 3 and end > start else b""
             if not data:
                 return self.json({"detail": "no file"}, 422)
+            # Like Invoke (routers/images.py): the part must say image/*.
+            part_head = body[: start - 4].lower()
+            if b"content-type: image/" not in part_head:
+                return self.json({"detail": "Not an image"}, 415)
             with lock:
                 img = add(
                     q.get("image_category", ["user"])[0],
@@ -364,7 +430,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9090
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    port = int(args[0]) if args else 9090
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 

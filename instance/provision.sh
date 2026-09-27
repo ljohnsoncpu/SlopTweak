@@ -6,7 +6,8 @@
 # Env (from the Vast create call):
 #   LAUNCH_TOKEN_HASH   sha256 hex of the launcher's per-session secret (required)
 #   MODELS_B64          base64 JSON: [{url, sha256, size_bytes, filename,
-#                                      requires_civitai_token}] (required)
+#                                      requires_civitai_token,
+#                                      default_settings?}] (required)
 #   CIVITAI_TOKEN       user's CivitAI key (only if a model needs it)
 #   IDLE_MINUTES, HEARTBEAT_MINUTES, MAX_SESSION_MINUTES   watchdog timers
 #   CONTAINER_ID, CONTAINER_API_KEY   injected by Vast
@@ -218,5 +219,11 @@ status registering "adding models to Invoke"
 while IFS=$'\t' read -r _ _ _ name _; do
   register_model "$MODELS_DIR/$name"
 done <<<"$MODEL_LINES"
+
+# Catalog-recommended CFG/steps/scheduler into each model's Invoke config.
+# Not fatal: without them the model still works with Invoke's own defaults.
+status registering "applying recommended settings"
+"$SIDECAR_VENV/bin/python" "$ASSET_DIR/model_defaults.py" >>"$LOG_DIR/model-defaults.log" 2>&1 ||
+  log "WARNING: some recommended settings were not applied (see model-defaults.log)"
 
 status ready "" 1

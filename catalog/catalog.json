@@ -25,6 +25,7 @@
           "requires_civitai_token": true
         }
       ],
+      "default_settings": { "scheduler": "euler_a", "cfg_scale": 5, "steps": 30 },
       "min_vram_gb": 12,
       "nsfw": true,
       "license_note": "CivitAI license: running on rented GPUs allowed (Rent, RentCivit); derivatives allowed; credit not required.",
@@ -78,6 +79,7 @@
           "requires_civitai_token": false
         }
       ],
+      "default_settings": { "cfg_scale": 4.5, "steps": 35 },
       "min_vram_gb": 8,
       "min_compute_cap": 800,
       "nsfw": false,
@@ -132,6 +134,7 @@
           "requires_civitai_token": false
         }
       ],
+      "default_settings": { "cfg_scale": 1, "steps": 10 },
       "min_vram_gb": 8,
       "min_compute_cap": 800,
       "nsfw": false,

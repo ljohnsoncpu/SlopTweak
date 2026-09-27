@@ -47,7 +47,8 @@ Early releases may not be code-signed yet, so Windows SmartScreen can say
   down.
 - **Private.** The InvokeAI page on the GPU needs a secret only your copy of the
   app has. Keys are stored in Windows Credential Manager, never in files.
-- **Built-in tutorial** for inpainting (repainting part of an image), and
+- **Built-in tutorial**: prompts, prompt templates, and inpainting (repainting
+  part of an image) in five short, resumable stages, and
   **LoRAs** from a CivitAI link.
 - **Automatic updates** from this repository's releases, verified with a
   signature before they install.

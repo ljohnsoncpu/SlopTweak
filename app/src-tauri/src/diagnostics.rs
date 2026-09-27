@@ -151,9 +151,10 @@ pub fn report(i: &Inputs, known: &[&str], home: Option<&str>) -> String {
     );
     let _ = writeln!(
         s,
-        "output folder {} · tutorial done {}",
+        "output folder {} · tutorial done {} · stage {}",
         st.output_dir.as_deref().unwrap_or("default"),
-        st.tutorial_done
+        st.tutorial_done,
+        st.tutorial_stage
     );
     for l in &st.loras {
         let _ = writeln!(
@@ -340,7 +341,7 @@ mod tests {
             "== state history ==",
             "== log ==",
             "ghcr.io/invoke-ai/invokeai:v6.14.1-cuda (digest 39a7e3b182c4…)",
-            "sha256 ea4bd0bc22da…",
+            "sha256 16e68e06a67d…",
             "Bearer [REDACTED]",
         ] {
             assert!(text.contains(want), "missing {want:?}:\n{text}");

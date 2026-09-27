@@ -91,7 +91,103 @@ pub struct Model {
     /// Built-in prompt templates. A bad one is dropped, not the model.
     #[serde(default)]
     pub templates: Vec<Template>,
+    /// Recommended generation settings. The instance writes them into the
+    /// model's Invoke config (`default_settings`) after registering it.
+    #[serde(default)]
+    pub default_settings: Option<DefaultSettings>,
+    #[serde(default)]
+    pub source: ModelSource,
 }
+
+/// A subset of Invoke's `MainModelDefaultSettings` (6.14.1). Invoke's UI
+/// applies them when the user clicks "Use default settings" (the sparkle
+/// button by the model picker), not on model select (findings → "Model
+/// default settings").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DefaultSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfg_scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<u32>,
+    /// An Invoke `SCHEDULER_NAME_VALUES` name. SD-family bases only: Invoke
+    /// gives Anima and FLUX their own scheduler setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<String>,
+}
+
+/// `SCHEDULER_NAME_VALUES` in Invoke 6.14.1
+/// (invokeai/backend/stable_diffusion/schedulers/schedulers.py).
+const SCHEDULERS: &[&str] = &[
+    "ddim",
+    "ddpm",
+    "deis",
+    "deis_k",
+    "lms",
+    "lms_k",
+    "pndm",
+    "heun",
+    "heun_k",
+    "euler",
+    "euler_k",
+    "euler_a",
+    "kdpm_2",
+    "kdpm_2_k",
+    "kdpm_2_a",
+    "kdpm_2_a_k",
+    "dpmpp_2s",
+    "dpmpp_2s_k",
+    "dpmpp_2m",
+    "dpmpp_2m_k",
+    "dpmpp_2m_sde",
+    "dpmpp_2m_sde_k",
+    "dpmpp_3m",
+    "dpmpp_3m_k",
+    "dpmpp_sde",
+    "dpmpp_sde_k",
+    "er_sde",
+    "unipc",
+    "unipc_k",
+    "lcm",
+    "tcd",
+];
+
+/// Catalog bases whose Invoke graphs use the shared `scheduler` parameter.
+const SCHEDULER_BASES: &[&str] = &["sd1", "sd2", "sdxl"];
+
+fn validate_defaults(d: &DefaultSettings, base: &str) -> Result<(), String> {
+    if d.cfg_scale.is_none() && d.steps.is_none() && d.scheduler.is_none() {
+        // Invoke would read `{}` as another model type's settings.
+        return Err("empty default_settings".into());
+    }
+    // Invoke requires cfg_scale >= 1 and steps > 0; the upper bounds are the UI's.
+    if d.cfg_scale.is_some_and(|c| !(1.0..=200.0).contains(&c)) {
+        return Err("bad default_settings.cfg_scale".into());
+    }
+    if d.steps.is_some_and(|s| !(1..=500).contains(&s)) {
+        return Err("bad default_settings.steps".into());
+    }
+    if let Some(s) = &d.scheduler {
+        if !SCHEDULERS.contains(&s.as_str()) {
+            return Err(format!("unknown default_settings.scheduler {s:?}"));
+        }
+        if !SCHEDULER_BASES.contains(&base) {
+            return Err(format!(
+                "Invoke ignores default_settings.scheduler for {base}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Where the model came from. Only the page is used (the tutorial opens it).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelSource {
+    #[serde(default)]
+    pub page: Option<String>,
+}
+
+/// Hosts whose model pages the app will open in the user's browser.
+const PAGE_HOSTS: [&str; 2] = ["civitai.com", "huggingface.co"];
 
 impl Model {
     pub fn total_bytes(&self) -> u64 {
@@ -100,6 +196,17 @@ impl Model {
 
     pub fn needs_civitai(&self) -> bool {
         self.files.iter().any(|f| f.requires_civitai_token)
+    }
+
+    /// The model's page, if it's an https page on CivitAI or Hugging Face.
+    pub fn page_url(&self) -> Option<Url> {
+        let u = Url::parse(self.source.page.as_deref()?).ok()?;
+        let ok = u.scheme() == "https"
+            && u.port().is_none()
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.host_str().is_some_and(|h| PAGE_HOSTS.contains(&h));
+        ok.then_some(u)
     }
 }
 
@@ -293,6 +400,9 @@ fn validate(m: &Model) -> Result<(), String> {
     }
     if m.good_for.len() > 60 {
         return Err("good_for is too long".into());
+    }
+    if let Some(d) = &m.default_settings {
+        validate_defaults(d, &m.base)?;
     }
     if !m.files.iter().any(|f| f.kind == "main") {
         return Err("no main model file".into());
@@ -512,6 +622,34 @@ mod tests {
     }
 
     #[test]
+    fn model_pages_are_https_on_known_hosts() {
+        for m in bundled() {
+            assert!(m.page_url().is_some(), "{} has a page", m.id);
+        }
+        let with = |page: &str| {
+            let mut e = entry("x");
+            e["source"] = json!({ "page": page, "civitai_model_id": 1 });
+            serde_json::from_value::<Model>(e).unwrap().page_url()
+        };
+        assert!(with("https://civitai.com/models/1/x").is_some());
+        assert!(with("https://huggingface.co/a/b").is_some());
+        for bad in [
+            "http://civitai.com/models/1",
+            "https://civitai.com.evil.com/",
+            "https://evil.com/?civitai.com",
+            "https://user@civitai.com/",
+            "https://civitai.com:8443/",
+            "file:///C:/x",
+            "javascript:alert(1)",
+            "not a url",
+        ] {
+            assert!(with(bad).is_none(), "{bad}");
+        }
+        let no_source: Model = serde_json::from_value(entry("x")).unwrap();
+        assert!(no_source.page_url().is_none());
+    }
+
+    #[test]
     fn bundled_anima_entries_are_complete() {
         let models = bundled();
         for id in ["anima-aesthetic", "anima-turbo"] {
@@ -604,6 +742,75 @@ mod tests {
         assert!(skipped.iter().any(|s| s.contains("wants the CivitAI key")));
         assert!(skipped.iter().any(|s| s.starts_with("ok: duplicate")));
         assert!(skipped.iter().any(|s| s.contains("needs Invoke 99.0.0")));
+    }
+
+    #[test]
+    fn bundled_default_settings_follow_the_model_cards() {
+        let models = bundled();
+        let get = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .default_settings
+                .clone()
+                .unwrap()
+        };
+        let banana = get("banana-splitz-xxl");
+        assert_eq!(banana.scheduler.as_deref(), Some("euler_a"));
+        let turbo = get("anima-turbo");
+        assert_eq!(turbo.cfg_scale, Some(1.0));
+        assert!((8..=12).contains(&turbo.steps.unwrap()));
+        let aesthetic = get("anima-aesthetic");
+        assert!((4.0..=5.0).contains(&aesthetic.cfg_scale.unwrap()));
+        assert!((30..=50).contains(&aesthetic.steps.unwrap()));
+        assert_eq!(aesthetic.scheduler, None);
+    }
+
+    #[test]
+    fn default_settings_are_validated() {
+        let with = |d: serde_json::Value, base: &str| {
+            let mut e = entry("d");
+            e["base"] = json!(base);
+            e["default_settings"] = d;
+            parse(&catalog(vec![e, entry("ok")])).unwrap()
+        };
+        let ok = with(
+            json!({"cfg_scale": 5, "steps": 30, "scheduler": "euler_a"}),
+            "sdxl",
+        );
+        assert_eq!(ok.0.len(), 2, "{:?}", ok.1);
+        assert_eq!(with(json!({"steps": 10}), "anima").0.len(), 2);
+        // Unknown keys are ignored, like elsewhere in the catalog.
+        assert_eq!(with(json!({"steps": 10, "future": 1}), "anima").0.len(), 2);
+        for (d, base, why) in [
+            (json!({}), "sdxl", "empty"),
+            (json!({"cfg_scale": 0.5}), "sdxl", "cfg_scale"),
+            (json!({"cfg_scale": 500}), "sdxl", "cfg_scale"),
+            (json!({"steps": 0}), "sdxl", "steps"),
+            (json!({"steps": -3}), "sdxl", "invalid"),
+            (json!({"steps": 2.5}), "sdxl", "invalid"),
+            (json!({"scheduler": "Euler a"}), "sdxl", "unknown"),
+            (json!({"scheduler": "euler"}), "anima", "ignores"),
+            (json!({"cfg_scale": "7"}), "sdxl", "invalid"),
+        ] {
+            let (models, skipped) = with(d.clone(), base);
+            assert_eq!(models.len(), 1, "{d} should be rejected");
+            assert!(skipped[0].contains(why), "{d}: {skipped:?}");
+        }
+    }
+
+    #[test]
+    fn default_settings_serialize_without_nulls() {
+        let d = DefaultSettings {
+            cfg_scale: Some(1.0),
+            steps: Some(10),
+            scheduler: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            json!({"cfg_scale": 1.0, "steps": 10})
+        );
     }
 
     #[test]

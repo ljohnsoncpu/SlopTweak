@@ -31,4 +31,4 @@ ignore = ["S101"]
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["sidecar.py", "build_assets.py", "dev", "tests"]
+files = ["sidecar.py", "model_defaults.py", "build_assets.py", "dev", "tests"]

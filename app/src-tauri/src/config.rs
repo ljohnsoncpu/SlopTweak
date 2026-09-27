@@ -23,13 +23,13 @@ pub const ASSETS_URL: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "/instance-assets.tar.gz"
 );
-pub const ASSETS_SHA256: &str = "ea4bd0bc22da9dfb0c0f49612388ca9346ece88211df1ddfdd8eca5c0afcaa99";
+pub const ASSETS_SHA256: &str = "16e68e06a67dbcd2a43bf5da510490d5c639abc966998720abae32de60461255";
 /// Debug builds of a version that has no release yet fetch the same bytes
-/// from the `instance-v0.1.1` dev pre-release; `SLOPTWEAK_DEV_ASSETS_URL` overrides it
+/// from the `instance-v0.1.2` dev pre-release; `SLOPTWEAK_DEV_ASSETS_URL` overrides it
 /// (the instance still checks [`ASSETS_SHA256`]).
 #[cfg(debug_assertions)]
 const DEV_ASSETS_URL: &str =
-    "https://github.com/ljohnsoncpu/SlopTweak/releases/download/instance-v0.1.1/instance-assets.tar.gz";
+    "https://github.com/ljohnsoncpu/SlopTweak/releases/download/instance-v0.1.2/instance-assets.tar.gz";
 
 /// Where instances fetch the bundle from.
 pub fn assets_url() -> String {
@@ -86,6 +86,16 @@ pub struct Settings {
     pub loras: Vec<Lora>,
     /// The Invoke-window tutorial was finished or skipped (Phase 4).
     pub tutorial_done: bool,
+    /// Tutorial stage the user is on, 1..=TUTORIAL_STAGES (Phase 6), so it
+    /// resumes on the next GPU.
+    pub tutorial_stage: u8,
+}
+
+/// Stages in the Invoke-window tutorial (PLAN §4 Phase 6).
+pub const TUTORIAL_STAGES: u8 = 5;
+
+fn first_stage() -> u8 {
+    1
 }
 
 impl Default for Settings {
@@ -111,6 +121,7 @@ impl Default for Settings {
             output_dir: None,
             loras: Vec::new(),
             tutorial_done: false,
+            tutorial_stage: 1,
         }
     }
 }
@@ -129,6 +140,8 @@ pub struct UserSettings {
     pub loras: Vec<Lora>,
     #[serde(default)]
     pub tutorial_done: bool,
+    #[serde(default = "first_stage")]
+    pub tutorial_stage: u8,
 }
 
 impl UserSettings {
@@ -145,6 +158,9 @@ impl UserSettings {
         }
         if !(0.0..=1000.0).contains(&self.min_credit) {
             return Err("Minimum credit must be between $0 and $1000.".into());
+        }
+        if !(1..=TUTORIAL_STAGES).contains(&self.tutorial_stage) {
+            return Err("Unknown tutorial stage.".into());
         }
         if let Some(d) = &self.output_dir {
             if d.trim().is_empty() || !Path::new(d).is_absolute() {
@@ -177,6 +193,7 @@ impl Settings {
             output_dir: self.output_dir.clone(),
             loras: self.loras.clone(),
             tutorial_done: self.tutorial_done,
+            tutorial_stage: self.tutorial_stage.clamp(1, TUTORIAL_STAGES),
         }
     }
 
@@ -275,17 +292,25 @@ pub fn launch_spec(
     launch_token_hash: &str,
     civitai_token: Option<&str>,
 ) -> LaunchSpec {
+    // The catalog's recommended settings ride on the main file, which is the
+    // Invoke model they belong to (instance/model_defaults.py).
+    let main_idx = model.files.iter().position(|f| f.kind == "main");
     let files: Vec<_> = model
         .files
         .iter()
-        .map(|f| {
-            json!({
+        .enumerate()
+        .map(|(i, f)| {
+            let mut v = json!({
                 "url": f.url,
                 "sha256": f.sha256.to_ascii_lowercase(),
                 "size_bytes": f.size_bytes,
                 "filename": f.filename,
                 "requires_civitai_token": f.requires_civitai_token,
-            })
+            });
+            if let (Some(d), true) = (&model.default_settings, Some(i) == main_idx) {
+                v["default_settings"] = json!(d);
+            }
+            v
         })
         .collect();
     let models_b64 =
@@ -413,6 +438,8 @@ mod tests {
             Box::new(|u| u.max_session_minutes = 10),
             Box::new(|u| u.min_credit = -1.0),
             Box::new(|u| u.output_dir = Some("relative-dir".into())),
+            Box::new(|u| u.tutorial_stage = 0),
+            Box::new(|u| u.tutorial_stage = TUTORIAL_STAGES + 1),
         ];
         for mutate in cases {
             let mut u = ok.clone();
@@ -504,6 +531,46 @@ mod tests {
         assert_eq!(offer_query(&model, &s).min_compute_cap, 750);
     }
 
+    fn decoded_models(spec: &LaunchSpec) -> serde_json::Value {
+        let b64 = &spec.env.iter().find(|(k, _)| k == "MODELS_B64").unwrap().1;
+        serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn default_settings_ride_on_the_main_file_only() {
+        let s = Settings::default();
+        let turbo = catalog::bundled()
+            .into_iter()
+            .find(|m| m.id == "anima-turbo")
+            .unwrap();
+        let m = with_loras(&turbo, &[lora(1, "Anima", "a.safetensors")]);
+        let files = decoded_models(&launch_spec(&m, &s, &"a".repeat(64), None));
+        let files = files.as_array().unwrap();
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0]["filename"], "anima-turbo-v1.1.safetensors");
+        assert_eq!(
+            files[0]["default_settings"],
+            json!({"cfg_scale": 1.0, "steps": 10})
+        );
+        assert!(files[1..]
+            .iter()
+            .all(|f| f.get("default_settings").is_none()));
+
+        let mut plain = turbo.clone();
+        plain.default_settings = None;
+        let files = decoded_models(&launch_spec(&plain, &s, &"a".repeat(64), None));
+        assert!(files
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f.get("default_settings").is_none()));
+    }
+
     #[test]
     fn model_ram_floor_reaches_the_query() {
         let mut model = catalog::bundled()[0].clone();
@@ -529,5 +596,27 @@ mod tests {
         let s = Settings::load(dir.path());
         assert_eq!(s.max_dph, 0.3);
         assert_eq!(s.max_attempts, 3);
+        assert_eq!(s.tutorial_stage, 1);
+    }
+
+    #[test]
+    fn tutorial_stage_resumes_and_is_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        // A Phase 4 file has tutorial_done but no stage.
+        std::fs::write(Settings::path(dir.path()), r#"{"tutorial_done": true}"#).unwrap();
+        let mut u = Settings::load(dir.path()).user();
+        assert_eq!(u.tutorial_stage, 1);
+        u.tutorial_stage = 3;
+        assert_eq!(
+            Settings::save_user(dir.path(), &u).unwrap().tutorial_stage,
+            3
+        );
+        assert_eq!(Settings::load(dir.path()).tutorial_stage, 3);
+        // A hand-edited stage out of range is clamped, not an error.
+        std::fs::write(Settings::path(dir.path()), r#"{"tutorial_stage": 42}"#).unwrap();
+        assert_eq!(
+            Settings::load(dir.path()).user().tutorial_stage,
+            TUTORIAL_STAGES
+        );
     }
 }

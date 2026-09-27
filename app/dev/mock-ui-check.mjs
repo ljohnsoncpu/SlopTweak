@@ -22,6 +22,7 @@ import { servesThisCheckout } from "./vite-check.mjs";
 import { COST_TITLE, windowTitles } from "./win-titles.mjs";
 
 const APP = resolve(import.meta.dirname, "..");
+const VERSION = JSON.parse(readFileSync(join(APP, "src-tauri", "tauri.conf.json"), "utf8")).version;
 const EXE = join(APP, "src-tauri", "target", "debug", "sloptweak.exe");
 const CDP_PORT = 9334;
 const CATALOG_PORT = 18431;
@@ -78,7 +79,6 @@ async function waitFor(fn, ms, what) {
 // ----- local "upstream" catalog ---------------------------------------------------
 
 const bundled = JSON.parse(readFileSync(join(APP, "..", "catalog", "catalog.json"), "utf8"));
-const VERSION = JSON.parse(readFileSync(join(APP, "package.json"), "utf8")).version;
 let catalogText = JSON.stringify(bundled);
 let catalogUp = true;
 const catalogServer = createServer((req, res) => {
