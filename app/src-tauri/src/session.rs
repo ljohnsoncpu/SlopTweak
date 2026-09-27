@@ -30,6 +30,7 @@ use url::Url;
 
 use crate::catalog::Model;
 use crate::config::{self, Settings};
+use crate::library::{Builtins, LibraryStore, LibrarySync};
 use crate::persist::{now_unix, ActiveRecord, RecordFile};
 use crate::provider::machines::MachineFile;
 use crate::provider::offers::{self, RankedOffer};
@@ -399,6 +400,11 @@ pub struct Timing {
     pub final_sync: Duration,
     /// Same, when the instance is already shutting itself down.
     pub final_sync_gone: Duration,
+    /// How often templates and workflows are saved while Ready.
+    pub library_every: Duration,
+    /// Most the Invoke window waits for saved templates and workflows to be
+    /// put back.
+    pub library_restore: Duration,
 }
 
 impl Timing {
@@ -418,6 +424,8 @@ impl Default for Timing {
             sync_every: Duration::from_secs(10),
             final_sync: Duration::from_secs(60),
             final_sync_gone: Duration::from_secs(15),
+            library_every: Duration::from_secs(60),
+            library_restore: Duration::from_secs(30),
         }
     }
 }
@@ -435,6 +443,10 @@ pub struct Deps {
     pub syncs: SyncStore,
     /// Where images go; read on every pass so a folder change applies at once.
     pub output_dir: OutputDir,
+    /// The user's templates and workflows, kept across GPUs.
+    pub library: LibraryStore,
+    /// Built-in templates for a model id (from the catalog).
+    pub builtins: Builtins,
     pub ui: Arc<dyn Ui>,
 }
 
@@ -466,6 +478,8 @@ struct Inner {
     /// Output sync for the Ready instance, and its polling task.
     sync: Option<Arc<AsyncMutex<OutputSync>>>,
     sync_task: Option<JoinHandle<()>>,
+    /// Template/workflow saving for the same instance (driven by the sync task).
+    library: Option<Arc<AsyncMutex<LibrarySync>>>,
     /// Last sync report; kept after the session so the UI can say what was saved.
     sync_report: Option<SyncReport>,
 }
@@ -551,6 +565,7 @@ impl SessionManager {
                 history: VecDeque::new(),
                 sync: None,
                 sync_task: None,
+                library: None,
                 sync_report: None,
             }),
             stop: watch::channel(false).0,
@@ -912,7 +927,8 @@ impl SessionManager {
         let mut rx = self.stop.subscribe();
         let query = config::offer_query(&model, &settings);
         let costs = config::cost_inputs(&model, &settings);
-        let ready_timeout = Duration::from_secs(u64::from(settings.ready_timeout_minutes) * 60);
+        let ready_timeout =
+            Duration::from_secs(u64::from(config::ready_timeout_minutes(&model, &settings)) * 60);
         let mut tried = offers::Tried::with_memory(self.deps.machines.load(), now_unix());
         loop {
             if self.stopped() {
@@ -1255,7 +1271,9 @@ impl SessionManager {
             return self.finish_stop(Some(instance_id)).await;
         }
         self.log(format!("instance {instance_id} is ready"));
-        self.start_sync(instance_id, &base, secret);
+        // Before the window opens, so Invoke's lists already have them.
+        let library = self.restore_library(instance_id, &base, secret).await;
+        self.start_sync(instance_id, &base, secret, library);
         let mut opened = false;
         for _ in 0..5 {
             match self.deps.sidecar.ticket(&base, secret).await {
@@ -1309,7 +1327,13 @@ impl SessionManager {
 
     // ----- output sync ----------------------------------------------------------
 
-    fn start_sync(self: &Arc<Self>, instance_id: u64, base: &Url, secret: &str) {
+    fn start_sync(
+        self: &Arc<Self>,
+        instance_id: u64,
+        base: &Url,
+        secret: &str,
+        library: Arc<AsyncMutex<LibrarySync>>,
+    ) {
         let sync = Arc::new(AsyncMutex::new(OutputSync::new(
             self.deps.sidecar.clone(),
             base.clone(),
@@ -1318,22 +1342,96 @@ impl SessionManager {
             self.deps.syncs.clone(),
             self.deps.output_dir.clone(),
         )));
-        let task = tokio::spawn(self.clone().sync_loop(sync.clone()));
+        let task = tokio::spawn(self.clone().sync_loop(sync.clone(), library.clone()));
         let mut inner = self.inner.lock().unwrap();
         if let Some(old) = inner.sync_task.replace(task) {
             old.abort();
         }
         inner.sync = Some(sync);
+        inner.library = Some(library);
+    }
+
+    /// Templates and workflows for this instance, with the built-ins of the
+    /// model it was rented for.
+    fn library_for(&self, instance_id: u64, base: &Url, secret: &str) -> LibrarySync {
+        let model_id = self
+            .deps
+            .records
+            .load()
+            .filter(|r| r.instance_id == instance_id)
+            .map(|r| r.model_id)
+            .unwrap_or_default();
+        LibrarySync::new(
+            self.deps.sidecar.clone(),
+            base.clone(),
+            secret.to_string(),
+            self.deps.library.clone(),
+            (self.deps.builtins)(&model_id),
+        )
+    }
+
+    /// Put saved templates and workflows (and the model's built-in
+    /// templates) into a fresh Invoke. Best effort, bounded.
+    async fn restore_library(
+        &self,
+        instance_id: u64,
+        base: &Url,
+        secret: &str,
+    ) -> Arc<AsyncMutex<LibrarySync>> {
+        let mut lib = self.library_for(instance_id, base, secret);
+        match tokio::time::timeout(self.timing.library_restore, lib.restore()).await {
+            Ok(Ok(r)) => {
+                if r.templates + r.workflows + r.failed > 0 {
+                    self.log(format!(
+                        "put back {} template(s) and {} workflow(s){}",
+                        r.templates,
+                        r.workflows,
+                        match r.failed {
+                            0 => String::new(),
+                            n => format!("; {n} failed"),
+                        }
+                    ));
+                }
+            }
+            Ok(Err(e)) => self.log(format!("couldn't put templates and workflows back: {e}")),
+            Err(_) => self.log(format!(
+                "stopped putting templates and workflows back after {} s",
+                self.timing.library_restore.as_secs()
+            )),
+        }
+        Arc::new(AsyncMutex::new(lib))
+    }
+
+    /// Save templates/workflows changed in Invoke, and say what happened.
+    async fn capture_library(&self, library: &AsyncMutex<LibrarySync>) {
+        match library.lock().await.capture().await {
+            Ok(c) if c.templates + c.workflows + c.removed > 0 => self.log(format!(
+                "saved {} template(s) and {} workflow(s); {} removed",
+                c.templates, c.workflows, c.removed
+            )),
+            Ok(_) => {}
+            Err(e) => self.log(format!("couldn't save templates and workflows: {e}")),
+        }
     }
 
     /// Poll Invoke every `sync_every` until a stop is requested. A pass that
     /// is running when Stop comes finishes (the final pass waits for it,
-    /// inside its own timeout).
-    async fn sync_loop(self: Arc<Self>, sync: Arc<AsyncMutex<OutputSync>>) {
+    /// inside its own timeout). Templates and workflows are saved every
+    /// `library_every`.
+    async fn sync_loop(
+        self: Arc<Self>,
+        sync: Arc<AsyncMutex<OutputSync>>,
+        library: Arc<AsyncMutex<LibrarySync>>,
+    ) {
         let mut rx = self.stop.subscribe();
         let mut failures = 0u32;
         let mut last_error: Option<String> = None;
+        let mut last_library = Instant::now();
         loop {
+            if last_library.elapsed() >= self.timing.library_every {
+                last_library = Instant::now();
+                self.capture_library(&library).await;
+            }
             let (result, report) = {
                 let mut s = sync.lock().await;
                 let r = s.pass(false).await;
@@ -1383,23 +1481,33 @@ impl SessionManager {
         let Some(base) = self.deps.provider.sidecar_url(&info) else {
             return;
         };
-        self.inner.lock().unwrap().sync = Some(Arc::new(AsyncMutex::new(OutputSync::new(
-            self.deps.sidecar.clone(),
-            base,
-            secret,
-            instance_id,
-            self.deps.syncs.clone(),
-            self.deps.output_dir.clone(),
-        ))));
+        // No restore: only save what it has.
+        let library = self.library_for(instance_id, &base, &secret);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.sync = Some(Arc::new(AsyncMutex::new(OutputSync::new(
+                self.deps.sidecar.clone(),
+                base,
+                secret,
+                instance_id,
+                self.deps.syncs.clone(),
+                self.deps.output_dir.clone(),
+            ))));
+            inner.library = Some(Arc::new(AsyncMutex::new(library)));
+        }
         self.final_sync(self.timing.final_sync).await;
     }
 
     /// The last pass before the instance goes, bounded by `limit`. It can't
     /// fail: whatever happens, the caller destroys next.
     async fn final_sync(&self, limit: Duration) {
-        let (sync, task) = {
+        let (sync, task, library) = {
             let mut inner = self.inner.lock().unwrap();
-            (inner.sync.take(), inner.sync_task.take())
+            (
+                inner.sync.take(),
+                inner.sync_task.take(),
+                inner.library.take(),
+            )
         };
         let Some(sync) = sync else { return };
         let abort = task.as_ref().map(JoinHandle::abort_handle);
@@ -1421,9 +1529,16 @@ impl SessionManager {
                 }
                 let _ = t.await;
             }
-            let mut s = sync.lock().await;
-            s.set_phase(Phase::Finishing);
-            s.pass(true).await
+            let r = {
+                let mut s = sync.lock().await;
+                s.set_phase(Phase::Finishing);
+                s.pass(true).await
+            };
+            // Images first; then whatever templates/workflows changed.
+            if let Some(l) = &library {
+                self.capture_library(l).await;
+            }
+            r
         };
         let outcome = tokio::time::timeout(limit, work).await;
         if let Some(a) = abort {

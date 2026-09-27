@@ -304,6 +304,14 @@ fn rebuild(
             let out = out_dir(dir);
             Arc::new(move || out.clone())
         },
+        library: crate::library::LibraryStore::new(dir),
+        builtins: Arc::new(|id: &str| {
+            catalog::bundled()
+                .iter()
+                .find(|m| m.id == id)
+                .map(crate::library::builtins_of)
+                .unwrap_or_default()
+        }),
         ui: ui.clone(),
     };
     (SessionManager::new(deps, Timing::default()), ui)
@@ -1040,4 +1048,67 @@ async fn session_log_masks_the_users_keys() {
     let line = h.mgr.log_lines().pop().unwrap();
     assert!(!line.contains("a1b2c3") && !line.contains("odd"), "{line}");
     assert_eq!(line.matches("[REDACTED]").count(), 2, "{line}");
+}
+
+/// Templates and workflows outlive the GPU: the model's built-ins and the
+/// user's own go into each fresh Invoke, and what the user makes is saved by
+/// the last pass before shutdown.
+#[tokio::test(start_paused = true)]
+async fn templates_and_workflows_carry_across_gpus() {
+    let h = harness(vec![]);
+    let id = ready_instance(&h).await;
+    let secret = h
+        .secrets
+        .get(&secrets::launch_secret_name(id))
+        .unwrap()
+        .unwrap();
+    let sidecar = h.mock.sidecar();
+    let names = |secret: &str| {
+        sidecar
+            .with_library(secret, |l| {
+                let mut v: Vec<String> = l
+                    .presets
+                    .iter()
+                    .map(|p| p["name"].as_str().unwrap().to_string())
+                    .collect();
+                v.sort();
+                v
+            })
+            .unwrap()
+    };
+    let builtins = crate::library::builtins_of(&model());
+    assert!(!builtins.is_empty());
+    let mut want: Vec<String> = builtins.iter().map(|b| b.name.clone()).collect();
+    want.sort();
+    assert_eq!(
+        names(&secret),
+        want,
+        "built-ins are in before the window opens"
+    );
+
+    sidecar.with_library(&secret, |l| {
+        l.add_preset("My style", "moody, {prompt}", "");
+        l.add_workflow("My flow", serde_json::json!([{"id": "a"}]));
+    });
+    // Stop right away: only the final pass can have saved them.
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+    let lib = crate::library::LibraryStore::new(h.dir.path()).load();
+    assert_eq!(lib.templates.len(), 1);
+    assert_eq!(lib.workflows.len(), 1);
+
+    let id2 = ready_instance(&h).await;
+    assert_ne!(id, id2);
+    let secret2 = h
+        .secrets
+        .get(&secrets::launch_secret_name(id2))
+        .unwrap()
+        .unwrap();
+    want.push("My style".into());
+    want.sort();
+    assert_eq!(names(&secret2), want);
+    let flows = sidecar
+        .with_library(&secret2, |l| l.workflows.len())
+        .unwrap();
+    assert_eq!(flows, 1);
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
 }

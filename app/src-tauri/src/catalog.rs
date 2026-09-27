@@ -36,6 +36,28 @@ pub struct ModelFile {
     pub requires_civitai_token: bool,
 }
 
+/// A prompt template SlopTweak puts into Invoke for this model (an Invoke
+/// "style preset"). Taken from the model page's example images.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Template {
+    pub name: String,
+    /// Contains `{prompt}` once; Invoke puts the user's prompt there.
+    pub positive: String,
+    #[serde(default)]
+    pub negative: String,
+    /// The example image as a small JPEG/PNG/WebP, base64. Shown in Invoke's
+    /// template list.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Where the example came from (credit).
+    #[serde(default)]
+    pub image_source: Option<String>,
+}
+
+pub const MAX_TEMPLATES: usize = 12;
+const MAX_TEMPLATE_PROMPT: usize = 2000;
+pub const MAX_TEMPLATE_IMAGE: usize = 64 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
@@ -56,6 +78,19 @@ pub struct Model {
     /// model only.
     #[serde(default)]
     pub min_compute_cap: Option<u32>,
+    /// Host RAM this model needs, GB. Invoke streams a transformer bigger
+    /// than VRAM from RAM, so large models need a roomy host.
+    #[serde(default)]
+    pub min_ram_gb: Option<f64>,
+    /// Rough rental price class: 1 = cheapest GPUs, 3 = the priciest.
+    #[serde(default)]
+    pub price_tier: Option<u8>,
+    /// A few words on what the model is for, shown in the model list.
+    #[serde(default)]
+    pub good_for: String,
+    /// Built-in prompt templates. A bad one is dropped, not the model.
+    #[serde(default)]
+    pub templates: Vec<Template>,
     /// Recommended generation settings. The instance writes them into the
     /// model's Invoke config (`default_settings`) after registering it.
     #[serde(default)]
@@ -227,7 +262,23 @@ pub fn parse(text: &str) -> Result<(Vec<Model>, Vec<String>), String> {
             .unwrap_or_else(|| format!("#{i}"));
         let checked = serde_json::from_value::<Model>(v)
             .map_err(|e| e.to_string())
-            .and_then(|m| validate(&m).map(|()| m));
+            .and_then(|m| validate(&m).map(|()| m))
+            .map(|mut m| {
+                let mut names = HashSet::new();
+                m.templates.retain(|t| {
+                    let ok = validate_template(t)
+                        .and_then(|()| {
+                            names
+                                .insert(t.name.clone())
+                                .then_some(())
+                                .ok_or_else(|| "duplicate name".to_string())
+                        })
+                        .map_err(|e| skipped.push(format!("{label}: template {:?}: {e}", t.name)));
+                    ok.is_ok()
+                });
+                m.templates.truncate(MAX_TEMPLATES);
+                m
+            });
         match checked {
             Ok(m) if !ids.insert(m.id.clone()) => skipped.push(format!("{label}: duplicate id")),
             Ok(m) => models.push(m),
@@ -286,6 +337,38 @@ pub fn validate_file(f: &ModelFile) -> Result<(), String> {
     Ok(())
 }
 
+/// PNG, JPEG, or WebP by magic bytes.
+pub fn is_image(b: &[u8]) -> bool {
+    b.starts_with(b"\x89PNG\r\n\x1a\n")
+        || b.starts_with(&[0xFF, 0xD8, 0xFF])
+        || (b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP")
+}
+
+/// A template's image, decoded, if it has a usable one.
+pub fn template_image(t: &Template) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let b = base64::engine::general_purpose::STANDARD
+        .decode(t.image.as_deref()?)
+        .ok()?;
+    (b.len() <= MAX_TEMPLATE_IMAGE && is_image(&b)).then_some(b)
+}
+
+pub fn validate_template(t: &Template) -> Result<(), String> {
+    if t.name.trim().is_empty() || t.name.chars().count() > 60 || t.name.contains('\n') {
+        return Err("bad name".into());
+    }
+    if t.positive.len() > MAX_TEMPLATE_PROMPT || t.negative.len() > MAX_TEMPLATE_PROMPT {
+        return Err("prompt is too long".into());
+    }
+    if t.positive.matches("{prompt}").count() != 1 {
+        return Err("positive must contain {prompt} once".into());
+    }
+    if t.image.is_some() && template_image(t).is_none() {
+        return Err("bad image".into());
+    }
+    Ok(())
+}
+
 fn validate(m: &Model) -> Result<(), String> {
     let id_ok = !m.id.is_empty()
         && m.id.len() <= 64
@@ -308,6 +391,15 @@ fn validate(m: &Model) -> Result<(), String> {
         .is_some_and(|c| !(300..=1300).contains(&c))
     {
         return Err("bad min_compute_cap".into());
+    }
+    if m.min_ram_gb.is_some_and(|r| !(r > 0.0 && r <= 2000.0)) {
+        return Err("bad min_ram_gb".into());
+    }
+    if m.price_tier.is_some_and(|t| !(1..=3).contains(&t)) {
+        return Err("bad price_tier".into());
+    }
+    if m.good_for.len() > 60 {
+        return Err("good_for is too long".into());
     }
     if let Some(d) = &m.default_settings {
         validate_defaults(d, &m.base)?;
@@ -474,6 +566,62 @@ mod tests {
     }
 
     #[test]
+    fn bundled_templates_are_valid() {
+        let text = BUNDLED;
+        let (models, skipped) = parse(text).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        for m in &models {
+            for t in &m.templates {
+                assert!(template_image(t).is_some(), "{} / {}", m.id, t.name);
+            }
+        }
+        let with = |id: &str| models.iter().find(|m| m.id == id).unwrap().templates.len();
+        assert_eq!(with("banana-splitz-xxl"), 1);
+        assert_eq!(with("anima-aesthetic"), 1);
+        assert_eq!(
+            with("anima-turbo"),
+            0,
+            "CFG 1 ignores negatives; no shared positive tags"
+        );
+        let krea = &models
+            .iter()
+            .find(|m| m.id == "krea-2-turbo")
+            .unwrap()
+            .templates;
+        let kroma = &models
+            .iter()
+            .find(|m| m.id == "kroma-turbo")
+            .unwrap()
+            .templates;
+        assert_eq!(krea, kroma, "Kroma reuses Krea 2's set");
+    }
+
+    #[test]
+    fn bad_templates_are_dropped_not_the_model() {
+        let mut e = entry("t");
+        let img = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode([0xFF, 0xD8, 0xFF, 0xE0, 1, 2])
+        };
+        e["templates"] = json!([
+            {"name": "ok", "positive": "a, {prompt}", "image": img},
+            {"name": "no slot", "positive": "a"},
+            {"name": "two slots", "positive": "{prompt} {prompt}"},
+            {"name": "not an image", "positive": "{prompt}", "image": "PGh0bWw+"},
+            {"name": "ok", "positive": "dup {prompt}"},
+            {"name": "", "positive": "{prompt}"}
+        ]);
+        let (models, skipped) = parse(&catalog(vec![e])).unwrap();
+        let names: Vec<&str> = models[0]
+            .templates
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(names, ["ok"]);
+        assert_eq!(skipped.len(), 5, "{skipped:?}");
+    }
+
+    #[test]
     fn model_pages_are_https_on_known_hosts() {
         for m in bundled() {
             assert!(m.page_url().is_some(), "{} has a page", m.id);
@@ -521,6 +669,36 @@ mod tests {
     }
 
     #[test]
+    fn bundled_krea2_entries_are_complete() {
+        let models = bundled();
+        for id in ["krea-2-turbo", "kroma-turbo"] {
+            let m = models.iter().find(|m| m.id == id).unwrap();
+            assert_eq!(m.base, "krea-2");
+            assert_eq!(m.min_compute_cap, Some(800));
+            assert!(
+                m.min_ram_gb.is_some_and(|r| r >= 48.0),
+                "streams from host RAM"
+            );
+            assert!(!m.needs_civitai());
+            let kinds: Vec<&str> = m.files.iter().map(|f| f.kind.as_str()).collect();
+            assert_eq!(kinds, ["main", "text_encoder", "vae"]);
+            // Invoke reads the Turbo variant from the file name.
+            assert!(m.files[0].filename.contains("turbo"));
+        }
+        // Kroma's only file is bf16 (25.6 GB): on 24 GB Invoke has to offload.
+        let kroma = models.iter().find(|m| m.id == "kroma-turbo").unwrap();
+        assert!(kroma.min_vram_gb >= 32.0);
+    }
+
+    #[test]
+    fn bundled_entries_are_labelled() {
+        for m in bundled() {
+            assert!(m.price_tier.is_some(), "{} has no price tier", m.id);
+            assert!(!m.good_for.is_empty(), "{} has no good_for", m.id);
+        }
+    }
+
+    #[test]
     fn bad_entries_are_skipped_not_fatal() {
         let mut token_elsewhere = entry("leak");
         token_elsewhere["files"][0]["url"] = json!("https://evil.example/x");
@@ -538,6 +716,10 @@ mod tests {
         bad_cap["min_compute_cap"] = json!(86);
         let mut bad_id = entry("Bad Id");
         bad_id["id"] = json!("Bad Id");
+        let mut bad_tier = entry("tier");
+        bad_tier["price_tier"] = json!(4);
+        let mut bad_ram = entry("ram");
+        bad_ram["min_ram_gb"] = json!(-1);
         let text = catalog(vec![
             entry("ok"),
             token_elsewhere,
@@ -548,13 +730,15 @@ mod tests {
             no_main,
             bad_cap,
             bad_id,
+            bad_tier,
+            bad_ram,
             entry("ok"),
             json!({"id": "junk"}),
         ]);
         let (models, skipped) = parse(&text).unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "ok");
-        assert_eq!(skipped.len(), 10, "{skipped:?}");
+        assert_eq!(skipped.len(), 12, "{skipped:?}");
         assert!(skipped.iter().any(|s| s.contains("wants the CivitAI key")));
         assert!(skipped.iter().any(|s| s.starts_with("ok: duplicate")));
         assert!(skipped.iter().any(|s| s.contains("needs Invoke 99.0.0")));

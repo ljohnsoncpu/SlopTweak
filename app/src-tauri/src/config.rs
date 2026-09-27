@@ -252,6 +252,16 @@ pub fn disk_gb(model: &Model) -> u32 {
     (model_gb + 40).max(50)
 }
 
+/// How long one GPU gets to become ready: the setting, or more for a big
+/// download. Live 2026-09-26: a host that passed the 2 Gbps filter pulled
+/// Kroma's 31 GB at ~36 MB/s (~14 min) and missed a flat 15 min. Allow
+/// ~0.6 min/GB plus 8 min for the image, verify, and registration.
+pub fn ready_timeout_minutes(model: &Model, s: &Settings) -> u32 {
+    let model_gb = model.total_bytes() as f64 / 1e9;
+    let for_size = (8.0 + 0.6 * model_gb).ceil() as u32;
+    s.ready_timeout_minutes.max(for_size)
+}
+
 pub fn offer_query(model: &Model, s: &Settings) -> OfferQuery {
     OfferQuery {
         min_vram_gb: model.min_vram_gb,
@@ -262,6 +272,7 @@ pub fn offer_query(model: &Model, s: &Settings) -> OfferQuery {
         max_dph: s.max_dph,
         min_cuda: MIN_CUDA,
         min_compute_cap: s.min_compute_cap.max(model.min_compute_cap.unwrap_or(0)),
+        min_ram_gb: model.min_ram_gb.unwrap_or(0.0),
         limit: 64,
     }
 }
@@ -341,6 +352,24 @@ pub fn launch_spec(
 mod tests {
     use super::*;
     use crate::catalog;
+
+    #[test]
+    fn ready_timeout_grows_with_the_download() {
+        let models = catalog::bundled();
+        let get = |id: &str| models.iter().find(|m| m.id == id).unwrap();
+        let s = Settings::default();
+        // Small models keep the setting.
+        assert_eq!(ready_timeout_minutes(get("anima-aesthetic"), &s), 15);
+        // Kroma (31 GB) missed a flat 15 min live; it gets ~27.
+        let kroma = ready_timeout_minutes(get("kroma-turbo"), &s);
+        assert!((25..=30).contains(&kroma), "{kroma}");
+        // A higher setting still wins.
+        let long = Settings {
+            ready_timeout_minutes: 45,
+            ..Settings::default()
+        };
+        assert_eq!(ready_timeout_minutes(get("kroma-turbo"), &long), 45);
+    }
 
     #[test]
     fn onstart_fits_vast_limit() {
@@ -540,6 +569,16 @@ mod tests {
             .unwrap()
             .iter()
             .all(|f| f.get("default_settings").is_none()));
+    }
+
+    #[test]
+    fn model_ram_floor_reaches_the_query() {
+        let mut model = catalog::bundled()[0].clone();
+        let s = Settings::default();
+        model.min_ram_gb = None;
+        assert_eq!(offer_query(&model, &s).min_ram_gb, 0.0);
+        model.min_ram_gb = Some(48.0);
+        assert_eq!(offer_query(&model, &s).min_ram_gb, 48.0);
     }
 
     #[test]

@@ -9,10 +9,14 @@
 //!
 //! The tutorial (tutorial.js) is injected as an initialization script: plain
 //! page JS, no IPC. Its only way back is a navigation to
-//! `/__sloptweak/tutorial/<done|skipped|stage/N|model-page>`, which is
-//! intercepted here and blocked. A page could fake those, but all they do is
-//! mark the tutorial as seen, remember a stage number, or open the current
-//! model's catalog page (rate-limited, see lib.rs).
+//! `/__sloptweak/tutorial/<done|skipped|stage/N|model-page>` or
+//! `/__sloptweak/docs/<key>`, which is intercepted here and blocked. A page
+//! could fake those, but all they do is mark the tutorial as seen, remember a
+//! stage number, or open the current model's catalog page or one of a few
+//! fixed Invoke docs pages (rate-limited, see lib.rs).
+//!
+//! defaults.js is injected after it: it applies the model's own steps/CFG
+//! through Invoke's API, once per GPU.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,6 +31,8 @@ use crate::config::TUTORIAL_STAGES;
 pub const LABEL_PREFIX: &str = "remote-";
 
 const TUTORIAL_JS: &str = include_str!("tutorial.js");
+/// Applies the model's own steps/CFG once per GPU (Invoke never does).
+const DEFAULTS_JS: &str = include_str!("defaults.js");
 /// The fallback portrait for stage 3 ("Use ours instead"), user-supplied.
 const TUTORIAL_PORTRAIT: &[u8] = include_bytes!("../assets/tutorial-portrait.webp");
 
@@ -39,6 +45,8 @@ pub enum TutorialSignal {
     Stage(u8),
     /// Open the current model's page in the user's browser.
     ModelPage,
+    /// Open this fixed Invoke docs page (from `invoke_docs`) in the browser.
+    Docs(&'static str),
 }
 
 /// What the overlay starts from: the app's saved tutorial state and the
@@ -71,10 +79,27 @@ pub fn allowed(origin: &Origin, url: &Url) -> bool {
     &url.origin() == origin
 }
 
+/// Invoke's own docs, by the key the tutorial sends. The page never sends a
+/// URL. Checked 2026-09-26: the old invoke-ai.github.io docs 301 to invoke.ai.
+pub fn invoke_docs(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "home" => "https://invoke.ai/",
+        "canvas" => "https://invoke.ai/features/canvas/layers-and-drops/",
+        "bbox" => "https://invoke.ai/features/canvas/bounding-box/",
+        "prompting" => "https://invoke.ai/concepts/prompting-guide/",
+        "hotkeys" => "https://invoke.ai/features/hotkeys/",
+        "videos" => "https://invoke.ai/troubleshooting/videos/",
+        _ => return None,
+    })
+}
+
 /// A tutorial signal navigation (same origin, exact path), if `url` is one.
 pub fn tutorial_signal(origin: &Origin, url: &Url) -> Option<TutorialSignal> {
     if &url.origin() != origin {
         return None;
+    }
+    if let Some(key) = url.path().strip_prefix("/__sloptweak/docs/") {
+        return invoke_docs(key).map(TutorialSignal::Docs);
     }
     match url.path().strip_prefix("/__sloptweak/tutorial/")? {
         "done" => Some(TutorialSignal::Done),
@@ -90,7 +115,8 @@ pub fn tutorial_signal(origin: &Origin, url: &Url) -> Option<TutorialSignal> {
     }
 }
 
-/// The overlay with its config and the fallback portrait baked in.
+/// The overlay with its config and the fallback portrait baked in, then the
+/// model-defaults script.
 pub fn tutorial_script(start: &TutorialStart, force: bool) -> String {
     let cfg = serde_json::json!({
         "autoShow": start.auto_show,
@@ -104,7 +130,12 @@ pub fn tutorial_script(start: &TutorialStart, force: bool) -> String {
         "portraitName": "sloptweak-tutorial-portrait.webp",
         "portraitType": "image/webp",
     });
-    format!("{}({cfg});", TUTORIAL_JS.trim_end())
+    format!(
+        "{}({cfg});
+{}",
+        TUTORIAL_JS.trim_end(),
+        DEFAULTS_JS.trim_end()
+    )
 }
 
 impl RemoteWindows {
@@ -276,6 +307,12 @@ mod tests {
             sig("https://a-b.trycloudflare.com/__sloptweak/tutorial/model-page"),
             Some(TutorialSignal::ModelPage)
         );
+        assert_eq!(
+            sig("https://a-b.trycloudflare.com/__sloptweak/docs/canvas"),
+            Some(TutorialSignal::Docs(
+                "https://invoke.ai/features/canvas/layers-and-drops/"
+            ))
+        );
         for n in 1..=TUTORIAL_STAGES {
             let u = format!("https://a-b.trycloudflare.com/__sloptweak/tutorial/stage/{n}");
             assert_eq!(sig(&u), Some(TutorialSignal::Stage(n)));
@@ -293,9 +330,27 @@ mod tests {
             "https://a-b.trycloudflare.com/__sloptweak/tutorial/stage/1/x",
             "https://a-b.trycloudflare.com/__sloptweak/tutorial/model-page/x",
             "https://a-b.trycloudflare.com/x/__sloptweak/tutorial/done",
+            "https://evil.trycloudflare.com/__sloptweak/docs/home",
+            "https://a-b.trycloudflare.com/__sloptweak/docs/",
+            "https://a-b.trycloudflare.com/__sloptweak/docs/https%3A%2F%2Fevil.com",
+            "https://a-b.trycloudflare.com/__sloptweak/docs/home/x",
             "https://a-b.trycloudflare.com/",
         ] {
             assert_eq!(sig(no), None, "{no}");
+        }
+    }
+
+    #[test]
+    fn every_docs_key_in_the_script_has_a_page() {
+        let keys: Vec<&str> = TUTORIAL_JS
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("[\""))
+            .filter_map(|l| l.split('"').next())
+            .collect();
+        assert!(keys.len() >= 5, "{keys:?}");
+        for k in keys {
+            let url = invoke_docs(k).unwrap_or_else(|| panic!("no page for {k}"));
+            assert!(url.starts_with("https://invoke.ai/"), "{url}");
         }
     }
 
@@ -314,6 +369,10 @@ mod tests {
         assert!(s.contains(r#""autoShow":true"#) && s.contains(r#""force":false"#));
         assert!(s.contains(r#""stage":3"#) && s.contains(r#""modelPage":true"#));
         assert!(s.contains(r#""portraitType":"image/webp""#));
+        assert!(
+            s.contains("/api/v1/recall/default"),
+            "model defaults applied"
+        );
         // "RIFF" in base64: the portrait is embedded as WebP.
         let b64 = base64::engine::general_purpose::STANDARD.encode(TUTORIAL_PORTRAIT);
         assert!(b64.starts_with("UklGR") && s.contains(&b64));

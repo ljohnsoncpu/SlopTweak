@@ -13,10 +13,17 @@
 //
 // Usage (from app/):  node dev/vast-acceptance.mjs [r1] [r2] [r3]
 //   TEST_MODEL=<catalog id>  pick this model before Start (default: first)
-//   GENERATE=1               in R1, type a prompt in Invoke and make one image
+//   GENERATE=1|2             in R1, type a prompt in Invoke and make 1 (or 2,
+//                            to time a warm model) images; logs model/steps/
+//                            CFG, checks they're the model's defaults, saves
+//                            the images to OUT
 //   MAX_DPH=0.5 MAX_SESSION_MINUTES=60   the app's price and session caps
+//   LOCAL_CATALOG=1          serve this checkout's catalog/catalog.json to the
+//                            app instead of the one on main
+//   READY_TIMEOUT=<minutes>  the app's ready_timeout_minutes (default 15)
 
 import { spawn, execSync } from "node:child_process";
+import { createServer } from "node:http";
 import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, appendFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { servesThisCheckout } from "./vite-check.mjs";
@@ -33,10 +40,13 @@ const DATA_DIR = join(process.env.LOCALAPPDATA ?? "", "com.sloptweak.launcher");
 const HEARTBEAT_MINUTES = 3;
 const runs = process.argv.slice(2).length ? process.argv.slice(2) : ["r1", "r2", "r3"];
 const TEST_MODEL = process.env.TEST_MODEL ?? "";
-const GENERATE = process.env.GENERATE === "1";
+const GENERATE = Number(process.env.GENERATE ?? 0);
 // Spend limits the app runs with (its own max $/hr and session cap).
 const MAX_DPH = Number(process.env.MAX_DPH ?? 0.5);
 const MAX_SESSION_MINUTES = Number(process.env.MAX_SESSION_MINUTES ?? 60);
+const LOCAL_CATALOG = process.env.LOCAL_CATALOG === "1";
+const CATALOG_PORT = 18557;
+const READY_TIMEOUT = Number(process.env.READY_TIMEOUT ?? 15);
 
 mkdirSync(OUT, { recursive: true });
 const LOG = join(OUT, "acceptance.log");
@@ -96,6 +106,7 @@ function launch(tag) {
       SLOPTWEAK_DEV_IMPORT_KEYS: "1",
       SLOPTWEAK_MAIN_DEBUG_PORT: String(MAIN_PORT),
       SLOPTWEAK_REMOTE_DEBUG_PORT: String(REMOTE_PORT),
+      ...(LOCAL_CATALOG ? { SLOPTWEAK_CATALOG_URL: `http://127.0.0.1:${CATALOG_PORT}/catalog.json` } : {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
@@ -213,7 +224,7 @@ async function startAndWaitReady(m, tag) {
     await sleep(3000);
   }
   await m.eval("document.getElementById('start').click()");
-  const s = await follow(m, (s) => s.kind === "ready", 30 * 60000, `${tag} ready`);
+  const s = await follow(m, (s) => s.kind === "ready", (READY_TIMEOUT * 3 + 10) * 60000, `${tag} ready`);
   say(`${tag}: READY instance ${s.instance_id} on offer ${s.offer.offer_id} (${s.offer.gpu_name}, $${s.offer.hourly.toFixed(4)}/hr)`);
   return s;
 }
@@ -227,7 +238,13 @@ async function invokeVisible(tag) {
   const origin = await r.eval("location.origin");
   const ipc = await r.eval(`(async () => { try { await window.__TAURI_INTERNALS__.invoke('get_snapshot'); return 'ALLOWED'; } catch (e) { return 'denied'; } })()`);
   const models = await r.eval("fetch('/api/v2/models/').then(r => r.json()).then(j => (j.models || []).map(m => m.base + '/' + m.type + ':' + m.name))");
-  if (GENERATE) await generateOnce(r, tag);
+  if (GENERATE) {
+    // SlopTweak's page script applies the model's steps/CFG once the UI is up.
+    const applied = await waitFor(() => r.eval("localStorage.getItem('sloptweak.defaults')"), 90000, "model defaults applied").catch(() => null);
+    say(`${tag}: model defaults applied by page script: ${applied}`);
+    await sleep(2000);
+    for (let i = 1; i <= GENERATE; i++) await generateOnce(r, i === 1 ? tag : `${tag}-${i}`);
+  }
   r.ws.close();
   check(`${tag}: Invoke visible in app window`, title.includes("Invoke"), `${title} @ ${origin}`);
   check(`${tag}: remote window IPC denied`, ipc === "denied");
@@ -256,9 +273,35 @@ async function generateOnce(r, tag) {
   const total = await waitFor(async () => {
     const t = await count();
     return t > before ? t : false;
-  }, 10 * 60000, "generated image").catch(() => before);
+  }, 15 * 60000, "generated image").catch(() => before);
   const q = await r.eval("fetch('/api/v1/queue/default/status').then(r => r.json()).then(j => JSON.stringify(j.queue))");
   await r.shot(`${tag}-generated`);
+  if (total > before) {
+    // What Invoke actually used (the model's defaults, if it has any), and
+    // the image itself, so a noise image doesn't count as working.
+    const meta = await r.eval(`(async () => {
+      const j = await (await fetch('/api/v1/images/?order_dir=DESC&starred_first=false&is_intermediate=false&limit=1')).json();
+      const name = j.items[0].image_name;
+      const m = await (await fetch('/api/v1/images/i/' + name + '/metadata')).json();
+      const b = await (await fetch('/api/v1/images/i/' + name + '/full')).arrayBuffer();
+      let bin = ''; new Uint8Array(b).forEach(x => bin += String.fromCharCode(x));
+      return { name, steps: m?.steps, cfg: m?.cfg_scale, scheduler: m?.scheduler, w: m?.width, h: m?.height,
+        model: m?.model?.name, t5: m?.qwen3_encoder?.name ?? m?.text_encoder?.name, vae: m?.vae?.name, png: btoa(bin) };
+    })()`).catch((e) => ({ error: String(e) }));
+    if (meta?.png) writeFileSync(join(OUT, `${tag}-image.png`), Buffer.from(meta.png, "base64"));
+    const { png, ...shown } = meta ?? {};
+    say(`${tag}: image settings ${JSON.stringify(shown)}${png ? `, saved ${tag}-image.png` : ""}`);
+    const models = await r.eval("fetch('/api/v2/models/').then(r => r.json()).then(j => (j.models || []).map(m => ({ name: m.name, base: m.base, type: m.type, variant: m.variant, defaults: m.default_settings })))");
+    say(`${tag}: models ${JSON.stringify(models)}`);
+    const d = (models ?? []).find((m) => m.type === "main")?.defaults;
+    if (d?.steps || d?.cfg_scale) {
+      check(
+        `${tag}: image used the model's default steps/CFG`,
+        (!d.steps || shown.steps === d.steps) && (!d.cfg_scale || shown.cfg === d.cfg_scale),
+        `used ${shown.steps}/${shown.cfg}, defaults ${d.steps}/${d.cfg_scale}`,
+      );
+    }
+  }
   check(`${tag}: image generated`, total > before, `${Math.round((Date.now() - started) / 1000)}s, queue ${q}`);
 }
 
@@ -377,21 +420,39 @@ if (before.size) {
 }
 const creditBefore = await credit();
 say(`credit before: $${creditBefore?.toFixed(4)}`);
-mkdirSync(CONFIG_DIR, { recursive: true });
-const settingsFile = join(CONFIG_DIR, "settings.json");
-// Keep the user's own settings (LoRAs, output folder) and put them back after.
-const settingsBackup = existsSync(settingsFile) ? readFileSync(settingsFile, "utf8") : null;
-writeFileSync(
-  settingsFile,
-  JSON.stringify({ heartbeat_minutes: HEARTBEAT_MINUTES, max_session_minutes: MAX_SESSION_MINUTES, max_dph: MAX_DPH }, null, 2),
-);
 if (existsSync(join(DATA_DIR, "active_instance.json"))) {
   say("refusing to run: an active_instance.json record exists");
   process.exit(2);
 }
 
+const catalogServer = LOCAL_CATALOG
+  ? createServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(readFileSync(join(APP, "..", "catalog", "catalog.json"), "utf8"));
+    }).listen(CATALOG_PORT, "127.0.0.1")
+  : null;
+
 vite = spawn("npx", ["vite", "--port", "1420", "--strictPort"], { cwd: APP, shell: true, windowsHide: true, stdio: "ignore" });
-await waitFor(() => servesThisCheckout(APP), 30000, "vite");
+// npx can take well over 30 s to start vite on a cold cache.
+await waitFor(() => servesThisCheckout(APP), 120000, "vite");
+
+mkdirSync(CONFIG_DIR, { recursive: true });
+const settingsFile = join(CONFIG_DIR, "settings.json");
+// Keep the user's own settings (LoRAs, output folder) and put them back
+// after. The backup is on disk so a killed run can't lose them: if one is
+// left from an earlier run, it's the real copy.
+const backupFile = settingsFile + ".acceptance-backup";
+if (!existsSync(backupFile)) {
+  writeFileSync(backupFile, existsSync(settingsFile) ? readFileSync(settingsFile, "utf8") : "");
+}
+writeFileSync(
+  settingsFile,
+  JSON.stringify(
+    { heartbeat_minutes: HEARTBEAT_MINUTES, max_session_minutes: MAX_SESSION_MINUTES, max_dph: MAX_DPH, ready_timeout_minutes: READY_TIMEOUT },
+    null,
+    2,
+  ),
+);
 
 const created = new Set();
 const tracker = setInterval(async () => {
@@ -420,6 +481,7 @@ try {
   }
 } finally {
   clearInterval(tracker);
+  catalogServer?.close();
   if (app) crash();
   try {
     execSync(`taskkill /T /F /PID ${vite.pid}`, { stdio: "ignore" });
@@ -433,8 +495,10 @@ try {
       await vast("DELETE", `/instances/${i.id}/`);
     }
   }
-  if (settingsBackup !== null) writeFileSync(settingsFile, settingsBackup);
+  const settingsBackup = readFileSync(backupFile, "utf8");
+  if (settingsBackup) writeFileSync(settingsFile, settingsBackup);
   else rmSync(settingsFile, { force: true });
+  rmSync(backupFile, { force: true });
   await sleep(10000);
   const left = (await ourInstances()).filter((i) => !before.has(i.id));
   say(`instances left: ${left.length ? left.map((i) => i.id).join(", ") : "none"}`);

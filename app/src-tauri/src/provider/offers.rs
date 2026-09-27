@@ -49,6 +49,7 @@ pub fn passes(offer: &Offer, q: &OfferQuery) -> bool {
         && offer.disk_space_gb >= q.min_disk_gb
         && offer.cuda_max_good >= q.min_cuda
         && offer.compute_cap >= q.min_compute_cap
+        && offer.cpu_ram_mb >= q.min_ram_gb * 1000.0
         && offer.dph_total.is_finite()
         && offer.inet_down_cost.is_finite()
         && offer.inet_down_cost >= 0.0
@@ -148,6 +149,7 @@ mod tests {
             disk_space_gb: 100.0,
             cuda_max_good: 12.8,
             compute_cap: 860,
+            cpu_ram_mb: 64_000.0,
             geolocation: Some("US".into()),
             machine_id: Some(id + 1000),
         }
@@ -163,6 +165,7 @@ mod tests {
             max_dph: 0.5,
             min_cuda: 12.4,
             min_compute_cap: 750,
+            min_ram_gb: 0.0,
             limit: 64,
         }
     }
@@ -240,6 +243,17 @@ mod tests {
         let mut o = base.clone();
         o.gpu_ram_mb = 12288.0;
         assert!(passes(&o, &q));
+        // A host RAM floor only applies when the model sets one.
+        let mut o = base.clone();
+        o.cpu_ram_mb = 32_000.0;
+        assert!(passes(&o, &q));
+        let big = OfferQuery {
+            min_ram_gb: 48.0,
+            ..q.clone()
+        };
+        assert!(!passes(&o, &big), "small host RAM should be filtered");
+        o.cpu_ram_mb = 64_000.0;
+        assert!(passes(&o, &big));
     }
 
     #[test]

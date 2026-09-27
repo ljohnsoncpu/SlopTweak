@@ -6,6 +6,7 @@ mod civitai;
 mod config;
 mod cost;
 mod diagnostics;
+mod library;
 mod persist;
 mod provider;
 mod redact;
@@ -240,6 +241,19 @@ impl AppState {
                 let (config, default) = (self.config_dir.clone(), self.default_output_dir.clone());
                 Arc::new(move || output_dir(&config, &default))
             },
+            library: library::LibraryStore::new(&self.config_dir),
+            builtins: {
+                let app = self.ui.app.clone();
+                Arc::new(move |model_id: &str| {
+                    app.state::<AppState>()
+                        .catalog
+                        .lock()
+                        .unwrap()
+                        .find(model_id)
+                        .map(library::builtins_of)
+                        .unwrap_or_default()
+                })
+            },
             ui: self.ui.clone(),
         };
         let m = SessionManager::new(deps, Timing::default());
@@ -275,6 +289,9 @@ struct ModelView {
     license_note: String,
     /// The model's own GPU architecture floor, if it sets one.
     min_compute_cap: Option<u32>,
+    min_ram_gb: Option<f64>,
+    price_tier: Option<u8>,
+    good_for: String,
 }
 
 impl From<&Model> for ModelView {
@@ -290,6 +307,9 @@ impl From<&Model> for ModelView {
             nsfw: m.nsfw,
             license_note: m.license_note.clone(),
             min_compute_cap: m.min_compute_cap,
+            min_ram_gb: m.min_ram_gb,
+            price_tier: m.price_tier,
+            good_for: m.good_for.clone(),
         }
     }
 }
@@ -744,6 +764,19 @@ fn on_tutorial_signal(app: &AppHandle, sig: TutorialSignal, last_page: &Mutex<Op
                 if let Err(e) = app.opener().open_url(url.as_str(), None::<&str>) {
                     eprintln!("[sloptweak] couldn't open the model page: {e}");
                 }
+            }
+            return;
+        }
+        // A fixed Invoke docs page (remote::invoke_docs); same rate limit
+        // window, shorter, so a page can't open a tab per signal in a loop.
+        TutorialSignal::Docs(url) => {
+            let mut last = last_page.lock().unwrap();
+            if last.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+                return;
+            }
+            *last = Some(Instant::now());
+            if let Err(e) = app.opener().open_url(url, None::<&str>) {
+                eprintln!("[sloptweak] couldn't open the docs: {e}");
             }
             return;
         }

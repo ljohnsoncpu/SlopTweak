@@ -102,6 +102,55 @@ pub trait SidecarApi: Send + Sync {
         secret: &str,
         item_id: u64,
     ) -> Result<serde_json::Value, SidecarError>;
+
+    // Generic Invoke API calls (templates and workflows, library.rs). `path`
+    // is under `/api/v1/`, one segment each; a last `""` adds the trailing
+    // slash Invoke's collection routes need.
+
+    async fn api_json(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<serde_json::Value, SidecarError>;
+
+    async fn api_bytes(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        max: usize,
+    ) -> Result<Vec<u8>, SidecarError>;
+
+    async fn api_post_json(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, SidecarError>;
+
+    /// Multipart POST: text fields plus an optional file part.
+    async fn api_post_form(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        fields: &[(&str, String)],
+        file: Option<(&str, Vec<u8>)>,
+    ) -> Result<serde_json::Value, SidecarError>;
+}
+
+/// `/api/v1/<path…>`, each segment encoded.
+pub fn invoke_api_url(base: &Url, path: &[&str], query: &[(&str, &str)]) -> Url {
+    let mut segs = vec!["api", "v1"];
+    segs.extend_from_slice(path);
+    let mut u = api_url(base, &segs);
+    if !query.is_empty() {
+        u.query_pairs_mut().extend_pairs(query);
+    }
+    u
 }
 
 /// `/api/v1/images/` gallery query. `starred_first` defaults to true, so it's
@@ -279,9 +328,107 @@ impl SidecarApi for HttpSidecar {
         );
         self.get_json(url, secret).await
     }
+
+    async fn api_json(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<serde_json::Value, SidecarError> {
+        self.get_json(invoke_api_url(base, path, query), secret)
+            .await
+    }
+
+    async fn api_bytes(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        max: usize,
+    ) -> Result<Vec<u8>, SidecarError> {
+        self.get_bytes(invoke_api_url(base, path, &[]), secret, max, 60)
+            .await
+    }
+
+    async fn api_post_json(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, SidecarError> {
+        let req = self
+            .http
+            .post(invoke_api_url(base, path, &[]))
+            .bearer_auth(secret)
+            .json(body);
+        self.send_json(req).await
+    }
+
+    async fn api_post_form(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        fields: &[(&str, String)],
+        file: Option<(&str, Vec<u8>)>,
+    ) -> Result<serde_json::Value, SidecarError> {
+        use reqwest::multipart::{Form, Part};
+        let mut form = Form::new();
+        for (k, v) in fields {
+            form = form.text(k.to_string(), v.clone());
+        }
+        if let Some((k, bytes)) = file {
+            let (name, mime) = image_part_type(&bytes);
+            let part = Part::bytes(bytes)
+                .file_name(name)
+                .mime_str(mime)
+                .map_err(|e| SidecarError::Parse(e.to_string()))?;
+            form = form.part(k.to_string(), part);
+        }
+        let req = self
+            .http
+            .post(invoke_api_url(base, path, &[]))
+            .bearer_auth(secret)
+            .multipart(form);
+        self.send_json(req).await
+    }
+}
+
+/// File name and type for an uploaded image, by its magic bytes.
+fn image_part_type(b: &[u8]) -> (&'static str, &'static str) {
+    if b.starts_with(b"\x89PNG") {
+        ("image.png", "image/png")
+    } else if b.starts_with(b"RIFF") {
+        ("image.webp", "image/webp")
+    } else {
+        ("image.jpg", "image/jpeg")
+    }
 }
 
 impl HttpSidecar {
+    /// Send a POST and read a JSON answer (bounded like a GET).
+    async fn send_json(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<serde_json::Value, SidecarError> {
+        let mut resp = req
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(unreachable)?;
+        check_status(&resp)?;
+        let mut out = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(unreachable)? {
+            if out.len() + chunk.len() > MAX_QUEUE_ITEM_BYTES {
+                return Err(SidecarError::Parse("response is too large".into()));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&out).map_err(|e| SidecarError::Parse(e.to_string()))
+    }
+
     /// GET with the launch secret, reading at most `max` bytes.
     async fn get_bytes(
         &self,
@@ -328,6 +475,29 @@ impl HttpSidecar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invoke_api_urls() {
+        let b = Url::parse("https://a-b.trycloudflare.com/x?y=1").unwrap();
+        assert_eq!(
+            invoke_api_url(&b, &["style_presets", ""], &[]).as_str(),
+            "https://a-b.trycloudflare.com/api/v1/style_presets/"
+        );
+        assert_eq!(
+            invoke_api_url(
+                &b,
+                &["workflows", ""],
+                &[("categories", "user"), ("page", "0")]
+            )
+            .as_str(),
+            "https://a-b.trycloudflare.com/api/v1/workflows/?categories=user&page=0"
+        );
+        // An id can't climb out of its segment.
+        assert_eq!(
+            invoke_api_url(&b, &["workflows", "i", "../../__ticket"], &[]).as_str(),
+            "https://a-b.trycloudflare.com/api/v1/workflows/i/..%2F..%2F__ticket"
+        );
+    }
 
     #[test]
     fn parses_sidecar_payload() {

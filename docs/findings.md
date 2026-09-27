@@ -547,6 +547,95 @@ Spend ~$0.018 (credit $11.3423 → $11.3247). The title check is also in
   settings" below.
 - CivitAI's `baseModel` "Anima" maps to the `anima` family for LoRAs.
 
+## Catalog research: Krea-2 and Kroma (2026-09-26, source only, not live)
+
+This supersedes the "Krea-2 is gated" note above.
+
+- **Invoke 6.14.0+ supports Krea-2 natively** (`BaseModelType.Krea2`,
+  variants `krea2_turbo` / `krea2_base`). The pinned 6.14.1 has it. It
+  accepts a diffusers folder, a single-file `.safetensors` (bf16 or ComfyUI
+  "scaled fp8"), or GGUF. Single-file and GGUF need a separate Qwen3-VL-4B
+  encoder and the Qwen-Image VAE.
+- **Kroma** (`lodestones/Kroma`, rev `b921d45c…`) is **not gated**. Its v0.3
+  files are `kroma-v0.3-turbo.safetensors` (25.64 GB, bf16, 430 tensors) and
+  `kroma-v0.3-base.safetensors` (51.3 GB). The keys are in the native/ComfyUI
+  layout (`blocks.*`, `txtfusion.*`, `first.*`, `tproj.*`). Invoke's
+  `_has_krea2_keys` matches `txtfusion` together with `first`/`tproj`, and
+  `Krea2CheckpointModel` converts native keys to diffusers keys. The variant
+  comes from the filename ("turbo" → Turbo, "base"/"raw" token → Base), so the
+  filenames must be kept.
+- **Krea's own repos** (`krea/Krea-2-Turbo`, `-Raw`) are `gated: auto`, so
+  they need an HF token. **`Comfy-Org/Krea-2` is not gated** and has single
+  files: `text_encoders/qwen3vl_4b_bf16.safetensors` (8.88 GB),
+  `qwen3vl_4b_fp8_scaled.safetensors` (5.24 GB), `vae/qwen_image_vae.safetensors`
+  (253.8 MB), plus Krea-2 Turbo/Raw bf16, fp8_scaled (13.1 GB), and nvfp4
+  transformers.
+- **VAE:** `krea2/vae_compat.py` accepts the Anima-classified Qwen-Image VAE.
+  The Anima catalog entry's `qwen_image_vae.safetensors` already works.
+- **Encoder caveat:** the single-file Qwen3-VL loader fetches config and
+  tokenizer from `Qwen/Qwen3-VL-4B-Instruct` (ungated, Apache-2.0) **at load
+  time**, which is unpinned. The alternative is to install that repo as a
+  folder (8.88 GB, pinnable to rev `ebb281ec…`).
+- **VRAM:** the bf16 Kroma/Krea-2 transformer (25.6 GB) doesn't fit on 24 GB
+  without Invoke's per-model FP8-storage setting (≈12.8 GB), which also needs
+  GPU support (`_device_supports_fp8_storage`). Kroma ships no fp8 file.
+- **License:** HF lists Kroma as `krea-2-community-license` (base weights);
+  the fine-tune delta is MIT. The Krea-2 license terms haven't been reviewed.
+
+### Krea 2 and Kroma live (2026-09-26) ✅ both work
+
+`TEST_MODEL=<id> GENERATE=1 LOCAL_CATALOG=1 node dev/vast-acceptance.mjs r1`,
+11/11 each. Total spend ~$0.58 across all runs below (credit $10.3671 → $9.7833).
+
+- **Registration:** all 3 files per model install through the API as
+  `krea-2/main` (variant `krea2_turbo` for both; Kroma's is read from the
+  filename), `any/qwen3_vl_encoder`, `anima/vae`. The Qwen3-VL config fetch at
+  load time worked.
+- **Krea 2 Turbo** (fp8_scaled) on an RTX 3090 (24 GB, $0.199/hr): Ready in
+  447 s; first image 187 s including the model load.
+- **Kroma Turbo** (bf16, 25.6 GB) on an RTX 3090 ($0.315/hr, 8.8 Gbps): Ready
+  in 541 s; first image 164 s including the load. It runs on 24 GB, but
+  only because Invoke offloads part of it, and the user reports slow gens.
+  **Catalog now asks for 32 GB** (tier $$$; 5090 ≈ $0.59–0.65/hr, A6000
+  $0.48–0.57/hr on 2026-09-26).
+- **Kroma on 48 GB** (RTX A6000, $0.569/hr, 2.4 Gbps): Ready in 905 s (the
+  download alone ~12 min, so a flat 15 min is too tight). First image 99 s
+  including the load (vs 164 s on the 3090); **warm image 12 s at 8 steps /
+  CFG 1**, clean. ~$0.22.
+- ⚠️ **Ready timeout:** Kroma's first try (RTX 3090, 2.3 Gbps listed) took
+  ~14 min to download 31 GB (~36 MB/s) and was dropped at the flat 15 min.
+  The timeout is now `max(setting, 8 + 0.6 min/GB)` (`config::ready_timeout_minutes`;
+  Kroma ≈ 27 min, Krea 2 ≈ 20). The 5-min reattach deadline is unchanged.
+- ⚠️ **Invoke never applies a model's default settings by itself.** Both
+  models were registered with `default_settings` `steps 8, cfg_scale 1`, but
+  the first image used 30 / 7.5 (Krea 2's came out oversaturated with hatching
+  artefacts). In 6.14.1 only `UseDefaultSettingsButton` (the sparkle icon next
+  to the model picker) dispatches `setDefaultSettings`. `modelsLoaded` →
+  `modelSelected` doesn't. Its `aria-label` key `modelManager.useDefaultSettings`
+  is missing from `en.json`.
+- **Fix (as built): `defaults.js`**, injected after `tutorial.js`. Once per
+  origin (a new GPU is a new tunnel origin), when Invoke's UI is up, it reads
+  the main model's `default_settings` and posts `steps`/`cfg_scale` to
+  `POST /api/v1/recall/default`. Invoke stores them as `recall_*` client state
+  and emits `recall_parameters_updated` to connected pages
+  (`setEventListeners.tsx` dispatches `setSteps`/`setCfgScale`). The event is
+  live-only, so the script sends it twice (2 s and 7 s after the UI is up).
+  ✅ **Live:** the POST returned 200 and the open page's Steps/CFG fields
+  changed to 8/1; the next image used 8/1. ⚠️ Invoke's **Invoke button has
+  no aria-label** in 6.14.1, only the text "Invoke" (the first live try
+  waited on the aria-label and never fired). ✅ **End to end** (Krea 2,
+  RTX 3090, 12/12): the script set 8/1 by itself ~8 s after the UI was up,
+  the image used 8/1 and came out clean (55 s including the load). ~$0.07.
+
+| Instance | Offer | Outcome |
+| --- | --- | --- |
+| 52841256 | 30086286, RTX 3090, $0.199/hr | Krea 2 run; destroyed by Stop |
+| 52842700 | 30086286, RTX 3090, $0.201/hr | Kroma; not ready in 15 min, destroyed by the app |
+| 52844373 | 52493301, RTX PRO 4000, $0.306/hr | Kroma retry; run stopped, destroyed via API |
+| 52844585 | 52741273, RTX 3090, $0.315/hr | Kroma run; destroyed by Stop |
+| 52847960 | 52313037, RTX A6000, $0.569/hr | Kroma 48 GB speed run; destroyed by Stop |
+| 52850783 | 52741273, RTX 3090, $0.312/hr | Krea 2 automatic-defaults run; destroyed by Stop |
+
 ## Phase 4 findings (2026-09-25)
 
 ### Canvas results and the gallery (Invoke 6.14.1, source + live)
@@ -629,6 +718,77 @@ Spend ~$0.018 (credit $11.3423 → $11.3247). The title check is also in
   every new GPU.
 - ✅ **Live:** Invoke 6.14.1 registers one `beforeunload` listener, but the
   blocked signal navigation raised no "leave site?" prompt; the page stayed.
+- Tutorial feedback round (2026-09-26): the welcome card opens centered over
+  a dimmed page (the Invoke window covers the app, and a corner card was easy
+  to miss). The step cards start bottom-right and can be dragged by their
+  title line; the position is kept on screen and saved with the tutorial
+  state. A highlight ring marks the next thing to click. It finds the target
+  only by visible text or `aria-label` (Assets, New Canvas from Image, As
+  Raster Layer (Resize), Inpaint Mask, Invoke, Accept), so a UI change just
+  means no ring. It's off while the page is hidden. Checked on a stand-in
+  page, **not yet against live Invoke**.
+- A last step links to Invoke's docs. Links reach the app as
+  `/__sloptweak/docs/<key>`; `remote::invoke_docs` maps each key to a fixed
+  URL (the page never sends a URL), and the app opens it in the default
+  browser, at most once a second. The docs moved: `invoke-ai.github.io/InvokeAI`
+  now 301s to `https://invoke.ai/`, and `support.invoke.ai` no longer
+  resolves (2026-09-26). Pages used: `/`, `/features/canvas/layers-and-drops/`,
+  `/features/canvas/bounding-box/`, `/concepts/prompting-guide/`,
+  `/features/hotkeys/`, `/troubleshooting/videos/` (all 200).
+
+### Templates and workflows (as built, 2026-09-26)
+
+- Invoke keeps prompt templates ("style presets") and workflows in the
+  instance's database, so they die with the GPU. Invoke 6.14.1 API (source
+  at the tag): `GET /api/v1/style_presets/` lists all (Invoke's own are
+  `type: "default"`); `POST /api/v1/style_presets/` is multipart, a `data`
+  JSON field (`name`, `positive_prompt`, `negative_prompt`, `type`,
+  `is_public`) plus an optional `image` (a 256 px thumbnail; ✅ live, `GET
+  …/i/{id}/image` served it back as `image/png`). Non-admins can't create `default` ones; CSV
+  `export`/`import` are admin-only, so they aren't used. Workflows:
+  `GET /api/v1/workflows/?categories=user&page=&per_page=` (items carry
+  `workflow_id`, `name`, `updated_at`), `GET …/i/{id}` → `{workflow: …}`,
+  `POST /api/v1/workflows/` with `{"workflow": …}` minus its `id`. Creates
+  answer 200. Collection routes need the trailing slash (FastAPI would 307).
+- A template's positive prompt holds `{prompt}` where the user's prompt goes;
+  without it Invoke appends the user's prompt (`buildPresetModifiedPrompt`).
+- `library.rs`, through the sidecar with the bearer secret (the proxy passes
+  any method). On Ready, before the Invoke window opens (≤ 30 s), it puts
+  back `library.json` (config dir) plus the running model's catalog
+  templates, skipping names Invoke already has. Every 60 s and in the final
+  pass after the images it saves what changed: new/edited/renamed templates
+  (with their image) and workflows (re-read only when `updated_at` moves).
+  Only ids seen this session count as deleted, so a failed restore never
+  empties the library. A deleted built-in goes to `hidden_builtins`; an
+  edited one is saved as the user's under the same name.
+- Built-in templates live in the catalog (`models[].templates`: name,
+  positive with one `{prompt}`, negative, a ≤ 64 KB base64 JPEG thumbnail of
+  the example image, and `image_source`). A bad template is dropped, not the
+  model. They reach users only once `catalog.json` is on `main`, since the
+  app prefers the online catalog.
+- Sources (user decision 2026-09-26): Banana Splitz XXL and Anima Aesthetic
+  get one "Showcase tags" template each: the tags common to *every*
+  showcase prompt on the CivitAI version (Banana: 10 images → `masterpiece,
+  best quality` + 8 shared negatives; Anima Aesthetic: 7 → `masterpiece,
+  best quality, safe` + the card's 6 negatives). Thumbnails are safe-rated
+  showcase images. Anima Turbo has none: its 9 showcase prompts share no
+  positive tag, and at CFG 1 Invoke ignores negatives. Krea 2 Turbo: 7 styles
+  from the captioned samples on `krea/Krea-2-Turbo` (no negatives, CFG 1).
+  Kroma (no examples on its page) reuses Krea 2's set.
+- ✅ **Live (2026-09-26), `dev/library-acceptance.mjs`, 19/19**, Anima
+  Aesthetic, two RTX 3070 rentals (Quebec, $0.0973/hr, ready in ~2 min):
+  the built-in template and its picture were in Invoke 6.14.1 when the
+  window opened; a template and a copied 17-node default workflow made
+  through Invoke's API were in `library.json` after Stop (workflow without
+  `id`); the second GPU had both back, nothing doubled, and the workflow
+  opened with its graph. Tutorial on real Invoke: welcome centered, step
+  card bottom-right (16 px), the ring found the Assets tab and the Invoke
+  button, the docs link reached the app and the page stayed. Spent ~$0.03.
+
+| Instance | Offer | Outcome |
+| --- | --- | --- |
+| 52837260 | RTX 3070, Quebec, $0.0973/hr | GPU 1 of the library run; destroyed by Stop |
+| 52837502 | RTX 3070, Quebec, $0.0973/hr | GPU 2 of the library run; destroyed by Stop |
 
 ### Phase 4 acceptance (2026-09-25) ✅
 
@@ -994,6 +1154,46 @@ components at the tag. Still to confirm live during tuning.
   fake generations, the WebP upload (decodes at 832×1216), stage signals
   `stage/2`…`stage/5` then `done`, and a new-GPU resume at stage 5. The
   tallest card is 338 px (fits a 720 px window).
+
+### Tutorial v2 + the v1 feedback round (merge, 2026-09-26)
+
+The Krea 2 branch's v1 tutorial changes were ported into v2 when merging
+main (user decision): the home card opens centered over a dimmed page; step
+cards and the minimized pill start bottom-right (16 px) and drag by their
+title line (position kept on screen, saved in the v2 state); a highlight
+ring on steps whose click target is one of the checked 6.14.1 labels
+(Generate, Add Negative Prompt, Create/Choose Prompt Template, Invoke, the
+canvas menu labels, Inpaint Mask, Scale Before Processing / Advanced
+Options, Denoising Strength, Accept, Add Layer, Opacity); and a last
+stage-5 card, "Where to go next", with the Invoke docs links
+(`/__sloptweak/docs/<key>` → `remote::invoke_docs`). Stage 1 no longer
+asks for ✨ since `defaults.js` applies steps/CFG, except for models whose
+catalog settings set a scheduler (Banana Splitz): 6.14.1's recall handler
+has no scheduler case, so there the card still says to click ✨.
+sync-check covers the docs step, the placement, and the centered home card;
+⏳ the ring targets and dragging in v2 aren't checked against live Invoke yet.
+
+### Tutorial v2 copy round (user feedback, 2026-09-26)
+
+- Audience: not assumed technical. The copy keeps Invoke's own UI terms
+  (bbox, Scaled Bbox, Denoising Strength) so the UI makes sense, but drops
+  internals (scheduler, CFG, Scale Before Processing). No talking down:
+  "NSFW content", not "adult pictures".
+- Prompting advice: match the captions the model was trained on. Templates
+  are framed as automating the repeated part (quality tags, standard
+  negative), not a second lesson on reading the model page.
+- "Use ours instead" is always optional; nothing says the GPU starts empty.
+- Regenerating is mentioned twice (stage 1 end, "Keep the best one"), with
+  the note that Random must be on or the same seed gives the same picture.
+- Eye recolor first try is **0.2** (0.3 turned Banana Splitz's eyes too
+  green for the "too weak" demo); the follow-up says the eyes barely change.
+- The visor text goes at the **start** of the prompt (earlier words weigh
+  more). 0.7 was tuned with it at the end; the user judged it fine without a
+  re-tune.
+- Stage 5 moves the card to the bottom left (it covered the layer list); any
+  other stage drops that position, so a replay starts bottom-right again.
+- Checked: all cards in the browser pane via `fake_invoke.py --overlay`;
+  sync-check 60/60, mock-ui 65/65, webview 26/26; cargo test 158, clippy clean.
 
 ### Phase 6 tuning (live, 2026-09-26) ✅
 

@@ -99,8 +99,10 @@ If you close the Invoke window by accident, press **Open Invoke**.
 
 ## 4. The built-in tutorial
 
-The first time Invoke opens, a small guide appears in its corner. It has five
-short stages, all with the same character:
+The first time Invoke opens, a guide appears in the middle of its window. After
+the first step it moves to the bottom-right corner; drag it by its title line if
+it's in the way. A blue outline marks what to click next. It has five short
+stages, all with the same character:
 
 1. **Prompting.** Make the character in the **Generate** tab. The prompt is a
    plain sentence, then tags; the **negative prompt** (`nsfw`) says what you
@@ -117,9 +119,22 @@ short stages, all with the same character:
    **Opacity**, mask it, describe the visor, and use a high denoise. Accept
    doesn't put the picture in the gallery: use **Save To Gallery**.
 
+The last step links to Invoke's own guides (layers, the bounding box, prompts,
+shortcuts, videos); they open in your browser.
+
 You can leave between stages: SlopTweak remembers where you were, even on
 your next GPU. You can skip it or minimize it. To see it again, press
 **Show tutorial** in SlopTweak.
+
+### Prompt templates and workflows
+
+Most models come with **prompt templates** (Invoke's template picker, next to
+the prompt box), made from the example pictures on the model's page. Pick one
+and your prompt is dropped into it.
+
+Templates and workflows you make or change in Invoke are saved on your PC while
+you work and when you Stop, and put back on the next GPU. Delete one in Invoke
+and it's gone for good, built-in ones included.
 
 ## 5. Stop, and where your images are
 
@@ -137,7 +152,8 @@ Your images are in **`Pictures\SlopTweak`** (press **Open output folder**):
 ![Stopped, images saved](images/h4-stopped-saved.png)
 
 The GPU is a fresh machine every time, so anything left only in Invoke is gone
-after Stop. Images already on your PC are safe.
+after Stop, except your templates and workflows (see above). Images already on
+your PC are safe.
 
 **If you forget to stop:** the GPU shuts itself down after 20 idle minutes, after
 4 hours in total, or about 10 minutes after your PC goes to sleep or offline. The

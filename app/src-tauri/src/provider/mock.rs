@@ -112,6 +112,198 @@ struct MockInstance {
     queue: Vec<MockQueueItem>,
     /// Auto-generated gallery images so far (see `MockImages::auto`).
     auto_made: usize,
+    /// Invoke's templates and workflows.
+    library: MockInvokeLibrary,
+}
+
+/// Invoke 6.14.1's template ("style preset") and workflow routes, in memory:
+/// just enough of their shapes for library.rs.
+#[derive(Debug, Default)]
+pub struct MockInvokeLibrary {
+    /// Style preset records, as `GET /api/v1/style_presets/` lists them.
+    pub presets: Vec<serde_json::Value>,
+    pub preset_images: HashMap<String, Vec<u8>>,
+    /// Workflow records with their `workflow`.
+    pub workflows: Vec<serde_json::Value>,
+    next: u64,
+    clock: u64,
+}
+
+impl MockInvokeLibrary {
+    fn id(&mut self, prefix: &str) -> String {
+        self.next += 1;
+        format!("{prefix}-{}", self.next)
+    }
+
+    fn stamp(&mut self) -> String {
+        self.clock += 1;
+        format!(
+            "2026-09-26 10:{:02}:{:02}.000",
+            self.clock / 60 % 60,
+            self.clock % 60
+        )
+    }
+
+    /// Add a template as the user would in Invoke.
+    #[cfg(test)]
+    pub fn add_preset(&mut self, name: &str, positive: &str, negative: &str) -> String {
+        let id = self.id("sp");
+        self.presets.push(serde_json::json!({
+            "id": id, "name": name, "type": "user", "user_id": "system", "is_public": false,
+            "image": null,
+            "preset_data": {"positive_prompt": positive, "negative_prompt": negative}
+        }));
+        id
+    }
+
+    /// Add a workflow as the user would in Invoke.
+    #[cfg(test)]
+    pub fn add_workflow(&mut self, name: &str, nodes: serde_json::Value) -> String {
+        let id = self.id("wf");
+        let wf = serde_json::json!({
+            "id": id, "name": name, "author": "", "description": "", "version": "1.0.0",
+            "contact": "", "tags": "", "notes": "", "exposedFields": [],
+            "meta": {"version": "3.0.0", "category": "user"},
+            "nodes": nodes, "edges": []
+        });
+        let t = self.stamp();
+        self.workflows.push(serde_json::json!({
+            "workflow_id": id, "name": name, "created_at": t, "updated_at": t,
+            "user_id": "system", "is_public": false, "workflow": wf
+        }));
+        id
+    }
+
+    /// Change a workflow's graph, as saving it in Invoke would.
+    #[cfg(test)]
+    pub fn touch_workflow(&mut self, id: &str, nodes: serde_json::Value) {
+        let t = self.stamp();
+        if let Some(r) = self.workflows.iter_mut().find(|r| r["workflow_id"] == id) {
+            r["workflow"]["nodes"] = nodes;
+            r["updated_at"] = t.into();
+        }
+    }
+
+    pub fn get(
+        &self,
+        path: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<serde_json::Value, SidecarError> {
+        match path {
+            ["style_presets", ""] => {
+                let mut all = vec![serde_json::json!({
+                    "id": "default-1", "name": "Invoke's own", "type": "default",
+                    "user_id": "system", "is_public": true, "image": null,
+                    "preset_data": {"positive_prompt": "{prompt}", "negative_prompt": ""}
+                })];
+                all.extend(self.presets.iter().cloned());
+                Ok(serde_json::Value::Array(all))
+            }
+            ["workflows", ""] => {
+                let q = |k: &str| query.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+                if q("categories") != Some("user") {
+                    return Err(SidecarError::Http(422));
+                }
+                let per: usize = q("per_page")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(usize::MAX);
+                let page: usize = q("page").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let items: Vec<_> = self
+                    .workflows
+                    .iter()
+                    .skip(page.saturating_mul(per))
+                    .take(per)
+                    .map(|r| {
+                        serde_json::json!({
+                            "workflow_id": r["workflow_id"], "name": r["name"],
+                            "updated_at": r["updated_at"], "category": "user"
+                        })
+                    })
+                    .collect();
+                let total = self.workflows.len();
+                Ok(serde_json::json!({
+                    "items": items, "page": page, "per_page": per, "total": total,
+                    "pages": total.div_ceil(per.max(1)).max(1)
+                }))
+            }
+            ["workflows", "i", id] => self
+                .workflows
+                .iter()
+                .find(|r| r["workflow_id"] == *id)
+                .cloned()
+                .ok_or(SidecarError::Http(404)),
+            _ => Err(SidecarError::Http(404)),
+        }
+    }
+
+    pub fn post_json(
+        &mut self,
+        path: &[&str],
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, SidecarError> {
+        if path != ["workflows", ""] {
+            return Err(SidecarError::Http(404));
+        }
+        let mut wf = body["workflow"].clone();
+        if !wf.is_object() || wf.get("id").is_some() || wf["meta"]["category"] != "user" {
+            return Err(SidecarError::Http(422));
+        }
+        let id = self.id("wf");
+        wf["id"] = id.clone().into();
+        let t = self.stamp();
+        let rec = serde_json::json!({
+            "workflow_id": id, "name": wf["name"], "created_at": t, "updated_at": t,
+            "user_id": "system", "is_public": false, "workflow": wf
+        });
+        self.workflows.push(rec.clone());
+        Ok(rec)
+    }
+
+    pub fn post_form(
+        &mut self,
+        path: &[&str],
+        fields: &[(&str, String)],
+        file: Option<(&str, Vec<u8>)>,
+    ) -> Result<serde_json::Value, SidecarError> {
+        if path != ["style_presets", ""] {
+            return Err(SidecarError::Http(404));
+        }
+        let data: serde_json::Value = fields
+            .iter()
+            .find(|(k, _)| *k == "data")
+            .and_then(|(_, v)| serde_json::from_str(v).ok())
+            .ok_or(SidecarError::Http(400))?;
+        if data["type"] != "user" {
+            return Err(SidecarError::Http(403));
+        }
+        let id = self.id("sp");
+        let image = file.filter(|(k, _)| *k == "image").map(|(_, b)| b);
+        let rec = serde_json::json!({
+            "id": id, "name": data["name"], "type": "user", "user_id": "system",
+            "is_public": false,
+            "image": image.as_ref().map(|_| format!("api/v1/style_presets/i/{id}/image")),
+            "preset_data": {
+                "positive_prompt": data["positive_prompt"],
+                "negative_prompt": data["negative_prompt"]
+            }
+        });
+        if let Some(b) = image {
+            self.preset_images.insert(id.clone(), b);
+        }
+        self.presets.push(rec.clone());
+        Ok(rec)
+    }
+
+    pub fn bytes(&self, path: &[&str]) -> Result<Vec<u8>, SidecarError> {
+        match path {
+            ["style_presets", "i", id, "image"] => self
+                .preset_images
+                .get(*id)
+                .cloned()
+                .ok_or(SidecarError::Http(404)),
+            _ => Err(SidecarError::Http(404)),
+        }
+    }
 }
 
 /// A queue item that ran a canvas graph: its `canvas_output` image, plus a
@@ -387,6 +579,7 @@ fn default_offers() -> Vec<Offer> {
         disk_space_gb: 120.0,
         cuda_max_good: 12.8,
         compute_cap: 860,
+        cpu_ram_mb: 64_000.0,
         geolocation: Some("Mockland".into()),
         machine_id: Some(id * 10),
     };
@@ -447,6 +640,7 @@ impl GpuProvider for MockProvider {
                 images: Vec::new(),
                 queue: Vec::new(),
                 auto_made: 0,
+                library: MockInvokeLibrary::default(),
             },
         );
         if s.instances[&id].behavior == MockBehavior::LostCreateResponse {
@@ -664,9 +858,61 @@ impl SidecarApi for MockSidecar {
                 .ok_or(SidecarError::Http(404))
         })
     }
+
+    async fn api_json(
+        &self,
+        _base: &Url,
+        secret: &str,
+        path: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<serde_json::Value, SidecarError> {
+        self.with_instance(secret, |inst, _| inst.library.get(path, query))
+    }
+
+    async fn api_bytes(
+        &self,
+        _base: &Url,
+        secret: &str,
+        path: &[&str],
+        _max: usize,
+    ) -> Result<Vec<u8>, SidecarError> {
+        self.with_instance(secret, |inst, _| inst.library.bytes(path))
+    }
+
+    async fn api_post_json(
+        &self,
+        _base: &Url,
+        secret: &str,
+        path: &[&str],
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, SidecarError> {
+        self.with_instance(secret, |inst, _| inst.library.post_json(path, body))
+    }
+
+    async fn api_post_form(
+        &self,
+        _base: &Url,
+        secret: &str,
+        path: &[&str],
+        fields: &[(&str, String)],
+        file: Option<(&str, Vec<u8>)>,
+    ) -> Result<serde_json::Value, SidecarError> {
+        self.with_instance(secret, |inst, _| inst.library.post_form(path, fields, file))
+    }
 }
 
 impl MockSidecar {
+    /// Change the fake Invoke's templates/workflows (tests), by launch secret.
+    #[cfg(test)]
+    pub fn with_library<T>(
+        &self,
+        secret: &str,
+        f: impl FnOnce(&mut MockInvokeLibrary) -> T,
+    ) -> Option<T> {
+        self.with_instance(secret, |inst, _| Ok(f(&mut inst.library)))
+            .ok()
+    }
+
     /// Like `with_instance`, after catching up on auto-generated images.
     fn with_images<T>(
         &self,
