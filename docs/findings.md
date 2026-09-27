@@ -1195,6 +1195,45 @@ sync-check covers the docs step, the placement, and the centered home card;
 - Checked: all cards in the browser pane via `fake_invoke.py --overlay`;
   sync-check 60/60, mock-ui 65/65, webview 26/26; cargo test 158, clippy clean.
 
+### Closing the Invoke window asks to stop (2026-09-27)
+
+- Closing the Invoke window while a session is active shows a native
+  "Stop renting the GPU?" prompt (`ask_stop_on_invoke_close`, lib.rs). The
+  remote window has no capabilities, so it's a Rust-side dialog.
+- tauri-plugin-dialog 2.7.3 → rfd 0.16 with `common-controls-v6`: a
+  **TaskDialog** with Yes/No common buttons and `nDefaultButton: 0`, so the
+  first button (**Yes**) is the default (Windows docs). It also allows
+  cancellation (Esc, its own X) → `Cancel`; we treat that as "never mind"
+  and leave Invoke open. Yes → close + `request_stop`; No → close only.
+- `dev/win-dialog.mjs` drives it by window message (WM_CLOSE on the Invoke
+  window, `TDM_CLICK_BUTTON` on the dialog). sync-check 64/64 covers Cancel,
+  No, and Yes (state `ready`/`ready`/`idle`).
+
+### Codex beta-risk review of v0.2.3 (2026-09-27)
+
+Four points; verdicts after checking the code:
+
+1. **Missing `CONTAINER_ID`/`CONTAINER_API_KEY` → no self-destroy.** Not a
+   live risk. The tunnel host reaches the app only through the instance
+   label, and `provision.sh` publishes that label with the same credential.
+   Without it the app never connects, the attempt fails at the ready
+   timeout, and the app destroys it with the user's key. Vast has always
+   set both (§2). Not changed (it would need a new asset bundle and a paid
+   run).
+2. **Ambiguous create found late → untracked until restart.** Valid. After
+   `find_created` gives up (~15 s), `destroy_late_create` keeps polling for
+   the attempt's unique label for 10 min and destroys the instance if it
+   appears. It matches only that label, so a friend's session on a shared
+   account is never touched. Test: `late_create_is_destroyed_in_the_background`
+   (mock `LateCreate`).
+3. **Output folder changed mid-session → earlier images look missing.**
+   Valid (UX). The folder is now locked while a session is active:
+   `pick_output_folder`/`reset_output_folder` refuse, and Settings disables
+   the buttons with a note. sync-check covers it.
+4. **Unsigned installer.** Known; SignPath is pending. Until then, send the
+   release link and the SHA-256 from the release notes through a trusted
+   channel.
+
 ### Phase 6 tuning (live, 2026-09-26) ✅
 
 Three held sessions (`dev/phase6-session.mjs`), one per catalog model; all

@@ -95,7 +95,9 @@ spent, and your credit left.
 
 ![Running](images/h3-ready.png)
 
-If you close the Invoke window by accident, press **Open Invoke**.
+When you close the Invoke window, SlopTweak asks whether to stop renting the
+GPU too. **Yes** (the default) stops it and saves your images; **No** keeps it
+running, and **Open Invoke** brings the window back.
 
 ## 4. The built-in tutorial
 

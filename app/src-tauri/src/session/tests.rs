@@ -495,6 +495,27 @@ async fn lost_create_response_is_reconciled_by_label() {
     assert!(h.mock.live_ids().is_empty());
 }
 
+/// Money rule: a create that went through but shows up only after the
+/// create call's own check gave up is still found and destroyed while the
+/// app stays open, not only at the next launch.
+#[tokio::test(start_paused = true)]
+async fn late_create_is_destroyed_in_the_background() {
+    let h = harness(vec![MockBehavior::LateCreate(Duration::from_secs(90))]);
+    start(&h);
+    let s = wait_for(&h.mgr, |s| matches!(s, SessionState::Failed { .. })).await;
+    let SessionState::Failed { reason } = s else {
+        panic!()
+    };
+    assert!(reason.contains("shows up"), "{reason}");
+    assert_eq!(h.mock.created_offers().len(), 1, "no second rental");
+    assert_eq!(h.mock.live_ids().len(), 1, "the late instance exists");
+    tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+    assert!(
+        h.mock.live_ids().is_empty(),
+        "the late instance was destroyed"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn three_failures_give_a_plain_message_and_leave_nothing_running() {
     let h = harness(vec![

@@ -36,6 +36,9 @@ pub enum MockBehavior {
     Unavailable,
     /// The instance is created but the create response is lost.
     LostCreateResponse,
+    /// Like `LostCreateResponse`, but the provider only lists the instance
+    /// after this long (too late for the create call's own check).
+    LateCreate(Duration),
     /// Provisioning reports `failed` with this detail.
     ProvisionFails(String),
     /// Becomes ready, then the watchdog destroys it after this long.
@@ -60,6 +63,7 @@ pub fn parse_script(script: &str) -> Vec<MockBehavior> {
             "stuck" => Some(MockBehavior::NeverStarts),
             "taken" => Some(MockBehavior::Unavailable),
             "lostcreate" => Some(MockBehavior::LostCreateResponse),
+            "latecreate" => Some(MockBehavior::LateCreate(Duration::from_secs(60))),
             "provfail" => Some(MockBehavior::ProvisionFails("download failed: mock".into())),
             "selfdestruct" => Some(MockBehavior::SelfDestructAfterReady(Duration::from_secs(
                 120,
@@ -114,6 +118,13 @@ struct MockInstance {
     auto_made: usize,
     /// Invoke's templates and workflows.
     library: MockInvokeLibrary,
+}
+
+impl MockInstance {
+    /// Not listed by the provider yet (`LateCreate`).
+    fn hidden(&self) -> bool {
+        matches!(self.behavior, MockBehavior::LateCreate(d) if self.created.elapsed() < d)
+    }
 }
 
 /// Invoke 6.14.1's template ("style preset") and workflow routes, in memory:
@@ -337,11 +348,14 @@ impl MockQueueItem {
 }
 
 impl MockInstance {
-    /// Time since creation, minus any simulated slow image pull.
+    /// Time since creation, minus any simulated slow image pull or late
+    /// listing.
     fn age(&self) -> Duration {
         let raw = self.created.elapsed();
         match self.behavior {
             MockBehavior::SlowPull(d) => raw.saturating_sub(d),
+            // Boots from when the provider starts listing it.
+            MockBehavior::LateCreate(d) => raw.saturating_sub(d),
             _ => raw,
         }
     }
@@ -643,7 +657,10 @@ impl GpuProvider for MockProvider {
                 library: MockInvokeLibrary::default(),
             },
         );
-        if s.instances[&id].behavior == MockBehavior::LostCreateResponse {
+        if matches!(
+            s.instances[&id].behavior,
+            MockBehavior::LostCreateResponse | MockBehavior::LateCreate(_)
+        ) {
             return Err(ProviderError::Network("mock: response lost".into()));
         }
         Ok(id)
@@ -654,7 +671,7 @@ impl GpuProvider for MockProvider {
         self.reap(&mut s);
         Ok(s.instances
             .get(&id)
-            .filter(|i| !i.destroyed)
+            .filter(|i| !i.destroyed && !i.hidden())
             .map(|i| self.info(id, i)))
     }
 
@@ -664,7 +681,7 @@ impl GpuProvider for MockProvider {
         let mut out: Vec<InstanceInfo> = s
             .instances
             .iter()
-            .filter(|(_, i)| !i.destroyed)
+            .filter(|(_, i)| !i.destroyed && !i.hidden())
             .map(|(id, i)| self.info(*id, i))
             .collect();
         out.sort_by_key(|i| i.id);

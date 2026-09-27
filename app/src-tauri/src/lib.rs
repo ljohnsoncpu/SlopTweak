@@ -18,13 +18,16 @@ mod sync;
 mod updater;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_clipboard_manager::ClipboardExt;
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{
+    DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
+};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 use url::Url;
@@ -683,6 +686,7 @@ async fn pick_output_folder(
     app: AppHandle,
     st: State<'_, AppState>,
 ) -> Result<SettingsView, String> {
+    output_folder_unlocked(&app)?;
     let current = st.output_dir();
     let mut dialog = app
         .dialog()
@@ -710,7 +714,11 @@ async fn pick_output_folder(
 }
 
 #[tauri::command]
-async fn reset_output_folder(st: State<'_, AppState>) -> Result<SettingsView, String> {
+async fn reset_output_folder(
+    app: AppHandle,
+    st: State<'_, AppState>,
+) -> Result<SettingsView, String> {
+    output_folder_unlocked(&app)?;
     update_settings(&st, |u| {
         u.output_dir = None;
         Ok(())
@@ -1127,6 +1135,60 @@ fn session_active(app: &AppHandle) -> bool {
     m.is_some_and(|m| m.is_busy() || m.state().is_active())
 }
 
+/// The output folder is fixed while a GPU runs: sync skips images it already
+/// saved, so after a change the earlier ones would stay in the old folder and
+/// look missing.
+fn output_folder_unlocked(app: &AppHandle) -> Result<(), String> {
+    if session_active(app) {
+        return Err(
+            "Stop the GPU to change the folder. Images from this session are already \
+             going to the current one."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Closing the Invoke window while a GPU is rented: ask whether to stop
+/// renting it too. Yes is the default button. Either answer closes the
+/// window; "Open Invoke" in the main window brings it back. The remote page
+/// can't show app UI, so this is a native dialog. Dismissing the dialog
+/// (Esc, its X) cancels: the Invoke window stays open.
+fn ask_stop_on_invoke_close(window: &tauri::Window) {
+    static ASKING: AtomicBool = AtomicBool::new(false);
+    if ASKING.swap(true, Ordering::SeqCst) {
+        return; // already asking (the X was clicked again)
+    }
+    let app = window.app_handle().clone();
+    window
+        .dialog()
+        .message(
+            "Do you want to stop renting the GPU too?\n\n\
+             Yes: stop it now. Your images are saved to your PC first.\n\
+             No: keep it running. You can reopen Invoke from SlopTweak, \
+             and you're still paying while it runs.",
+        )
+        .title("Stop renting the GPU?")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::YesNo)
+        .parent(window)
+        .show_with_result(move |answer| {
+            let st = app.state::<AppState>();
+            match answer {
+                MessageDialogResult::Yes => {
+                    st.ui.remote.close();
+                    if let Ok(m) = st.manager() {
+                        m.request_stop();
+                    }
+                }
+                MessageDialogResult::No => st.ui.remote.close(),
+                // Esc or the dialog's own X: changed their mind; Invoke stays open.
+                _ => {}
+            }
+            ASKING.store(false, Ordering::SeqCst);
+        });
+}
+
 /// While a GPU bills: push the cost bar to the UI and the Invoke window's
 /// title, and refresh the credit every few minutes.
 async fn cost_loop(app: AppHandle) {
@@ -1282,6 +1344,15 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label().starts_with(remote::LABEL_PREFIX) {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    if session_active(window.app_handle()) {
+                        api.prevent_close();
+                        ask_stop_on_invoke_close(window);
+                    }
+                }
+                return;
+            }
             if window.label() != "main" {
                 return;
             }

@@ -405,6 +405,9 @@ pub struct Timing {
     /// Most the Invoke window waits for saved templates and workflows to be
     /// put back.
     pub library_restore: Duration,
+    /// After a create that may have gone through but wasn't found, how long
+    /// to keep looking for it (and destroy it) in the background.
+    pub late_create: Duration,
 }
 
 impl Timing {
@@ -426,6 +429,7 @@ impl Default for Timing {
             final_sync_gone: Duration::from_secs(15),
             library_every: Duration::from_secs(60),
             library_restore: Duration::from_secs(30),
+            late_create: Duration::from_secs(10 * 60),
         }
     }
 }
@@ -441,7 +445,8 @@ pub struct Deps {
     pub machines: MachineFile,
     /// Which images each instance has already saved.
     pub syncs: SyncStore,
-    /// Where images go; read on every pass so a folder change applies at once.
+    /// Where images go. The app refuses a change while a session is active
+    /// (lib.rs `output_folder_unlocked`).
     pub output_dir: OutputDir,
     /// The user's templates and workflows, kept across GPUs.
     pub library: LibraryStore,
@@ -1014,9 +1019,10 @@ impl SessionManager {
                 }
                 Err(e) => {
                     let reason = if e.create_may_have_succeeded() {
+                        tokio::spawn(self.clone().destroy_late_create(spec.label.clone()));
                         format!(
-                            "Couldn't rent the GPU: {e}. If a GPU shows up in the Vast console \
-                             anyway, SlopTweak offers to shut it down next time it starts."
+                            "Couldn't rent the GPU: {e}. If Vast made one anyway, SlopTweak \
+                             shuts it down as soon as it shows up."
                         )
                     } else {
                         format!("Couldn't rent the GPU: {e}")
@@ -1638,6 +1644,39 @@ impl SessionManager {
         }
         self.log("no instance was created");
         None
+    }
+
+    /// After a create that may have gone through but `find_created` didn't
+    /// find: keep looking for its label for `timing.late_create`, and destroy
+    /// the instance if the provider lists it late, so it can't bill unnoticed
+    /// while the app stays open. The label is unique to that attempt, so no
+    /// other instance (another session, a friend on the same account) is
+    /// touched. Setup swaps the label for the tunnel's only once the image is
+    /// pulled and the sidecar runs (minutes), so a 10 s poll sees it first;
+    /// past that, the sidecar's watchdog destroys an instance nobody
+    /// heartbeats.
+    async fn destroy_late_create(self: Arc<Self>, label: String) {
+        let deadline = Instant::now() + self.timing.late_create;
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let Ok(list) = self.deps.provider.list_instances().await else {
+                continue;
+            };
+            if let Some(i) = list.iter().find(|i| i.label.as_deref() == Some(&label)) {
+                self.log(format!(
+                    "the failed rental made instance {} after all; shutting it down",
+                    i.id
+                ));
+                if !self.destroy_confirmed(i.id).await {
+                    self.log(format!(
+                        "couldn't confirm instance {} is gone; SlopTweak offers to shut it \
+                         down next time it starts",
+                        i.id
+                    ));
+                }
+                return;
+            }
+        }
     }
 
     /// Destroy, then poll until the provider no longer lists the instance.

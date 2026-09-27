@@ -26,6 +26,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { servesThisCheckout } from "./vite-check.mjs";
+import { closeWindow, pressDialog, IDCANCEL, IDNO, IDYES } from "./win-dialog.mjs";
+import { windowTitles } from "./win-titles.mjs";
 
 const APP = resolve(import.meta.dirname, "..");
 const ROOT = resolve(APP, "..");
@@ -232,6 +234,9 @@ async function main() {
     await sleep(1500);
     await startSession(m, ipc);
     check("mock session reaches Ready through the real sidecar", true);
+    const lockMsg = await m.eval(`window.__TAURI_INTERNALS__.invoke("reset_output_folder").then(() => "changed", (e) => String(e))`);
+    const lockBtn = await m.eval(`document.getElementById("out-pick").disabled`);
+    check("the output folder can't change while the GPU runs", lockMsg.includes("Stop the GPU") && lockBtn === true, `${lockMsg}; disabled=${lockBtn}`);
 
     // ----- tutorial -----
     let r = await remotePage();
@@ -408,8 +413,31 @@ async function main() {
     await sleep(1000);
     check("× closes it again", (await cardText(r)) === "");
     r.ws.close();
-    await m.eval("document.getElementById('stop').click()");
-    await waitFor(async () => (await ipc("get_snapshot")).state.kind === "idle", 120000, "idle after the second Stop");
+
+    // ----- closing the Invoke window asks whether to stop renting -----
+    // Native TaskDialog: found by title, buttons pressed by window message.
+    const INV = "SlopTweak — Invoke";
+    const ASK = "Stop renting the GPU?";
+    const titles = () => windowTitles(app.pid);
+    const invokeOpen = () => titles().some((t) => t.startsWith(INV));
+    const kind = async () => (await ipc("get_snapshot")).state.kind;
+    const asked = () => waitFor(() => titles().includes(ASK), 10000, "stop prompt").then(() => true, () => false);
+    check("closing Invoke asks whether to stop renting", closeWindow(app.pid, INV) === "ok" && (await asked()), titles().join(" | "));
+    pressDialog(app.pid, ASK, IDCANCEL);
+    await sleep(1500);
+    check("dismissing the prompt keeps Invoke open and the GPU running", invokeOpen() && (await kind()) === "ready", `${titles().join(" | ")}; ${await kind()}`);
+    closeWindow(app.pid, INV);
+    await asked();
+    pressDialog(app.pid, ASK, IDNO);
+    await sleep(1500);
+    check("No closes Invoke and keeps the GPU", !invokeOpen() && (await kind()) === "ready", `${titles().join(" | ")}; ${await kind()}`);
+    await ipc("open_invoke");
+    await waitFor(invokeOpen, 15000, "Invoke reopened").catch(() => false);
+    closeWindow(app.pid, INV);
+    await asked();
+    pressDialog(app.pid, ASK, IDYES);
+    const stopped = await waitFor(async () => (await kind()) === "idle", 120000, "idle after Yes").then(() => true, () => false);
+    check("Yes closes Invoke and stops the GPU", stopped && !invokeOpen(), `${titles().join(" | ")}; ${await kind()}`);
     m.ws.close();
   } finally {
     if (backup !== null) writeFileSync(SETTINGS, backup);
