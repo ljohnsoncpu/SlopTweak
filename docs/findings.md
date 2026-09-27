@@ -1328,6 +1328,15 @@ $0 checks at the same commit: cargo test 144, clippy, `npm run build`,
 mock-ui-check 65/65, webview-check 26/26, sync-check 50/50, instance
 pytest 33, ruff/mypy, `build_assets.py --check-pin`.
 
+## Release 0.2.3 check (2026-09-26) ✅
+
+Krea 2 / Kroma catalog, automatic model defaults, saved templates and
+workflows, and the tutorial copy round (PR #12). `instance/` is unchanged
+(bundle pin `16e68e06…`, `--check-pin` matches), so `releasing.md` step 2's
+real-Vast run was not repeated; PR #12's live runs cover the app changes.
+$0 checks: cargo test 158, clippy, `npm run build`, mock-ui-check 65/65,
+webview-check 26/26, sync-check 60/60, instance pytest 33, ruff/mypy.
+
 ## Still open
 
 - ~~Live upstream catalog edit~~ **done (2026-09-25).** Merging PR #3
