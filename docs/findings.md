@@ -627,6 +627,33 @@ This supersedes the "Krea-2 is gated" note above.
   RTX 3090, 12/12): the script set 8/1 by itself ~8 s after the UI was up,
   the image used 8/1 and came out clean (55 s including the load). ~$0.07.
 
+### Wulver Turbo (2026-09-30) ✅ live, 14/14
+
+- CivitAI model 2881657 ("Wulver (Krea - 2)", by Vaelico) is a full fine-tune
+  of Krea 2 Raw. Its CivitAI page returns 403 to scripted fetches; the API
+  (`/api/v1/models/2881657`) works. The files are mirrored, ungated, on
+  `Vaelico/Wulver` (rev `c77ac3a1…`), so the catalog uses Hugging Face (no
+  CivitAI key, pinned revision).
+- **v0.5 "Turbo" files have the official Krea 2 Turbo LoRA merged in**
+  (8 steps, CFG 1, euler/simple). `non_turbo_*` is the undistilled base
+  (52 steps, CFG 3.5). Catalog uses `Wulver_v0.5_bf16.safetensors`
+  (25.64 GB, same 430-tensor native layout as Kroma), saved as
+  `wulver-v0.5-turbo.safetensors` so Invoke reads the Turbo variant.
+- ⚠️ **fp8 not used.** `Wulver_v0.5_fp8_e4m3fn.safetensors` (12.8 GB) is a
+  plain cast: 265 `F8_E4M3` tensors and no `*.weight_scale`. Invoke 6.14.1's
+  Krea 2 loader only dequantizes ComfyUI scaled fp8 (`weight_scale`), so it
+  would likely load raw float8. A 24 GB entry would need a live test.
+  int8/w4a8 are ComfyUI-only. GGUF is only on CivitAI (needs the key).
+- ✅ **Live** (`TEST_MODEL=wulver-turbo GENERATE=2 LOCAL_CATALOG=1`, RTX 5090,
+  $0.663/hr, Switzerland host at 14.4 Gbps): Ready in 600 s (27 GB download
+  ~8 min); registered as `krea-2/main` variant `krea2_turbo`; the page script
+  applied 8 / CFG 1 by itself; first image 17 s (including the load), warm
+  image 7 s, both clean at 1024. Spend ~$0.07; Stop destroyed instance
+  53628849 and Vast showed none left.
+- Catalog gap noticed: `krea-2-turbo` and `kroma-turbo` have no
+  `default_settings` in `catalog.json`, although the section above says they
+  were registered with 8 / CFG 1.
+
 | Instance | Offer | Outcome |
 | --- | --- | --- |
 | 52841256 | 30086286, RTX 3090, $0.199/hr | Krea 2 run; destroyed by Stop |
