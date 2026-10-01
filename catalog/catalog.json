@@ -144,7 +144,7 @@
     {
       "id": "krea-2-turbo",
       "name": "Krea 2 Turbo",
-      "description": "12B general-purpose model by Krea, strong at photoreal and varied styles. SlopTweak sets it to 8 steps and CFG 1 when Invoke opens. Needs a 24 GB GPU and a host with plenty of RAM, so it rents for more than the anime models.",
+      "description": "12B general-purpose model by Krea, strong at photoreal and varied styles. SlopTweak sets it to 8 steps and CFG 1 when Invoke opens. Needs a 24 GB GPU and a host with plenty of RAM, so it rents for more than the anime models. Also installs the SNOFS LoRA (adult-content LoKR by Ashen3, v1.4, 1.5 GB), which needs a CivitAI key; add it from the LoRA panel in Invoke to use it.",
       "good_for": "Photoreal and general images",
       "price_tier": 2,
       "base": "krea-2",
@@ -178,12 +178,20 @@
           "size_bytes": 253806246,
           "kind": "vae",
           "requires_civitai_token": false
+        },
+        {
+          "url": "https://civitai.com/api/download/models/3290120?fileId=3174557",
+          "filename": "snofs_krea_v1_4.safetensors",
+          "sha256": "767888EDDE83003F14CF930F13F174FE2A7431E252A515DDF04BD93D382A8932",
+          "size_bytes": 1562410296,
+          "kind": "lora",
+          "requires_civitai_token": true
         }
       ],
       "min_vram_gb": 24,
       "min_compute_cap": 800,
       "min_ram_gb": 48,
-      "nsfw": false,
+      "nsfw": true,
       "license_note": "Krea 2 Community License: free for personal use and for businesses under $1M/yr revenue. It asks you to take reasonable steps against generating prohibited or unlawful content.",
       "invoke_min_version": "6.14.1",
       "templates": [

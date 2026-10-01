@@ -654,6 +654,15 @@ This supersedes the "Krea-2 is gated" note above.
   `default_settings` in `catalog.json`, although the section above says they
   were registered with 8 / CFG 1.
 
+- **SNOFS LoRA bundled with Krea 2 Turbo (2026-10-01) ✅ setup works.**
+  CivitAI model 1972981 v1.4 (version 3290120, a LoKR, 1,562,410,296 B) is a
+  `lora` file in the `krea-2-turbo` entry; it needs the CivitAI key (401
+  without). Live (`launch_dev.py create --model krea-2-turbo`, RTX 3090,
+  $0.376/hr, Netherlands): download + SHA-256 + Invoke registration all
+  passed and the instance reached Ready in 611 s. Not checked: the LoRA's
+  type in Invoke's model list, or a generation with it on. Spend ~$0.07;
+  instance 53696073 destroyed, Vast listed none left.
+
 | Instance | Offer | Outcome |
 | --- | --- | --- |
 | 52841256 | 30086286, RTX 3090, $0.199/hr | Krea 2 run; destroyed by Stop |
