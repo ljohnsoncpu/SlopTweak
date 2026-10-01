@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn bundled_krea2_entries_are_complete() {
         let models = bundled();
-        for id in ["krea-2-turbo", "kroma-turbo"] {
+        for id in ["krea-2-turbo", "kroma-turbo", "wulver-turbo"] {
             let m = models.iter().find(|m| m.id == id).unwrap();
             assert_eq!(m.base, "krea-2");
             assert_eq!(m.min_compute_cap, Some(800));
@@ -685,9 +685,16 @@ mod tests {
             // Invoke reads the Turbo variant from the file name.
             assert!(m.files[0].filename.contains("turbo"));
         }
-        // Kroma's only file is bf16 (25.6 GB): on 24 GB Invoke has to offload.
-        let kroma = models.iter().find(|m| m.id == "kroma-turbo").unwrap();
-        assert!(kroma.min_vram_gb >= 32.0);
+        // Kroma's and Wulver's only transformer is bf16 (25.6 GB): on 24 GB
+        // Invoke has to offload. Wulver's fp8 file is a plain cast without
+        // `weight_scale` tensors, which Invoke doesn't dequantize.
+        for id in ["kroma-turbo", "wulver-turbo"] {
+            let m = models.iter().find(|m| m.id == id).unwrap();
+            assert!(m.min_vram_gb >= 32.0, "{id}");
+        }
+        let wulver = models.iter().find(|m| m.id == "wulver-turbo").unwrap();
+        let d = wulver.default_settings.as_ref().unwrap();
+        assert_eq!((d.steps, d.cfg_scale), (Some(8), Some(1.0)));
     }
 
     #[test]
