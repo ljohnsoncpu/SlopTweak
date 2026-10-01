@@ -663,6 +663,40 @@ This supersedes the "Krea-2 is gated" note above.
   type in Invoke's model list, or a generation with it on. Spend ~$0.07;
   instance 53696073 destroyed, Vast listed none left.
 
+- **⚠️ The SNOFS LoKR can't be used in Invoke 6.14.1/6.14.2 (2026-10-01);
+  superseded by the merged model below.** Generating with it fails with
+  `ValueError: Unsupported lora format: dict_keys(['alpha'])`, and the model
+  list shows its type and base as Unknown. The file is fine: a standard
+  LyCORIS LoKR from ai-toolkit (metadata `ss_base_model_version: krea2`, 256
+  layers of `alpha` + `lokr_w1` + `lokr_w2` under `diffusion_model.blocks.N…`,
+  read from its safetensors header). Invoke's Krea 2 LoRA loader
+  (`krea2_lora_conversion_utils.py`) has no `lokr_*` suffixes, so the weights
+  are dropped and only `alpha` is left. The fix is
+  [invoke-ai/InvokeAI#9424](https://github.com/invoke-ai/InvokeAI/pull/9424),
+  open and unreleased (v6.14.2 doesn't have it). The LoKR was removed from
+  `krea-2-turbo`, which is keyless and sfw again. Re-add it once a release
+  includes #9424.
+
+- **SNOFS Krea 2 (merged) added (2026-10-01).** CivitAI model 2416142 has the
+  LoKR merged into the weights. Version 3333068 "Krea 2 Raw v1.4" is the only
+  bf16 file (`…krea2RawV14_3219407`, 25,640,191,440 B, same 430-tensor native
+  layout as Kroma and Wulver); the Turbo v1.4 version is int8 only
+  (ComfyUI-only), so it isn't usable. Catalog id `snofs-krea-2`: saved as
+  `snofs-krea-2-raw-v1.4.safetensors` (the `raw` token makes Invoke read the
+  Base variant), 52 steps / CFG 3.5, 32 GB GPU like Wulver, needs the CivitAI
+  key. Bundles Krea's official Turbo LoRA
+  (`loras/krea2_turbo_lora_rank_64_bf16.safetensors`, 469 MB, native
+  `lora_down/up` keys) so a user can switch on 8 steps / CFG 1.
+  ✅ **Live** (`TEST_MODEL=snofs-krea-2 GENERATE=2 LOCAL_CATALOG=1`, cap
+  $0.70/hr): the app chose an RTX A6000 (48 GB, $0.542/hr, 2.2 Gbps), not a
+  5090. Ready in 1256 s (27 GB download ~17 min, then verify + register).
+  Registered as `krea-2/main` variant `krea2_base` plus `krea-2/lora`
+  `krea2_turbo_lora_rank_64_bf16`; the page script applied 52 / CFG 3.5;
+  both 1024 images generated (156 s with the load, 135 s warm). 8/8 PASS.
+  Spend ~$0.33; Stop destroyed instance 53718636 and Vast showed none left.
+  Not checked: the images' content, and the Turbo LoRA switched on in the
+  LoRA panel (it registered, but no generation used it).
+
 | Instance | Offer | Outcome |
 | --- | --- | --- |
 | 52841256 | 30086286, RTX 3090, $0.199/hr | Krea 2 run; destroyed by Stop |

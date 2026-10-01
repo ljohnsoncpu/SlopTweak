@@ -671,7 +671,12 @@ mod tests {
     #[test]
     fn bundled_krea2_entries_are_complete() {
         let models = bundled();
-        for id in ["krea-2-turbo", "kroma-turbo", "wulver-turbo"] {
+        for id in [
+            "krea-2-turbo",
+            "kroma-turbo",
+            "wulver-turbo",
+            "snofs-krea-2",
+        ] {
             let m = models.iter().find(|m| m.id == id).unwrap();
             assert_eq!(m.base, "krea-2");
             assert_eq!(m.min_compute_cap, Some(800));
@@ -679,27 +684,37 @@ mod tests {
                 m.min_ram_gb.is_some_and(|r| r >= 48.0),
                 "streams from host RAM"
             );
-            // Only Krea 2 bundles a CivitAI LoRA (SNOFS), so only it needs a key.
-            assert_eq!(m.needs_civitai(), id == "krea-2-turbo", "{id}");
+            // Only SNOFS (a CivitAI file) needs a key.
+            assert_eq!(m.needs_civitai(), id == "snofs-krea-2", "{id}");
             let kinds: Vec<&str> = m.files.iter().map(|f| f.kind.as_str()).collect();
-            if id == "krea-2-turbo" {
+            if id == "snofs-krea-2" {
+                // The Turbo LoRA is optional: it turns the Raw merge into an 8-step model.
                 assert_eq!(kinds, ["main", "text_encoder", "vae", "lora"]);
             } else {
                 assert_eq!(kinds, ["main", "text_encoder", "vae"]);
             }
-            // Invoke reads the Turbo variant from the file name.
-            assert!(m.files[0].filename.contains("turbo"));
+            // Invoke reads the variant from the file name: a "turbo" substring
+            // wins, otherwise a whole "raw" or "base" token means undistilled.
+            assert_eq!(
+                m.files[0].filename.contains("turbo"),
+                id != "snofs-krea-2",
+                "{id}"
+            );
         }
         // Kroma's and Wulver's only transformer is bf16 (25.6 GB): on 24 GB
         // Invoke has to offload. Wulver's fp8 file is a plain cast without
         // `weight_scale` tensors, which Invoke doesn't dequantize.
-        for id in ["kroma-turbo", "wulver-turbo"] {
+        for id in ["kroma-turbo", "wulver-turbo", "snofs-krea-2"] {
             let m = models.iter().find(|m| m.id == id).unwrap();
             assert!(m.min_vram_gb >= 32.0, "{id}");
         }
         let wulver = models.iter().find(|m| m.id == "wulver-turbo").unwrap();
         let d = wulver.default_settings.as_ref().unwrap();
         assert_eq!((d.steps, d.cfg_scale), (Some(8), Some(1.0)));
+        // The SNOFS merge is Raw, not distilled.
+        let snofs = models.iter().find(|m| m.id == "snofs-krea-2").unwrap();
+        let d = snofs.default_settings.as_ref().unwrap();
+        assert_eq!((d.steps, d.cfg_scale), (Some(52), Some(3.5)));
     }
 
     #[test]
