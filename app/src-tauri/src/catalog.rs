@@ -679,9 +679,14 @@ mod tests {
                 m.min_ram_gb.is_some_and(|r| r >= 48.0),
                 "streams from host RAM"
             );
-            assert!(!m.needs_civitai());
+            // Only Krea 2 bundles a CivitAI LoRA (SNOFS), so only it needs a key.
+            assert_eq!(m.needs_civitai(), id == "krea-2-turbo", "{id}");
             let kinds: Vec<&str> = m.files.iter().map(|f| f.kind.as_str()).collect();
-            assert_eq!(kinds, ["main", "text_encoder", "vae"]);
+            if id == "krea-2-turbo" {
+                assert_eq!(kinds, ["main", "text_encoder", "vae", "lora"]);
+            } else {
+                assert_eq!(kinds, ["main", "text_encoder", "vae"]);
+            }
             // Invoke reads the Turbo variant from the file name.
             assert!(m.files[0].filename.contains("turbo"));
         }
