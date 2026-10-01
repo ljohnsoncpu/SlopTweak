@@ -1450,3 +1450,12 @@ webview-check 26/26.
   (2026-09-26, PR #9):** the catalog's `default_settings` are in each
   model's Invoke config, and stage 1 has the user click ✨ to load them. The
   tutorial numbers were re-tuned at those settings (below).
+
+## Release 0.2.5 check (2026-10-01) ✅
+
+Krea 2 Turbo now installs the SNOFS LoRA (PR #17) and Wulver Turbo is in the
+catalog (PR #16). `instance/` is unchanged (pin `16e68e06…`, `--check-pin`
+matches), so no new real-Vast run beyond the SNOFS one above. $0 checks:
+cargo fmt, clippy, cargo test 159, typecheck. Existing installs get the
+catalog changes from `main` without updating; 0.2.5 refreshes the bundled
+fallback copy.
