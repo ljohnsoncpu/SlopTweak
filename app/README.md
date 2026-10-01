@@ -16,6 +16,10 @@ Run against the mock provider (no Vast calls, no money):
 SLOPTWEAK_PROVIDER=mock npx tauri dev
 ```
 
+To run this checkout (and its `catalog/catalog.json`) without a release, double-click
+`dev/run-dev.cmd` (real Vast, spends money) or `dev/run-dev-mock.cmd`
+(mock provider). They wrap `dev/run-dev.ps1` (`-Mock` for the mock).
+
 `SLOPTWEAK_MOCK_SCRIPT=daemon,dead,normal` scripts per-create failures
 (`daemon`, `dead`, `stuck`, `taken`, `provfail`, `selfdestruct`, `slowpull`, `nosidecar`, `normal`)
 so the retry and failure paths can be seen in the UI.
