@@ -16,8 +16,10 @@
 // and are never printed.
 //
 // Usage (from app/):  MODEL=banana-splitz-xxl MINUTES=70 CAP_USD=0.9 node dev/phase6-session.mjs
+// Optional: MAX_DPH=0.7 (price limit, default 0.5), READY_TIMEOUT=30 (minutes; big models).
 
 import { spawn, execSync } from "node:child_process";
+import { createServer } from "node:http";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -34,6 +36,10 @@ const DATA_DIR = join(process.env.LOCALAPPDATA ?? "", "com.sloptweak.launcher");
 const MODEL = process.env.MODEL ?? "banana-splitz-xxl";
 const MINUTES = Number(process.env.MINUTES ?? 70);
 const CAP_USD = Number(process.env.CAP_USD ?? 0.9);
+const MAX_DPH = Number(process.env.MAX_DPH ?? 0.5);
+const LOCAL_CATALOG = process.env.LOCAL_CATALOG === "1";
+const CATALOG_PORT = 18558;
+const READY_TIMEOUT = Number(process.env.READY_TIMEOUT ?? 0);
 
 mkdirSync(OUT, { recursive: true });
 const LOG = join(OUT, "session.log");
@@ -128,12 +134,23 @@ const creditBefore = await credit();
 say(`credit before: $${creditBefore?.toFixed(4)}; model ${MODEL}; cap ${MINUTES} min / $${CAP_USD}`);
 mkdirSync(CONFIG_DIR, { recursive: true });
 const settingsFile = join(CONFIG_DIR, "settings.json");
+// The backup lives on disk, so a run that is killed outright (no cleanup)
+// still gets its settings back: the next start restores a leftover backup.
+const backupFile = join(CONFIG_DIR, "settings.json.phase6-backup");
+if (existsSync(backupFile)) {
+  const old = JSON.parse(readFileSync(backupFile, "utf8"));
+  if (old.content === null) rmSync(settingsFile, { force: true });
+  else writeFileSync(settingsFile, old.content);
+  rmSync(backupFile, { force: true });
+  say("restored settings.json from a previous run's backup");
+}
 const settingsBackup = existsSync(settingsFile) ? readFileSync(settingsFile, "utf8") : null;
+writeFileSync(backupFile, JSON.stringify({ content: settingsBackup }));
 const outDir = mkdtempSync(join(tmpdir(), "sloptweak-phase6-out-"));
 writeFileSync(
   settingsFile,
   JSON.stringify(
-    { model_id: MODEL, output_dir: outDir, tutorial_done: true, max_dph: 0.5, max_session_minutes: MINUTES + 5, heartbeat_minutes: 3, idle_minutes: 30 },
+    { model_id: MODEL, output_dir: outDir, tutorial_done: true, max_dph: MAX_DPH, max_session_minutes: MINUTES + 5, heartbeat_minutes: 3, idle_minutes: 30, ...(READY_TIMEOUT ? { ready_timeout_minutes: READY_TIMEOUT } : {}) },
     null,
     2,
   ),
@@ -141,6 +158,7 @@ writeFileSync(
 
 let app = null;
 let vite = null;
+let catalogServer = null;
 let m = null;
 let hourly = null;
 let readyAt = null;
@@ -176,6 +194,7 @@ async function cleanup(why) {
     }
     if (app) kill(app);
     if (vite) kill(vite);
+    catalogServer?.close();
     try {
       for (const i of await ourInstances()) {
         if (!before.has(i.id)) {
@@ -188,6 +207,7 @@ async function cleanup(why) {
     }
     if (settingsBackup !== null) writeFileSync(settingsFile, settingsBackup);
     else rmSync(settingsFile, { force: true });
+    rmSync(backupFile, { force: true });
     rmSync(STATE, { force: true });
     await sleep(10000);
     const left = (await ourInstances()).filter((i) => !before.has(i.id));
@@ -201,7 +221,14 @@ async function cleanup(why) {
 for (const sig of ["SIGINT", "SIGTERM", "SIGBREAK"]) process.on(sig, () => cleanup(sig).then(() => process.exit(1)));
 
 try {
-  vite = spawn("npx", ["vite", "--port", "1420", "--strictPort"], { cwd: APP, shell: true, windowsHide: true, stdio: "ignore" });
+  // LOCAL_CATALOG=1 serves this checkout's catalog/catalog.json to the app instead of main's.
+catalogServer = LOCAL_CATALOG
+  ? createServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(readFileSync(join(APP, "..", "catalog", "catalog.json"), "utf8"));
+    }).listen(CATALOG_PORT, "127.0.0.1")
+  : null;
+vite = spawn("npx", ["vite", "--port", "1420", "--strictPort"], { cwd: APP, shell: true, windowsHide: true, stdio: "ignore" });
   await waitFor(() => servesThisCheckout(APP), 30000, "vite");
   const appLog = join(OUT, "app.log");
   app = spawn(EXE, [], {
@@ -209,6 +236,7 @@ try {
       ...process.env,
       SLOPTWEAK_DEV_IMPORT_KEYS: "1",
       SLOPTWEAK_MAIN_DEBUG_PORT: String(MAIN_PORT),
+      ...(LOCAL_CATALOG ? { SLOPTWEAK_CATALOG_URL: `http://127.0.0.1:${CATALOG_PORT}/catalog.json` } : {}),
       SLOPTWEAK_REMOTE_DEBUG_PORT: String(REMOTE_PORT),
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -217,7 +245,7 @@ try {
   app.stdout.on("data", (d) => appendFileSync(appLog, d));
   app.stderr.on("data", (d) => appendFileSync(appLog, d));
   m = await cdp(MAIN_PORT, (u) => u.includes("localhost:1420"));
-  await waitFor(async () => (await m.eval("document.getElementById('model').options.length")) > 0, 30000, "UI");
+  await waitFor(async () => (await m.eval("document.getElementById('model').options.length")) > 0, 120000, "UI");
   await waitFor(async () => (await m.eval("document.getElementById('start').disabled")) === false, 60000, "Start enabled");
   await m.eval("document.getElementById('start').click()");
   let last = "";
