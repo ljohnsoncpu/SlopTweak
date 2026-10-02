@@ -388,7 +388,7 @@
     {
       "id": "snofs-krea-2",
       "name": "SNOFS Krea 2",
-      "description": "Krea 2 Raw with the SNOFS adult-content LoKR (by Ashen3, v1.4) merged in, so it doesn't depend on Invoke's LoKR support. Photoreal nudes and explicit scenes. This is the undistilled model: SlopTweak sets 52 steps and CFG 3.5 when Invoke opens. For about 8 steps, switch on the Krea 2 Turbo LoRA in the LoRA panel at weight 1 and set 8 steps, CFG 1. A 27 GB download (the GPU can take 15+ minutes to get ready) and a GPU with 32 GB or more, about $0.50-0.65/hr, so raise the price limit in Settings to about $0.70. Needs a CivitAI key.",
+      "description": "Krea 2 Raw with the SNOFS adult-content LoKR (by Ashen3, v1.4) merged in, so it doesn't depend on Invoke's LoKR support. Photoreal nudes and explicit scenes. This is the undistilled model: SlopTweak sets 52 steps and CFG 3.5 when Invoke opens. For about 8 steps, switch on the 8-step Turbo Distill LoRA in the LoRA panel at weight 1 and set 8 steps, CFG 1. A 27 GB download (the GPU can take 15+ minutes to get ready) and a GPU with 32 GB or more, about $0.50-0.65/hr, so raise the price limit in Settings to about $0.70. Needs a CivitAI key.",
       "good_for": "Photoreal adult images",
       "price_tier": 3,
       "base": "krea-2",
@@ -422,12 +422,12 @@
           "requires_civitai_token": false
         },
         {
-          "url": "https://huggingface.co/Comfy-Org/Krea-2/resolve/eb1eddd3983a54678545a9b2c178c5853b30f7be/loras/krea2_turbo_lora_rank_64_bf16.safetensors",
-          "filename": "krea2_turbo_lora_rank_64_bf16.safetensors",
-          "sha256": "DB8C5BAE0A415D448DA9D842111D6E51F7D32E47143A3118EB267E5C4773DE87",
-          "size_bytes": 469423778,
+          "url": "https://civitai.com/api/download/models/3089600?fileId=2969147",
+          "filename": "krea2_8step_turbo_distill_r64.safetensors",
+          "sha256": "8F8A1D084A20363269A907413AB627DFBFDFBB0ADD831A7CE87A89AD1A333931",
+          "size_bytes": 469312122,
           "kind": "lora",
-          "requires_civitai_token": false
+          "requires_civitai_token": true
         }
       ],
       "default_settings": {

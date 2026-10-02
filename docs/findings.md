@@ -686,7 +686,8 @@ This supersedes the "Krea-2 is gated" note above.
   Base variant), 52 steps / CFG 3.5, 32 GB GPU like Wulver, needs the CivitAI
   key. Bundles Krea's official Turbo LoRA
   (`loras/krea2_turbo_lora_rank_64_bf16.safetensors`, 469 MB, native
-  `lora_down/up` keys) so a user can switch on 8 steps / CFG 1.
+  `lora_down/up` keys) so a user can switch on 8 steps / CFG 1. ⚠️ **That
+  LoRA doesn't work in Invoke 6.14.1; see the Turbo LoRA entry below.**
   ✅ **Live** (`TEST_MODEL=snofs-krea-2 GENERATE=2 LOCAL_CATALOG=1`, cap
   $0.70/hr): the app chose an RTX A6000 (48 GB, $0.542/hr, 2.2 Gbps), not a
   5090. Ready in 1256 s (27 GB download ~17 min, then verify + register).
@@ -694,8 +695,33 @@ This supersedes the "Krea-2 is gated" note above.
   `krea2_turbo_lora_rank_64_bf16`; the page script applied 52 / CFG 3.5;
   both 1024 images generated (156 s with the load, 135 s warm). 8/8 PASS.
   Spend ~$0.33; Stop destroyed instance 53718636 and Vast showed none left.
-  Not checked: the images' content, and the Turbo LoRA switched on in the
-  LoRA panel (it registered, but no generation used it).
+  Not checked then: the Turbo LoRA in a generation (done below).
+
+- **Turbo LoRA for SNOFS Krea 2 (2026-10-02): Krea's official one fails, a
+  CivitAI one works.** Generating with Comfy-Org's
+  `krea2_turbo_lora_rank_64_bf16.safetensors` fails with `ValueError:
+  Unsupported lora format: dict_keys(['img_in.diff_b', 'time_mod_proj.diff_b'])`.
+  The file has 528 `lora_down/up` weights plus 7 `diff_b` bias deltas
+  (`first`, `last.linear`, `tmlp.0/2`, `tproj.1`, `txtmlp.1/3`), which Invoke
+  6.14.1's Krea 2 loader can't parse. It registers fine and only fails at
+  generation. (An earlier note here called the file plain `lora_down/up`;
+  that came from reading only its first keys.)
+  CivitAI model 2746698 "Krea-2 Turbo 8-Step Distillation LoRA (SVD
+  Extract)", V2026.1 rank 64 (version 3089600, file 2969147, 469,312,122 B)
+  has 265 `lora_A` + 265 `lora_B` and nothing else; rentals allowed. The
+  catalog now bundles it (`krea2_8step_turbo_distill_r64.safetensors`, needs
+  the CivitAI key, which this entry already did).
+  ✅ **Live** (`phase6-session.mjs` + `phase6-turbo-lora.mjs`, recall API sets
+  the LoRA at weight 1, 8 steps, CFG 1; RTX A6000, $0.542/hr, Quebec): Ready
+  in 1196 s; three 1024 images, each with the LoRA in its metadata:
+  **36.3 s (cold, includes loading the LoRA), 13.9 s, 13.6 s**, against 156 s
+  and 135 s at 52 steps on the same GPU type. The image was clean. Spend
+  ~$0.28; instance 53871973 destroyed.
+  Two earlier attempts: a background task hit its time limit and killed the
+  session script mid-download (instance 53863719 destroyed by hand, ~$0.07)
+  and the script left its test `settings.json` behind. `phase6-session.mjs`
+  now keeps its settings backup on disk. The recall API's `loras` field takes
+  `{model_name, weight, is_enabled}`.
 
 | Instance | Offer | Outcome |
 | --- | --- | --- |
