@@ -1287,7 +1287,7 @@ fn identity_service() -> Arc<crate::identity::IdentityService> {
 
 #[tokio::test(start_paused = true)]
 async fn identity_edit_makes_an_image_and_it_is_saved() {
-    use crate::identity::{Aspect, Phase};
+    use crate::identity::{Aspect, Mode, Phase};
     let h = harness(vec![]);
     let id = ready_comfy(&h).await;
     let target = identity_target(&h);
@@ -1296,9 +1296,15 @@ async fn identity_edit_makes_an_image_and_it_is_saved() {
         .unwrap();
     svc.set_ref(1, "wolf.png", crate::provider::mock::MOCK_PNG.to_vec())
         .unwrap();
-    svc.generate(&target, "  they share a coffee  ", Aspect::Portrait, 0xBEEF)
-        .await
-        .unwrap();
+    svc.generate(
+        &target,
+        "  they share a coffee  ",
+        Mode::New,
+        Aspect::Portrait,
+        0xBEEF,
+    )
+    .await
+    .unwrap();
 
     let v = svc.view();
     assert_eq!(v.phase, Phase::Done, "{}", v.message);
@@ -1334,8 +1340,53 @@ async fn identity_edit_makes_an_image_and_it_is_saved() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn identity_edit_mode_edits_the_picture_first() {
+    use crate::identity::{fit_size, image_size, Aspect, Mode, Phase, BASE_SLOT};
+    let h = harness(vec![]);
+    let id = ready_comfy(&h).await;
+    let target = identity_target(&h);
+    let svc = identity_service();
+    let png = crate::provider::mock::MOCK_PNG.to_vec();
+    svc.set_ref(BASE_SLOT, "base.png", png.clone()).unwrap();
+    svc.set_ref(0, "sheet.png", png.clone()).unwrap();
+    svc.generate(
+        &target,
+        "make it dusk",
+        Mode::Edit,
+        Aspect::Landscape,
+        0xED17,
+    )
+    .await
+    .unwrap();
+    let v = svc.view();
+    assert_eq!(v.phase, Phase::Done, "{}", v.message);
+    let (uploads, prompts) = h
+        .mock
+        .with_comfy(id, |c| {
+            let mut u: Vec<_> = c.uploads.keys().cloned().collect();
+            u.sort();
+            (u, c.prompts.clone())
+        })
+        .unwrap();
+    // The picture is uploaded first (reference 1), the sheet second.
+    assert_eq!(
+        uploads,
+        ["sloptweak_ref_ed17_0.png", "sloptweak_ref_ed17_1.png"]
+    );
+    let g = &prompts[0];
+    assert_eq!(g["20"]["inputs"]["image"], "sloptweak_ref_ed17_0.png");
+    assert_eq!(g["21"]["inputs"]["image"], "sloptweak_ref_ed17_1.png");
+    // The canvas follows the picture, not the Shape menu.
+    let (w, hh) = fit_size(image_size(&png).unwrap().0, image_size(&png).unwrap().1);
+    assert_eq!(g["6"]["inputs"]["width"], w);
+    assert_eq!(g["6"]["inputs"]["height"], hh);
+    assert_eq!(g["7"]["inputs"]["denoise"], 1.0);
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+}
+
+#[tokio::test(start_paused = true)]
 async fn identity_edit_can_be_cancelled() {
-    use crate::identity::{Aspect, Phase};
+    use crate::identity::{Aspect, Mode, Phase};
     let h = harness(vec![]);
     let id = ready_comfy(&h).await;
     h.mock.with_comfy(id, |c| c.hold_prompts = true);
@@ -1345,7 +1396,10 @@ async fn identity_edit_can_be_cancelled() {
         .unwrap();
     let run = {
         let (svc, target) = (svc.clone(), target.clone());
-        tokio::spawn(async move { svc.generate(&target, "a walk", Aspect::Square, 1).await })
+        tokio::spawn(async move {
+            svc.generate(&target, "a walk", Mode::New, Aspect::Square, 1)
+                .await
+        })
     };
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(svc.view().phase, Phase::Running);
@@ -1359,7 +1413,7 @@ async fn identity_edit_can_be_cancelled() {
 
 #[tokio::test(start_paused = true)]
 async fn identity_edit_reports_a_refused_request_plainly() {
-    use crate::identity::{Aspect, Phase};
+    use crate::identity::{Aspect, Mode, Phase};
     let h = harness(vec![]);
     let id = ready_comfy(&h).await;
     h.mock.with_comfy(id, |c| c.reject_prompts = true);
@@ -1367,7 +1421,7 @@ async fn identity_edit_reports_a_refused_request_plainly() {
     let svc = identity_service();
     svc.set_ref(0, "fox.png", crate::provider::mock::MOCK_PNG.to_vec())
         .unwrap();
-    svc.generate(&target, "a walk", Aspect::Square, 1)
+    svc.generate(&target, "a walk", Mode::New, Aspect::Square, 1)
         .await
         .unwrap();
     let v = svc.view();

@@ -2019,3 +2019,16 @@ later. Two instances, both destroyed; Vast showed none left.
 - Content policy (PLAN §9.3) and the Krea license §4.2: this spike used SFW images;
   base-image editing lets users alter images they bring in, which is worth
   deciding on explicitly before shipping it.
+
+## Edit mode built: route 1 only (2026-10-03)
+The panel has **I want to: Make a new image / Edit a picture**. Edit mode sends
+the picture as reference 1 and the optional character sheet (slot 0) as reference
+2, with the canvas at the picture's own shape: `identity::fit_size` (about 1 MP,
+multiples of 64, 512-1536) from `identity::image_size` (PNG/JPEG/WebP headers;
+unreadable falls back to square). Slots: 0 and 1 are sheets, 2 is the picture
+(`BASE_SLOT`). No img2img or mask yet (routes 2 and 3 of the spike). Unit tests:
+header sizes, canvas rounding, reference order, a mock end-to-end edit; the mock
+UI check covers the mode switch and a mock edit (26/26). 🧪 Not run on a real GPU
+since the spike (the graph is the spike's route 1, except `fit_size` rounds to
+the base's shape instead of passing its exact size). Content policy (PLAN §9.3)
+and Krea license §4.2 are still undecided; editing user-supplied images touches both.
