@@ -28,6 +28,8 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use url::Url;
 
+use crate::remote::RemoteApp;
+
 use crate::catalog::Backend;
 use crate::catalog::Model;
 use crate::config::{self, Settings};
@@ -380,7 +382,7 @@ pub trait Ui: Send + Sync {
     fn state_changed(&self, state: &SessionState);
     /// Already redacted.
     fn log(&self, line: &str);
-    fn open_remote(&self, url: Url);
+    fn open_remote(&self, url: Url, app: RemoteApp);
     fn close_remote(&self);
     fn sync_changed(&self, report: &SyncReport);
 }
@@ -829,7 +831,23 @@ impl SessionManager {
             .ticket(&base, &secret)
             .await
             .map_err(|e| format!("Couldn't open Invoke: {e}"))?;
-        self.deps.ui.open_remote(auth_url(&base, &ticket));
+        self.deps
+            .ui
+            .open_remote(auth_url(&base, &ticket), RemoteApp::Invoke);
+        Ok(())
+    }
+
+    /// Mint a fresh ticket and (re)open ComfyUI's own interface in the remote
+    /// window. Identity Edit GPUs only.
+    pub async fn open_comfyui(&self) -> Result<(), String> {
+        let (sidecar, base, secret, _) = self.comfy_endpoint()?;
+        let ticket = sidecar
+            .ticket(&base, &secret)
+            .await
+            .map_err(|e| format!("Couldn't open ComfyUI: {e}"))?;
+        self.deps
+            .ui
+            .open_remote(auth_url(&base, &ticket), RemoteApp::ComfyUi);
         Ok(())
     }
 
@@ -1323,7 +1341,9 @@ impl SessionManager {
                 for _ in 0..5 {
                     match self.deps.sidecar.ticket(&base, secret).await {
                         Ok(t) => {
-                            self.deps.ui.open_remote(auth_url(&base, &t));
+                            self.deps
+                                .ui
+                                .open_remote(auth_url(&base, &t), RemoteApp::Invoke);
                             opened = true;
                             break;
                         }

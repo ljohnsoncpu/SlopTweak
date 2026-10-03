@@ -211,6 +211,7 @@ async function run() {
   await waitFor(async () => await evaluate(visible("identity")), 90000, "identity panel");
   check("the Identity Edit panel opens when the GPU is ready", true);
   check("no Open Invoke / tutorial buttons", !(await evaluate(visible("open"))) && !(await evaluate(visible("tutorial"))));
+  check("Open ComfyUI (advanced) is offered", await evaluate(visible("open-comfy")));
   check("status says Identity Edit is ready", (await evaluate(text("status-text"))).includes("Identity Edit is ready"));
   check("Make image is off with nothing added", await evaluate(`${q("id-go")}.disabled`));
   await shot("i2-ready");
@@ -251,7 +252,7 @@ async function run() {
   check("both images were saved to the output folder", filesIn(MOCK_OUT) >= before + 2, `${filesIn(MOCK_OUT) - before} new`);
   await evaluate(click("stop"));
   await waitFor(async () => await evaluate(visible("start")), 60000, "stopped");
-  check("Stop returns to idle and hides the panel", !(await evaluate(visible("identity"))));
+  check("Stop returns to idle and hides the panel", !(await evaluate(visible("identity"))) && !(await evaluate(visible("open-comfy"))));
   check("log shows the instance destroyed", /instance \d+ destroyed/.test(app.output()));
   ws.close();
   kill(app);

@@ -66,6 +66,9 @@ pub struct OfferQuery {
     pub min_cuda: f64,
     /// Vast units (750 = Turing / RTX 20-series).
     pub min_compute_cap: u32,
+    /// Newest architecture allowed (`u32::MAX` = no cap). Blackwell (1200)
+    /// has no xformers kernels in the ComfyUI image.
+    pub max_compute_cap: u32,
     /// Host RAM, GB. 0 = no requirement.
     pub min_ram_gb: f64,
     pub limit: u32,

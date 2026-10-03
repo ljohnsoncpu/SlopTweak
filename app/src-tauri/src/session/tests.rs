@@ -239,6 +239,7 @@ fn launch_secret_is_256_bit_urlsafe() {
 struct Recorder {
     states: Mutex<Vec<SessionState>>,
     opened: Mutex<Vec<Url>>,
+    opened_apps: Mutex<Vec<RemoteApp>>,
     closed: Mutex<u32>,
     lines: Mutex<Vec<String>>,
     syncs: Mutex<Vec<SyncReport>>,
@@ -251,8 +252,9 @@ impl Ui for Recorder {
     fn log(&self, line: &str) {
         self.lines.lock().unwrap().push(line.to_string());
     }
-    fn open_remote(&self, url: Url) {
+    fn open_remote(&self, url: Url, app: RemoteApp) {
         self.opened.lock().unwrap().push(url);
+        self.opened_apps.lock().unwrap().push(app);
     }
     fn close_remote(&self) {
         *self.closed.lock().unwrap() += 1;
@@ -1178,6 +1180,23 @@ async fn comfyui_session_has_no_invoke_window_and_a_backend_record() {
     assert!(err.contains("Identity Edit"), "{err}");
     assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
     assert!(h.mock.live_ids().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn open_comfyui_opens_the_raw_ui_only_on_identity_gpus() {
+    let h = harness(vec![]);
+    let _ = ready_comfy(&h).await;
+    h.mgr.open_comfyui().await.unwrap();
+    let opened = h.ui.opened.lock().unwrap().clone();
+    assert_eq!(opened.len(), 1);
+    assert!(opened[0].as_str().ends_with("/__auth?t=mock-ticket"));
+    assert_eq!(*h.ui.opened_apps.lock().unwrap(), vec![RemoteApp::ComfyUi]);
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+
+    let h = harness(vec![]);
+    let _ = ready_instance(&h).await;
+    let err = h.mgr.open_comfyui().await.unwrap_err();
+    assert!(err.contains("Identity Edit"), "{err}");
 }
 
 #[tokio::test(start_paused = true)]

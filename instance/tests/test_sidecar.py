@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from aiohttp import ClientSession, WSMsgType, web
+from aiohttp import ClientSession, WSMsgType, WSServerHandshakeError, web
 from aiohttp.test_utils import TestClient, TestServer
 
 import sidecar
@@ -366,7 +366,27 @@ class FakeComfy:
     def app(self) -> web.Application:
         app = web.Application()
         app.router.add_get("/queue", self.queue)
+        app.router.add_get("/ws", self.ws_check)
+        app.router.add_route("*", "/echo", self.origin_check)
         return app
+
+    async def origin_check(self, request: web.Request) -> web.Response:
+        # Like ComfyUI: any Origin that isn't its own loopback address is a 403.
+        origin = request.headers.get("Origin")
+        if origin is not None and origin != f"http://{request.host}":
+            return web.Response(status=403, text="origin mismatch")
+        return web.json_response({"origin": origin, "referer": request.headers.get("Referer")})
+
+    async def ws_check(self, request: web.Request) -> web.StreamResponse:
+        origin = request.headers.get("Origin")
+        if origin is not None and origin != f"http://{request.host}":
+            return web.Response(status=403, text="origin mismatch")
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                await ws.send_str(f"echo:{msg.data}")
+        return ws
 
     async def queue(self, _: web.Request) -> web.Response:
         return web.json_response({"queue_running": self.running, "queue_pending": self.pending})
@@ -497,3 +517,59 @@ async def test_vast_destroyer_without_credentials_does_not_call() -> None:
 def test_module_has_no_accidental_print() -> None:
     source = Path(sidecar.__file__).read_text()
     assert "print(" not in source
+
+
+async def _comfy_browser(
+    tmp_path: Path, aiohttp_client: ClientFactory, aiohttp_server: ServerFactory
+) -> tuple[TestClient[Any, Any], dict[str, str], str]:
+    car, _ = await _comfy_sidecar(tmp_path, aiohttp_server, FakeComfy())
+    client = await aiohttp_client(car.make_app(run_watchdog=False))
+    resp = await client.post("/__ticket", headers=BEARER)
+    ticket = (await resp.json())["ticket"]
+    resp = await client.get("/__auth", params={"t": ticket}, allow_redirects=False)
+    cookie = {"Cookie": f"{SESSION_COOKIE}={resp.cookies[SESSION_COOKIE].value}"}
+    return client, cookie, f"http://{client.host}:{client.port}"
+
+
+async def test_comfy_same_host_origin_is_rewritten(
+    tmp_path: Path, aiohttp_client: ClientFactory, aiohttp_server: ServerFactory
+) -> None:
+    client, cookie, host = await _comfy_browser(tmp_path, aiohttp_client, aiohttp_server)
+    resp = await client.get("/echo", headers={**cookie, "Origin": host, "Referer": f"{host}/x?a=1"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["origin"].startswith("http://127.0.0.1:")
+    assert body["origin"] != host
+    assert body["referer"].endswith("/x?a=1")
+
+
+async def test_comfy_foreign_origin_is_refused(
+    tmp_path: Path, aiohttp_client: ClientFactory, aiohttp_server: ServerFactory
+) -> None:
+    client, cookie, _ = await _comfy_browser(tmp_path, aiohttp_client, aiohttp_server)
+    resp = await client.post("/echo", headers={**cookie, "Origin": "https://evil.example"})
+    assert resp.status == 403
+    assert await resp.text() == "cross-origin request refused"
+
+
+async def test_comfy_without_origin_passes_and_foreign_referer_dropped(
+    tmp_path: Path, aiohttp_client: ClientFactory, aiohttp_server: ServerFactory
+) -> None:
+    client, cookie, _ = await _comfy_browser(tmp_path, aiohttp_client, aiohttp_server)
+    resp = await client.get("/echo", headers={**cookie, "Referer": "https://evil.example/p"})
+    assert resp.status == 200
+    assert await resp.json() == {"origin": None, "referer": None}
+    resp = await client.get("/echo", headers=BEARER)  # the app's own calls
+    assert resp.status == 200
+
+
+async def test_comfy_websocket_origin(
+    tmp_path: Path, aiohttp_client: ClientFactory, aiohttp_server: ServerFactory
+) -> None:
+    client, cookie, host = await _comfy_browser(tmp_path, aiohttp_client, aiohttp_server)
+    ws = await client.ws_connect("/ws", headers={**cookie, "Origin": host})
+    await ws.send_str("hi")
+    assert (await ws.receive_str()) == "echo:hi"
+    await ws.close()
+    with pytest.raises(WSServerHandshakeError):
+        await client.ws_connect("/ws", headers={**cookie, "Origin": "https://evil.example"})

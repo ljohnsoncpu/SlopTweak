@@ -63,6 +63,14 @@ pub struct TutorialStart {
     pub has_model_page: bool,
 }
 
+/// Which app a remote window shows. ComfyUI's raw UI gets none of the Invoke
+/// tutorial or defaults scripts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteApp {
+    Invoke,
+    ComfyUi,
+}
+
 pub type TutorialHandler = Arc<dyn Fn(TutorialSignal) + Send + Sync>;
 
 pub struct RemoteWindows {
@@ -171,7 +179,7 @@ impl RemoteWindows {
 
     /// Open (or re-point) the Invoke window, with the tutorial overlay
     /// starting from `tutorial`.
-    pub fn open(&self, url: Url, tutorial: &TutorialStart) -> Result<(), String> {
+    pub fn open(&self, url: Url, app: RemoteApp, tutorial: &TutorialStart) -> Result<(), String> {
         let origin = url.origin();
         let mut current = self.current.lock().unwrap();
         if let Some((label, o)) = current.as_ref() {
@@ -199,14 +207,16 @@ impl RemoteWindows {
             .join("remote-webview");
         let pinned = origin.clone();
         let on_tutorial = self.on_tutorial.clone();
-        let force = self.force_tutorial.swap(false, Ordering::Relaxed);
+        let title = match app {
+            RemoteApp::Invoke => "SlopTweak — Invoke",
+            RemoteApp::ComfyUi => "SlopTweak — ComfyUI",
+        };
         #[allow(unused_mut)]
         let mut builder = WebviewWindowBuilder::new(&self.app, &label, WebviewUrl::External(url))
-            .title("SlopTweak — Invoke")
+            .title(title)
             .inner_size(1440.0, 920.0)
             .min_inner_size(900.0, 600.0)
             .data_directory(data_dir)
-            .initialization_script(tutorial_script(tutorial, force))
             .on_navigation(move |u| {
                 if let Some(sig) = tutorial_signal(&pinned, u) {
                     on_tutorial(sig);
@@ -236,6 +246,10 @@ impl RemoteWindows {
                  --remote-debugging-port={}",
                 port.trim()
             ));
+        }
+        if app == RemoteApp::Invoke {
+            let force = self.force_tutorial.swap(false, Ordering::Relaxed);
+            builder = builder.initialization_script(tutorial_script(tutorial, force));
         }
         builder.build().map_err(|e| e.to_string())?;
         *current = Some((label, origin));

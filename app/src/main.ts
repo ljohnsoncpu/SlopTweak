@@ -221,6 +221,7 @@ const ui = {
   progressFill: el("progress-fill"),
   start: el<HTMLButtonElement>("start"),
   open: el<HTMLButtonElement>("open"),
+  openComfy: el<HTMLButtonElement>("open-comfy"),
   tutorial: el<HTMLButtonElement>("tutorial"),
   openFolder: el<HTMLButtonElement>("open-folder"),
   outOpen: el<HTMLButtonElement>("out-open"),
@@ -416,6 +417,7 @@ function render(): void {
   ui.stop.hidden = !active() || s.kind === "stopping";
   const identityGpu = isIdentity();
   ui.open.hidden = s.kind !== "ready" || identityGpu;
+  ui.openComfy.hidden = s.kind !== "ready" || !identityGpu;
   ui.tutorial.hidden = s.kind !== "ready" || identityGpu;
   ui.dismiss.hidden = !(s.kind === "failed" || (s.kind === "idle" && s.notice));
   ui.model.disabled = active();
@@ -1033,6 +1035,7 @@ ui.model.onchange = () => {
 ui.start.onclick = () => act(invoke("start_session", { modelId: ui.model.value }));
 ui.stop.onclick = () => act(invoke("stop_session"));
 ui.open.onclick = () => act(invoke("open_invoke"));
+ui.openComfy.onclick = () => act(invoke("open_comfyui"));
 ui.tutorial.onclick = () => act(invoke("show_tutorial"));
 ui.openFolder.onclick = () => act(invoke("open_output_folder"));
 ui.outOpen.onclick = async () => {

@@ -26,7 +26,7 @@ pub const ASSETS_URL: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "/instance-assets.tar.gz"
 );
-pub const ASSETS_SHA256: &str = "259665826526930b33ceaef2beda2906881061ab68a56b51ff9985f52f18c293";
+pub const ASSETS_SHA256: &str = "3751a40ce390b2f2b6722cdc76012e9abaaa561081769df744f7546a5be93625";
 /// Debug builds of a version that has no release yet fetch the same bytes
 /// from the `instance-v0.1.2` dev pre-release; `SLOPTWEAK_DEV_ASSETS_URL` overrides it
 /// (the instance still checks [`ASSETS_SHA256`]).
@@ -286,6 +286,10 @@ pub fn ready_timeout_minutes(model: &Model, s: &Settings) -> u32 {
     s.ready_timeout_minutes.max(for_size)
 }
 
+/// Newest GPU architecture the ComfyUI image runs Identity Edit on: Blackwell
+/// (compute cap 1200) fails in xformers ("No operator found"), live 2026-10-03.
+pub const COMFY_MAX_COMPUTE_CAP: u32 = 1199;
+
 pub fn offer_query(model: &Model, s: &Settings) -> OfferQuery {
     OfferQuery {
         min_vram_gb: model.min_vram_gb,
@@ -296,6 +300,10 @@ pub fn offer_query(model: &Model, s: &Settings) -> OfferQuery {
         max_dph: s.max_dph,
         min_cuda: min_cuda_for(model),
         min_compute_cap: s.min_compute_cap.max(model.min_compute_cap.unwrap_or(0)),
+        max_compute_cap: match model.backend {
+            Backend::Comfyui => COMFY_MAX_COMPUTE_CAP,
+            _ => u32::MAX,
+        },
         min_ram_gb: model.min_ram_gb.unwrap_or(0.0),
         limit: 64,
     }
@@ -627,6 +635,16 @@ mod tests {
         assert_eq!(offer_query(&model, &s).min_compute_cap, 800);
         model.min_compute_cap = Some(600);
         assert_eq!(offer_query(&model, &s).min_compute_cap, 750);
+    }
+
+    #[test]
+    fn comfyui_models_exclude_blackwell_others_do_not() {
+        let s = Settings::default();
+        let mut model = catalog::bundled()[0].clone();
+        model.backend = Backend::Invoke;
+        assert_eq!(offer_query(&model, &s).max_compute_cap, u32::MAX);
+        model.backend = Backend::Comfyui;
+        assert_eq!(offer_query(&model, &s).max_compute_cap, 1199);
     }
 
     fn decoded_models(spec: &LaunchSpec) -> serde_json::Value {

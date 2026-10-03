@@ -33,6 +33,7 @@ from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
@@ -341,6 +342,8 @@ class Sidecar:
             self.watchdog.activity()
 
         headers = self._upstream_headers(request)
+        if self.cfg.backend == "comfyui" and not self._rewrite_browser_origin(request, headers):
+            return web.Response(status=403, text="cross-origin request refused")
         url = self.cfg.upstream + request.rel_url.path_qs
         if request.headers.get("Upgrade", "").lower() == "websocket":
             return await self._proxy_ws(request, url, headers)
@@ -357,6 +360,25 @@ class Sidecar:
         if other:
             headers["Cookie"] = "; ".join(other)
         return headers
+
+    def _rewrite_browser_origin(self, request: web.Request, headers: dict[str, str]) -> bool:
+        """ComfyUI answers 403 to any request whose Origin isn't its own loopback
+        address, so a browser behind the tunnel is blocked. Its cross-site check
+        moves here: an Origin that isn't this tunnel host is refused (False), and
+        a same-host one is rewritten to the upstream's so ComfyUI accepts it.
+        Origin-less requests (the app's own calls) pass unchanged."""
+        origin = headers.pop("Origin", None)
+        referer = headers.pop("Referer", None)
+        if origin is not None:
+            if urlsplit(origin).netloc.lower() != request.host.lower():
+                return False
+            headers["Origin"] = self.cfg.upstream
+        if referer is not None and urlsplit(referer).netloc.lower() == request.host.lower():
+            parts = urlsplit(referer)
+            headers["Referer"] = (
+                self.cfg.upstream + parts.path + (f"?{parts.query}" if parts.query else "")
+            )
+        return True
 
     async def _proxy_http(
         self, request: web.Request, url: str, headers: dict[str, str]

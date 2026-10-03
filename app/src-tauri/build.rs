@@ -10,6 +10,7 @@ fn main() {
             "start_session",
             "stop_session",
             "open_invoke",
+            "open_comfyui",
             "dismiss",
             "set_secret",
             "check_credit",

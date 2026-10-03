@@ -250,3 +250,13 @@ Notes: *Cancel* stops an image that's running. **Stop** works as always: it save
 what's left and shuts the GPU down, so nothing keeps billing. The Invoke-only
 parts of SlopTweak (the tutorial, templates, workflows and your CivitAI LoRAs)
 don't apply to Identity Edit.
+
+### Advanced: ComfyUI's own interface
+While an Identity Edit GPU is ready, **Open ComfyUI (advanced)** opens ComfyUI's
+node editor in its own window, with the *SlopTweak Identity Edit* workflow in
+its Workflows list. No extra node packs and no ComfyUI-Manager are installed,
+so only what Identity Edit ships with is available. Images you save with a
+*Save Image* node are synced to your output folder like the panel's results
+(use plain folder names: letters, digits, `-`, `_`, `.`; *Preview Image* results
+aren't saved). The GPU keeps billing while a long job runs, and closing the
+window asks whether to stop it, as with Invoke.

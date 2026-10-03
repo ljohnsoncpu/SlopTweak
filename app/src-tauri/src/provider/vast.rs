@@ -119,7 +119,7 @@ pub fn search_body(q: &OfferQuery) -> Value {
         "disk_space": {"gte": q.min_disk_gb},
         "dph_total": {"lte": q.max_dph},
         "cuda_max_good": {"gte": q.min_cuda},
-        "compute_cap": {"gte": q.min_compute_cap},
+        "compute_cap": {"gte": q.min_compute_cap, "lte": q.max_compute_cap},
         // cpu_ram is MB, like gpu_ram.
         "cpu_ram": {"gte": q.min_ram_gb * 1000.0},
         "order": [["dph_total", "asc"]],
@@ -405,6 +405,7 @@ mod tests {
             max_dph: 0.5,
             min_cuda: 12.4,
             min_compute_cap: 750,
+            max_compute_cap: 1199,
             min_ram_gb: 0.0,
             limit: 64,
         };
@@ -413,6 +414,7 @@ mod tests {
         assert_eq!(b["gpu_ram"]["gte"], 12000.0);
         assert_eq!(b["dph_total"]["lte"], 0.5);
         assert_eq!(b["compute_cap"]["gte"], 750);
+        assert_eq!(b["compute_cap"]["lte"], 1199);
         assert_eq!(b["cpu_ram"]["gte"], 0.0);
         assert_eq!(b["disk_bw"]["gte"], 2000.0);
         assert_eq!(b["type"], "ondemand");

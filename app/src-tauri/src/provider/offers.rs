@@ -49,6 +49,7 @@ pub fn passes(offer: &Offer, q: &OfferQuery) -> bool {
         && offer.disk_space_gb >= q.min_disk_gb
         && offer.cuda_max_good >= q.min_cuda
         && offer.compute_cap >= q.min_compute_cap
+        && offer.compute_cap <= q.max_compute_cap
         && offer.cpu_ram_mb >= q.min_ram_gb * 1000.0
         && offer.dph_total.is_finite()
         && offer.inet_down_cost.is_finite()
@@ -165,6 +166,7 @@ mod tests {
             max_dph: 0.5,
             min_cuda: 12.4,
             min_compute_cap: 750,
+            max_compute_cap: 1199,
             min_ram_gb: 0.0,
             limit: 64,
         }
@@ -231,6 +233,7 @@ mod tests {
             ("small disk", Box::new(|o| o.disk_space_gb = 40.0)),
             ("old cuda", Box::new(|o| o.cuda_max_good = 12.2)),
             ("old gpu arch", Box::new(|o| o.compute_cap = 520)),
+            ("too new for the cap", Box::new(|o| o.compute_cap = 1200)),
             ("nan price", Box::new(|o| o.dph_total = f64::NAN)),
             ("negative bw", Box::new(|o| o.inet_down_cost = -1.0)),
         ];
