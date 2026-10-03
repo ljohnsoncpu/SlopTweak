@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::Backend;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActiveRecord {
     pub instance_id: u64,
@@ -16,6 +18,10 @@ pub struct ActiveRecord {
     pub created_unix: u64,
     /// "vast" or "mock"; a mock record is meaningless to the Vast provider.
     pub provider: String,
+    /// Which app runs on the instance. Records from before the ComfyUI
+    /// backend have none: they are Invoke.
+    #[serde(default)]
+    pub backend: Backend,
 }
 
 pub struct RecordFile {
@@ -64,6 +70,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_old_record_without_a_backend_is_invoke() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("active_instance.json"),
+            r#"{"instance_id": 7, "offer_id": 8, "gpu_name": "g", "hourly": 0.1,
+                "model_id": "m", "created_unix": 1, "provider": "vast"}"#,
+        )
+        .unwrap();
+        let rec = RecordFile::new(dir.path()).load().unwrap();
+        assert_eq!(rec.backend, Backend::Invoke);
+    }
+
+    #[test]
     fn roundtrip_and_clear() {
         let dir = tempfile::tempdir().unwrap();
         let f = RecordFile::new(dir.path());
@@ -76,6 +95,7 @@ mod tests {
             model_id: "m".into(),
             created_unix: 1,
             provider: "vast".into(),
+            backend: Backend::Comfyui,
         };
         f.save(&rec).unwrap();
         assert_eq!(f.load(), Some(rec.clone()));

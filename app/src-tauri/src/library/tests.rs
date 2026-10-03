@@ -94,6 +94,44 @@ impl SidecarApi for FakeInvoke {
         self.check()?;
         self.lib.lock().unwrap().post_form(path, fields, file)
     }
+    async fn comfy_json(
+        &self,
+        _: &Url,
+        _: &str,
+        _: &[&str],
+        _: &[(&str, &str)],
+    ) -> Result<Value, SidecarError> {
+        unimplemented!()
+    }
+    async fn comfy_bytes(
+        &self,
+        _: &Url,
+        _: &str,
+        _: &[&str],
+        _: &[(&str, &str)],
+        _: usize,
+    ) -> Result<Vec<u8>, SidecarError> {
+        unimplemented!()
+    }
+    async fn comfy_post_json(
+        &self,
+        _: &Url,
+        _: &str,
+        _: &[&str],
+        _: &Value,
+    ) -> Result<Value, SidecarError> {
+        unimplemented!()
+    }
+    async fn comfy_upload(
+        &self,
+        _: &Url,
+        _: &str,
+        _: &[&str],
+        _: &[(&str, String)],
+        _: (&str, &str, Vec<u8>),
+    ) -> Result<Value, SidecarError> {
+        unimplemented!()
+    }
 }
 
 const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F'];

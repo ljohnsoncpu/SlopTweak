@@ -32,6 +32,12 @@
     "allow-confirm-close",
     "allow-copy-diagnostics",
     "allow-check-update",
-    "allow-install-update"
+    "allow-install-update",
+    "allow-identity-state",
+    "allow-identity-pick-ref",
+    "allow-identity-clear-ref",
+    "allow-identity-use-result",
+    "allow-identity-generate",
+    "allow-identity-cancel"
   ]
 }

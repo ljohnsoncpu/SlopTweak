@@ -386,6 +386,63 @@
       "invoke_min_version": "6.14.1"
     },
     {
+      "id": "wulver-identity-edit",
+      "name": "Wulver Identity Edit",
+      "description": "Edit and compose with your own characters. Drop in one or two character sheets, describe the new scene, and Wulver (v0.5 Turbo, an anthro/furry Krea 2 fine-tune) draws the same characters in it. Uses the Identity Edit LoRA by conrad_locke; runs in SlopTweak's own Identity Edit panel, not Invoke. A 29 GB download (the GPU can take 15+ minutes to get ready) and a GPU with 32 GB or more, about $0.50-0.65/hr, so raise the price limit in Settings to about $0.70.",
+      "good_for": "Your own characters in new scenes",
+      "price_tier": 3,
+      "backend": "comfyui",
+      "base": "krea-2",
+      "source": {
+        "huggingface_repo": "Vaelico/Wulver",
+        "revision": "c77ac3a1d5e28522cfcbdd3c58e9c684da4a8b08",
+        "page": "https://huggingface.co/conradlocke/krea2-identity-edit"
+      },
+      "files": [
+        {
+          "url": "https://huggingface.co/Vaelico/Wulver/resolve/c77ac3a1d5e28522cfcbdd3c58e9c684da4a8b08/Wulver_v0.5_bf16.safetensors",
+          "filename": "wulver-v0.5-turbo.safetensors",
+          "sha256": "C8F2B29749CEE4386F2215033BCA5E26AF0CC8FD0FD0C49F4C1D55B35B3EBDE3",
+          "size_bytes": 25640191128,
+          "kind": "main",
+          "requires_civitai_token": false,
+          "dest": "diffusion_models"
+        },
+        {
+          "url": "https://huggingface.co/Comfy-Org/Krea-2/resolve/eb1eddd3983a54678545a9b2c178c5853b30f7be/text_encoders/qwen3vl_4b_fp8_scaled.safetensors",
+          "filename": "qwen3vl_4b_fp8_scaled.safetensors",
+          "sha256": "54BD5144DF0BBC25DD6CCADFCB826B521445A1B06AE5A42570BDD2974CA87094",
+          "size_bytes": 5242467968,
+          "kind": "text_encoder",
+          "requires_civitai_token": false,
+          "dest": "text_encoders"
+        },
+        {
+          "url": "https://huggingface.co/Comfy-Org/Krea-2/resolve/eb1eddd3983a54678545a9b2c178c5853b30f7be/vae/qwen_image_vae.safetensors",
+          "filename": "qwen_image_vae.safetensors",
+          "sha256": "A70580F0213E67967EE9C95F05BB400E8FB08307E017A924BF3441223E023D1F",
+          "size_bytes": 253806246,
+          "kind": "vae",
+          "requires_civitai_token": false,
+          "dest": "vae"
+        },
+        {
+          "url": "https://huggingface.co/conradlocke/krea2-identity-edit/resolve/89e9e7a09ee2e5c9331e952063d79b1b8a703280/krea2_identity_edit_v1_2.safetensors",
+          "filename": "krea2_identity_edit_v1_2.safetensors",
+          "sha256": "6ADF9A69CC9502D286DB7B69964D37DA7E9CFE4B05B4D004BC275F087D3FD3CF",
+          "size_bytes": 1828256432,
+          "kind": "lora",
+          "requires_civitai_token": false,
+          "dest": "loras"
+        }
+      ],
+      "min_vram_gb": 32,
+      "min_compute_cap": 800,
+      "min_ram_gb": 48,
+      "nsfw": true,
+      "license_note": "Krea 2 Community License plus Krea's Acceptable Use Policy (Wulver and the Identity Edit LoRA are both modified Krea 2 weights): free for personal use and for businesses under $1M/yr revenue. It asks you to take reasonable steps against generating prohibited or unlawful content."
+    },
+    {
       "id": "snofs-krea-2",
       "name": "SNOFS Krea 2",
       "description": "Krea 2 Raw with the SNOFS adult-content LoKR (by Ashen3, v1.4) merged in, so it doesn't depend on Invoke's LoKR support. Photoreal nudes and explicit scenes. This is the undistilled model: SlopTweak sets 52 steps and CFG 3.5 when Invoke opens. For about 8 steps, switch on the 8-step Turbo Distill LoRA in the LoRA panel at weight 1 and set 8 steps, CFG 1. A 27 GB download (the GPU can take 15+ minutes to get ready) and a GPU with 32 GB or more, about $0.50-0.65/hr, so raise the price limit in Settings to about $0.70. Needs a CivitAI key.",

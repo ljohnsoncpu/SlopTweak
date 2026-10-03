@@ -5,6 +5,10 @@
 //       relaunch -> "Shut it down" destroys
 //   R3  Start -> crash, no relaunch -> instance watchdog destroys ->
 //       relaunch clears the stale record
+//   R4  Identity Edit (TEST_MODEL=wulver-identity-edit): Start -> panel ->
+//       image from 1 sheet -> image from 2 sheets -> crash -> relaunch ->
+//       Reconnect -> another image -> Stop. Needs SHEETS=a.png;b.png (the
+//       debug build's file-dialog stand-in) and writes to OUT/out.
 //
 // Safety: every instance created while this runs is destroyed in `finally`
 // (anything labelled sloptweak* that wasn't there before). Instance ids are
@@ -24,7 +28,7 @@
 
 import { spawn, execSync } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, appendFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync, appendFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { servesThisCheckout } from "./vite-check.mjs";
 import { COST_TITLE, windowTitles } from "./win-titles.mjs";
@@ -47,6 +51,10 @@ const MAX_SESSION_MINUTES = Number(process.env.MAX_SESSION_MINUTES ?? 60);
 const LOCAL_CATALOG = process.env.LOCAL_CATALOG === "1";
 const CATALOG_PORT = 18557;
 const READY_TIMEOUT = Number(process.env.READY_TIMEOUT ?? 15);
+// R4: two character sheets, answered to the debug build's pick-a-file call.
+const SHEETS = process.env.SHEETS ?? "";
+// No run may outlive this: the safety net destroys what's left and exits.
+const HARD_CAP_MINUTES = Number(process.env.HARD_CAP_MINUTES ?? 75);
 
 mkdirSync(OUT, { recursive: true });
 const LOG = join(OUT, "acceptance.log");
@@ -104,6 +112,7 @@ function launch(tag) {
     env: {
       ...process.env,
       SLOPTWEAK_DEV_IMPORT_KEYS: "1",
+      ...(SHEETS ? { SLOPTWEAK_DEV_PICK_REF: SHEETS } : {}),
       SLOPTWEAK_MAIN_DEBUG_PORT: String(MAIN_PORT),
       SLOPTWEAK_REMOTE_DEBUG_PORT: String(REMOTE_PORT),
       ...(LOCAL_CATALOG ? { SLOPTWEAK_CATALOG_URL: `http://127.0.0.1:${CATALOG_PORT}/catalog.json` } : {}),
@@ -179,7 +188,8 @@ async function cdp(port, match, ms = 60000) {
 
 async function mainWindow() {
   const m = await cdp(MAIN_PORT, (u) => u.includes("localhost:1420"));
-  await waitFor(async () => (await m.eval("document.getElementById('model').options.length")) > 0, 30000, "UI");
+  // A cold vite takes ~30 s to serve the first page.
+  await waitFor(async () => (await m.eval("document.getElementById('model').options.length")) > 0, 120000, "UI");
   return m;
 }
 
@@ -411,6 +421,102 @@ async function r3() {
   crash();
 }
 
+
+// ----- R4: Identity Edit ----------------------------------------------------------
+
+const idState = (m) => m.eval("window.__TAURI_INTERNALS__.invoke('identity_state')");
+
+/** Fill the prompt, press Make image, wait for one more result. Saves it. */
+async function idGenerate(m, tag, prompt, aspect) {
+  const before = (await idState(m)).results.length;
+  await m.eval(`(() => {
+    const p = document.getElementById('id-prompt');
+    p.value = ${JSON.stringify(prompt)}; p.dispatchEvent(new Event('input'));
+    document.getElementById('id-aspect').value = ${JSON.stringify(aspect)};
+  })()`);
+  await sleep(400);
+  const clicked = await m.eval("(() => { const b = document.getElementById('id-go'); if (b.disabled) return 'disabled'; b.click(); return 'ok'; })()");
+  say(`${tag}: Make image -> ${clicked}`);
+  if (clicked !== "ok") {
+    check(`${tag}: Make image was enabled`, false);
+    return;
+  }
+  const started = Date.now();
+  let last = "";
+  const made = await waitFor(async () => {
+    const v = await idState(m);
+    if (v.message !== last) {
+      last = v.message;
+      say(`${tag}: [${v.phase}] ${v.message}`);
+    }
+    if (v.phase === "failed") throw new Error(v.message);
+    return v.results.length > before ? v : false;
+  }, 15 * 60000, `${tag} image`).catch((e) => {
+    say(`${tag}: ${e}`);
+    return null;
+  });
+  const secs = Math.round((Date.now() - started) / 1000);
+  if (made) {
+    const url = made.results[0].data_url;
+    const bytes = Buffer.from(url.slice(url.indexOf(",") + 1), "base64");
+    writeFileSync(join(OUT, `${tag}-result.png`), bytes);
+    say(`${tag}: saved ${tag}-result.png (${bytes.length} bytes)`);
+  }
+  await m.shot(`${tag}-panel`);
+  check(`${tag}: image made`, !!made, `${secs}s`);
+}
+
+async function r4() {
+  say("=== R4: Identity Edit end to end ===");
+  if (!SHEETS.includes(";")) throw new Error("set SHEETS=a.png;b.png");
+  launch("r4a");
+  let m = await mainWindow();
+  const s = await startAndWaitReady(m, "R4");
+  const id = s.instance_id;
+  const snap = () => m.eval("window.__TAURI_INTERNALS__.invoke('get_snapshot').then(x => ({ b: x.active_backend, s: x.sync }))");
+  check("R4: the GPU is an Identity Edit GPU", (await snap()).b === "comfyui");
+  await waitFor(() => m.eval("!document.getElementById('identity').hidden"), 30000, "identity panel");
+  check("R4: the panel is shown, Open Invoke is not", await m.eval("document.getElementById('open').hidden"));
+  const inst = (await vast("GET", `/instances/${id}/`)).body?.instances ?? {};
+  say(`R4 host: machine ${inst.machine_id}, ${inst.geolocation}, ${inst.gpu_name}, ${inst.gpu_ram} MB, inet_down ${inst.inet_down}`);
+  await m.shot("R4-ready");
+
+  await m.eval("document.getElementById('ref-pick-0').click()");
+  await waitFor(() => m.eval("!!document.getElementById('ref-img-0').querySelector('img')"), 15000, "sheet 1");
+  await idGenerate(m, "R4-1sheet", "The same character sits at a sunny cafe table, smiling, holding a coffee cup.", "square");
+  await m.eval("document.getElementById('ref-pick-1').click()");
+  await waitFor(() => m.eval("!!document.getElementById('ref-img-1').querySelector('img')"), 15000, "sheet 2");
+  await idGenerate(m, "R4-2sheets", "The red fox woman and the grey wolf man sit together at a cafe table, anime style.", "portrait");
+
+  const outDir = join(OUT, "out");
+  const countOut = () => (existsSync(outDir) ? readdirSync(outDir).filter((f) => f.endsWith(".png")).length : 0);
+  await waitFor(() => countOut() >= 2, 60000, "synced images").catch(() => {});
+  check("R4: both images reached the output folder while running", countOut() >= 2, `${countOut()} files`);
+
+  // Crash with the GPU running, relaunch, reconnect, make one more.
+  m.ws.close();
+  crash();
+  launch("r4b");
+  m = await mainWindow();
+  const banner = await orphanBanner(m, id);
+  check("R4: relaunch finds the Identity Edit GPU", true, banner.slice(0, 100));
+  await clickOrphan(m, "Reconnect");
+  await follow(m, (x) => x.kind === "ready" && x.instance_id === id, 10 * 60000, "R4 reattached");
+  await waitFor(() => m.eval("!document.getElementById('identity').hidden"), 30000, "panel after reattach");
+  check("R4: the panel is back after Reconnect", true);
+  await m.eval("document.getElementById('ref-pick-0').click()");
+  await waitFor(() => m.eval("!!document.getElementById('ref-img-0').querySelector('img')"), 15000, "sheet 1 again");
+  await idGenerate(m, "R4-after-reconnect", "The same character stands in a snowy forest at dusk.", "landscape");
+
+  await m.eval("document.getElementById('stop').click()");
+  await follow(m, (x) => x.kind === "idle", 5 * 60000, "R4 idle");
+  check("R4: Stop destroys the instance", await instanceGone(id), `instance ${id}`);
+  check("R4: record cleared", !existsSync(join(DATA_DIR, "active_instance.json")));
+  check("R4: all three images are in the output folder, none twice", countOut() === 3, `${countOut()} files`);
+  m.ws.close();
+  crash();
+}
+
 // ----- main -----------------------------------------------------------------
 
 const before = new Set((await ourInstances()).map((i) => i.id));
@@ -448,13 +554,37 @@ if (!existsSync(backupFile)) {
 writeFileSync(
   settingsFile,
   JSON.stringify(
-    { heartbeat_minutes: HEARTBEAT_MINUTES, max_session_minutes: MAX_SESSION_MINUTES, max_dph: MAX_DPH, ready_timeout_minutes: READY_TIMEOUT },
+    {
+      heartbeat_minutes: HEARTBEAT_MINUTES,
+      max_session_minutes: MAX_SESSION_MINUTES,
+      max_dph: MAX_DPH,
+      ready_timeout_minutes: READY_TIMEOUT,
+      // R4 saves to a scratch folder, not the user's Pictures.
+      ...(runs.includes("r4") ? { output_dir: join(OUT, "out") } : {}),
+    },
     null,
     2,
   ),
 );
 
 const created = new Set();
+const hardCap = setTimeout(async () => {
+  say(`HARD CAP (${HARD_CAP_MINUTES} min): destroying what this run created and stopping`);
+  try {
+    for (const i of await ourInstances()) {
+      if (!before.has(i.id)) {
+        say(`HARD CAP: destroying instance ${i.id}`);
+        await vast("DELETE", `/instances/${i.id}/`);
+      }
+    }
+  } finally {
+    const backup = readFileSync(backupFile, "utf8");
+    if (backup) writeFileSync(settingsFile, backup);
+    else rmSync(settingsFile, { force: true });
+    rmSync(backupFile, { force: true });
+    process.exit(3);
+  }
+}, HARD_CAP_MINUTES * 60000);
 const tracker = setInterval(async () => {
   try {
     for (const i of await ourInstances()) {
@@ -471,7 +601,7 @@ const tracker = setInterval(async () => {
 try {
   for (const r of runs) {
     try {
-      await { r1, r2, r3 }[r]();
+      await { r1, r2, r3, r4 }[r]();
     } catch (e) {
       check(`${r} completed`, false, String(e));
       if (app) crash();
@@ -481,6 +611,7 @@ try {
   }
 } finally {
   clearInterval(tracker);
+  clearTimeout(hardCap);
   catalogServer?.close();
   if (app) crash();
   try {

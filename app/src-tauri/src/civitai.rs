@@ -227,6 +227,7 @@ pub fn lora_from_version(v: &Value) -> Result<Lora, CivitaiError> {
         kind: "lora".into(),
         // The download goes to civitai.com; many LoRAs need a signed-in user.
         requires_civitai_token: true,
+        dest: None,
     };
     validate_file(&mf)
         .map_err(|e| CivitaiError::Invalid(format!("That LoRA can't be used: {e}.")))?;

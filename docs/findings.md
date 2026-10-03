@@ -1519,3 +1519,388 @@ matches), so no new real-Vast run beyond the SNOFS one above. $0 checks:
 cargo fmt, clippy, cargo test 159, typecheck. Existing installs get the
 catalog changes from `main` without updating; 0.2.5 refreshes the bundled
 fallback copy.
+
+## Krea 2 edit spike — Phase A (2026-10-02, research only, no spend)
+
+Spend: **$0.00**. No Vast call was made, so credit before/after wasn't read.
+Prompt: `docs/spikes/krea2-edit-spike.md`. Everything below is from public
+pages and APIs read today; nothing was run.
+
+### Pinned versions
+
+| Piece | Pin | Notes |
+| --- | --- | --- |
+| ComfyUI | tag `v0.38.0` (2026-09-29), tag ref `6b747c04…` | Native Krea 2 is `2a610155…` (#14589, 2026-06-22). Ostris/identity reference-latent support is `c9602625…` (#14843, 2026-07-19). First tag with both: **v0.29.0** (2026-07-29). v0.28.0 has neither edit support. |
+| ComfyUI-Krea2-Ostris-Edit | `7756566160c4a1b24bb1bd9f0ff3ced1a83d7547` (2026-07-17) | MIT, 9 files, no dependencies. Ships `workflow/Krea2_Ostris_Edit.json`. |
+| ai-toolkit | `ecee894ed2b1f3716d9d7326693061ec1a3105bb` (2026-09-27) | Krea 2 code in `extensions_built_in/diffusion_models/krea2/`. |
+| comfyui-krea2edit (benchmark) | `86f886dac23013d88996e3a2e99093ba44d322fb` (2026-07-29) | The prior-art kit pins `bdfa8b26…` instead. Pick one in the run sheet. |
+| conradlocke/krea2-identity-edit (HF) | rev `89e9e7a0…` | v1.2 is 1,828,256,432 B, rank 256, fp16. `_r64` is 457 MB, `_r128` is 914 MB. |
+| Comfy-Org/Krea-2 (HF) | rev `eb1eddd3…` (2026-09-23) | The kit pins `952f49d4…`. |
+| lodestones/Kroma (HF) | rev `b921d45c…` | v0.3 turbo/base present. |
+| Vaelico/Wulver (HF) | rev `c77ac3a1…` (earlier findings) | |
+| ostris/krea2_turbo_training_adapter (HF) | rev `64ba06d2…` | `krea2_turbo_training_adapter_v1.safetensors`; `license:other`. |
+
+### Verified
+
+- ✅ **The text encoders have the vision weights.** Safetensors headers of
+  both `qwen3vl_4b_bf16` and `qwen3vl_4b_fp8_scaled` in `Comfy-Org/Krea-2`
+  contain 315 `model.visual.*` tensors. The fp8_scaled file (5.2 GB) is
+  enough.
+- ✅ **How the Ostris path injects references** (from `nodes.py`, the node
+  README and `krea2.py` in ai-toolkit):
+  - *Qwen3-VL tokens.* Each reference is downscaled (never upscaled) to fit
+    **384×384 total pixels**. The prompt becomes
+    `Picture 1: <|vision_start|><|image_pad|><|vision_end|>` … then the user
+    text, through Krea's conditioning template. At most **3** references.
+  - *Reference latents.* With a VAE connected, each reference is resized to
+    fit **1 MP**, keeps its own aspect ratio, is snapped to 16 px, and is
+    VAE-encoded. They ride on the conditioning as `reference_latents`.
+  - *Model patch.* Reference tokens are appended to the image token sequence.
+    Reference *i* gets RoPE axis-0 index `i+1` (the target is 0) and its own
+    y/x grid. They are modulated at **timestep 0**, while the noisy tokens use
+    the real t. An optional `kv_cache` caches their K/V, but only works for
+    LoRAs trained with ai-toolkit's `kv_cache` model kwarg.
+  - *Training match.* ai-toolkit with `arch: krea2`, `model_kwargs.edit: true`
+    sets `encode_control_in_text_embeddings`, `has_multiple_control_images`
+    and `use_raw_control_images`. Controls keep their own size, capped at
+    1 MP (`control_image_max_pixels`). The VLM budget is `vlm_max_pixels`
+    (384²). Dataset keys are `control_path`, or `control_path_1..3`
+    (`toolkit/config_modules.py`).
+  - *What a dataset must look like:* a target image plus caption per sample,
+    and 1–3 reference images per sample in parallel folders. The exact
+    file-matching rule (same filename vs. folder order) was not read; check
+    `toolkit/data_loader.py` before writing a dataset. ~1,750 steps per
+    concept is the reported figure. Training uses
+    `ostris/krea2_turbo_training_adapter`.
+- ✅ **Public Ostris-format edit LoRAs exist** (all `ss_base_model_version:
+  krea2`, ai-toolkit-trained, Krea 2 Community License):
+
+  | LoRA | Rank / size | What it does | Fit for us |
+  | --- | --- | --- | --- |
+  | `ostris/krea2_turbo_style_reference` (rev `269e1e42…`) | 64 / 457 MB | Style from 1–2 references, "thousands of curated pairs". | Tests the nodes and transfer. Not an identity LoRA. |
+  | `reverentelusarca/krea2-detail-enhancer-edit-lora` (rev `5f905aa5…`) | 32 / 229 MB | Trigger "enhance this image", 3,000 steps. Author calls it "highly experimental". | Best single-image edit smoke test. |
+  | CivitAI 2758883 "Droste effect [Krea2-Edit]" | not read | Concept. | Skip. |
+
+  **None is an identity-preserving or two-character LoRA.** Ostris's
+  `Krea2OstrisEdit` HF repo is a diffusers pipeline, not a LoRA. The custom
+  edit LoRA the plan wants would have to be trained (Phase C).
+- ✅ **Case 6 prior art.** The kit's `krea-2` stack (verified 2026-08-09)
+  pairs Identity Edit v1.2 with **Kroma v0.2 turbo**, and its workflow
+  `kroma_reference_edit.json` uses `Krea2EditModelPatch` +
+  `Krea2EditGroundedEncode`. So the benchmark can run on Kroma directly, not
+  only on stock Turbo.
+
+### Differs from assumptions
+
+- ⚠️ **ComfyUI's own `krea2` code has reference-image support built in**
+  (#14843, "regular and timestep zero reference images … for ostris and
+  identity edit ref loras"). The Ostris nodes may be thinner than assumed;
+  confirm in Phase B that case 1 needs no other custom code.
+- ⚠️ A fetch of the Kroma card said v0.2 / MIT while the HF repo lists v0.3.
+  Re-read the card before citing it.
+- ⚠️ Rank 32 and 64 LoRAs are not comparable to the rank-256 identity LoRA
+  for VRAM or transfer.
+
+### Licenses (Krea 2 Community License, PDF read in full)
+
+- Commercial use only if company-wide trailing-12-month revenue is **< $1M**
+  (§2.3); above that needs an Enterprise License. "Commercial Use" is broad
+  (any revenue, direct or indirect).
+- Derivatives explicitly include fine-tuned, distilled and **merged** models
+  (§1). You own your derivative, subject to Krea's rights (§5.2). Outputs are
+  yours (§5.3).
+- Distributing a model, or a service containing one, requires: a copy of the
+  license for recipients, "Krea" at the **start of the model's name**, a
+  NOTICE file with the attribution line, and a statement that you modified it
+  (§3.1, 3.2). Terms you add must not conflict.
+- **§4.2 requires reasonable content filters** on any deployment (examples:
+  Falconsai/nsfw_image_detection, NudeNet). Plus the Acceptable Use Policy
+  (a separate document, not read) and an indemnity from you to Krea (§8).
+- Nothing in the text addresses **renting a GPU** or running on third-party
+  hardware. It reads as allowed: that is use, not distribution. 🧪 Not legal
+  advice.
+- Kroma: HF tag says Krea-2 license on the base weights, delta MIT. Wulver:
+  Krea 2 Community License, "not affiliated with Krea". Neither states more
+  about redistributing merged weights.
+- ⚠️ **§4.2 collides with PLAN §9.3** (content policy). Unresolved; the
+  user's call.
+
+### Prior art: `manage-creative-vast` (kit at `~/.codex/skills/manage-creative-vast/assets/vastai-creative-kit`)
+
+Checked against our rules:
+
+| Rule | Kit | Verdict |
+| --- | --- | --- |
+| Binds 127.0.0.1 | `--listen 127.0.0.1`; nginx and gateway on 127.0.0.1; SSH forwards | ✅ |
+| Keys in env only | Vast key in WSL `~/.config/vastai/` files | ⚠️ different, not env |
+| Destroy on every exit path | `destroy` is manual only; the watchdog **stops, never destroys**; policy `stop_destroys_instance: false` | ❌ a stopped instance still bills storage |
+| Instance id printed first | recorded in a state file; no print-first guarantee found | ⚠️ unverified |
+| Cost policy | 48 GB min, 220 GB disk, ≥500 Mbps, ≤$1/hr, compute capability ≥ 8.0, 6 h hard stop | ⚠️ a persistent-runtime design, tighter than we want |
+
+Reusable as **data**, not as a runner: pinned manifests (`krea-2.json`, the
+Wulver stack), `kroma_reference_edit.json`, and the Wulver workflows. For
+Phase B, use a throwaway script outside the repo that wraps the creation call
+in try/finally destroy.
+
+### Phase B run sheet (proposal, not approved)
+
+- **GPU:** one 48 GB card (RTX A6000 class). Kroma/Wulver bf16 are 25.6 GB
+  and ComfyUI also needs room for the 4B encoder, VAE and activations. Our
+  2026-09-26 run had a clean 12 s warm image on an A6000 at 8 steps / CFG 1.
+- **Price:** about **$0.55/hr** (A6000 listed $0.48–0.57 on 2026-09-26 and
+  10-01). Not re-queried today; re-run the offer search and quote the exact
+  offer before asking approval. Prefer a host with ≥ 2 Gbps down.
+- **Duration:** ~3 h expected (~35 min downloads, 5 min setup, ~2 h tests,
+  teardown). **Hard cap $2.50 total and a 4 h wall clock**, whichever first.
+  Expected spend ≈ $1.65.
+- **Downloads (≈ 75 GB):** Krea 2 Turbo fp8_scaled 13.1 GB; Kroma v0.3 turbo
+  25.6 GB; Wulver v0.5 turbo 25.6 GB (drop it if time-boxed → ≈ 49 GB);
+  qwen3vl_4b_fp8_scaled 5.2 GB; VAE 0.25 GB; LoRAs: style_reference 0.46,
+  detail-enhancer 0.23, Identity Edit v1.2 r64 0.46 GB (the rank-256 file is
+  1.8 GB). Plus ComfyUI and two node packs (small). Disk ≥ 120 GB.
+- **Steps:**
+  1. Offer search, show the exact offer, get approval.
+  2. Create the instance (id printed first, then try/finally destroy) from an
+     image with ComfyUI ≥ v0.29.0 (the kit's
+     `vastai/comfy:v0.30.0-cuda-13.2-py312` is an option; check the tag
+     exists first).
+  3. `git clone` the node packs at the pinned SHAs; download models by pinned
+     revision and verify SHA-256 where HF gives one.
+  4. Start ComfyUI with `--listen 127.0.0.1` and reach it over an SSH forward
+     only.
+  5. Run the matrix below; log timings and peak VRAM (`nvidia-smi` sampler).
+  6. Copy outputs to the scratchpad, destroy, confirm with the Vast list that
+     the instance is gone, record spend and credit.
+- **Test cases** (SFW, adult characters, turbo at 8 steps / CFG 1, fixed seeds):
+
+  | # | Case | Models | Pass |
+  | --- | --- | --- | --- |
+  | 1 | Ostris nodes load; one text-only run | Krea 2 Turbo | Image generated; no node errors; encoder accepts images |
+  | 2 | Single-image edit: detail-enhancer ("enhance this image"), then style_reference with 1–2 refs | Krea 2 Turbo | Output differs from the text-only run as intended; reference composition kept |
+  | 3 | Same LoRA, prompt, seed | Kroma v0.3 turbo | Same behaviour as case 2 at similar strength |
+  | 4 | Same | Wulver v0.5 turbo (if time) | Same |
+  | 5 | Two characters from two sheets into one scene, 2 refs through the Ostris encoder, no LoRA trained for it (a negative control) | best of 2–4 | Report what happens; not expected to pass |
+  | 6 | Identity Edit v1.2 on its own pack | Kroma and Krea 2 Turbo | Identity holds on a single character |
+
+  Record per case: load time, peak VRAM, s/image, identity, instruction
+  followed, failure modes.
+- **What this run can settle:** whether Ostris LoRAs transfer to Kroma and
+  Wulver; whether 2 references work without a LoRA trained for it; whether
+  `kv_cache` helps.
+
+### Phase B result (2026-10-02, one rental, ✅ ran end to end)
+
+**Rental:** Vast instance 53955855, RTX 6000 Ada 48 GB, California, offer
+50163305, **$0.63/hr** as billed (the $0.539 offer price plus the 130 GB
+disk). Image `vastai/comfy:v0.38.0-cuda-12.9-py312` (ComfyUI **0.38.0**,
+torch 2.10+cu128). Up for ~32 min (ready after 6.6 min; ~25 min of that spent
+downloading and testing). Run by a throwaway driver (outside the repo) that
+printed the id first and destroyed in `finally`; the Vast list showed no
+instance afterwards. ComfyUI ran with `--listen 127.0.0.1`; all access was
+over SSH. No keys were sent to the instance; every model is ungated.
+**Spend: credit $7.4562 → $6.4544 = $1.00**, of which ~$0.33 is compute at
+the billed rate. The other ~$0.67 is unexplained; likely Vast's bandwidth
+charge for ~75 GB (not verified).
+
+**Pins used:** Ostris nodes `77565661…`, krea2edit `86f886da…`; models at the
+revisions above (Kroma v0.3 turbo 25,640,191,096 B, Wulver v0.5 bf16
+25,640,191,128 B, Krea 2 Turbo fp8_scaled, qwen3vl_4b_fp8_scaled, Qwen-Image
+VAE); LoRAs style_reference, detail-enhancer, identity v1.2 (rank 256).
+Turbo settings: 8 steps / CFG 1 for the Ostris graphs, 10 steps for the
+Identity Edit graph (as in the kit's workflow), euler/simple, 1024².
+
+**Method:** reference images were generated on the instance with Krea 2
+Turbo (adult anthro fox woman "A", adult anthro wolf man "B", both front+back
+character sheets). Every case then used the same refs. One seed per case;
+identity and instruction-following were judged by eye from contact sheets, so
+treat them as a first look. Outputs are in the session scratchpad
+(`spike/out/`), not the repo.
+
+| Case | Model | Seconds / image | Peak VRAM* | Result |
+| --- | --- | --- | --- | --- |
+| 1 stock t2i | Krea 2 Turbo fp8 | 16.3 cold (incl. load), 8.0 warm | 19.2 GB | ✅ clean |
+| 1 Ostris nodes, refs, **no LoRA** | Turbo / Kroma / Wulver | 18 / 30 / 33 first | 19.9 / 31.9 / 31.9 GB | ✅ runs, ❌ output is mosaic noise on all three. Expected: the patch needs a trained LoRA. |
+| 2 detail-enhancer, 1 ref | Turbo | 17–20 | 19.9–21.7 GB | ✅ identity holds; sharpened |
+| 3 detail-enhancer | Kroma v0.3 | 21 | 32.1 GB | ⚠️ runs, but the look drifts more (softer, pose shifts) than Turbo |
+| 4 detail-enhancer | Wulver v0.5 | 21–22 | 32.0 GB | ✅ identity holds, closest to the ref |
+| 2–4 style_reference, 1 ref | all three | 20–22 | 21.7–32.1 GB | style transfer, not identity: a fox in a jacket, but a new design each time |
+| 5 two refs + style_reference | Turbo | 29.6 | 22.2 GB | ⚠️ both characters appear but drift (fox becomes humanoid) |
+| 5 same | Kroma / Wulver | 33.8 / 33.6 | 32.7 GB | ⚠️ same: right species and palette, wrong details |
+| 6 Identity Edit, 1 ref | Turbo | 43.6 cold, 27.7 warm | 30.9 / 20.0 GB | ✅ identity holds; instruction followed (seated) |
+| 6 same | Kroma v0.3 | 55.3 cold, 32.3 warm | 32.1 GB | ⚠️ identity holds; "sitting" not followed in either seed (only the background changed) |
+| 6 same | Wulver v0.5 | 53.4 cold, 32.1 warm | 32.1 GB | ✅ identity holds; seated in both seeds |
+| 6 Identity Edit, 2 refs | Turbo / Wulver / Kroma | 50.7 / 57.5 / 57.7 | 21.0 / 32.8 / 32.8 GB | ✅ both characters recognisable; Turbo best (both faces). On Kroma and Wulver the wolf is seen from behind. |
+
+\*`nvidia-smi` memory.used while the run was live: an upper bound
+that includes ComfyUI's caching. bf16 Kroma/Wulver peaked ~32 GB, so a 24 GB
+card would need offloading or fp8 weights (Wulver's fp8 file is a plain cast).
+
+**What this settles**
+- ✅ The Ostris nodes load and run on ComfyUI 0.38.0 with no extra
+  dependencies, and both node packs coexist.
+- ✅ Ostris-format LoRAs **do transfer mechanically** to Kroma v0.3 and Wulver
+  v0.5 (no errors, coherent output). Quality transfers well on Wulver and
+  less well on Kroma for the one edit LoRA tested (detail-enhancer).
+- ⚠️ The only public Ostris-format LoRAs are style/detail. Case 5 shows a
+  style LoRA can place two characters in a scene, but identity drifts. There is
+  no public Ostris identity or multi-character LoRA, so that LoRA must be
+  trained (Phase C) or we use the Identity Edit pack.
+- ✅ **Identity Edit is the working option today:** on its own nodes it
+  preserves identity for both characters on all three models (best on Turbo
+  and Wulver). It was trained SFW; furry fidelity looked fine on these SFW
+  tests, but the user should judge content quality with their own sheets.
+- 🧪 Not tested: `kv_cache` (needs a LoRA trained with it), 3 references,
+  non-SFW content, 24 GB cards, Kroma v0.2, Wulver non-turbo, strengths other
+  than 1.0, more than one seed per case, Identity Edit ref_boost values.
+- 🧪 Not tested: prompts that put the two characters in different poses from
+  their sheets. Several outputs copied the reference's front+back layout
+  instead of following "sitting"; a single-view reference may behave better.
+
+### Recommendation (Krea 2 edit spike)
+
+1. **Does the Ostris path work on Kroma/Wulver?** Mechanically yes. Whether a
+   custom LoRA trained on Turbo works well on them can't be known until one
+   exists; the detail LoRA suggests Wulver is fine and Kroma is looser.
+2. **Cheapest route to the user's goal:** adopt the Identity Edit pack
+   (`comfyui-krea2edit` + `krea2_identity_edit_v1_2`) on Wulver. It already
+   gives identity plus two-character scenes. Train a custom Ostris edit LoRA
+   only if its limits matter (SFW training data, layout copying, rank 256
+   size, instruction following on Kroma).
+3. **ComfyUI backend sketch for the launcher** (no code written):
+   - *image:* `vastai/comfy:v0.38.0-cuda-12.9-py312` pinned by digest; it
+     already contains ComfyUI and venv `/venv/main` (`ssh` runtype does not
+     start its supervisor, so the provisioner starts ComfyUI itself);
+   - *upstream port:* ComfyUI on `127.0.0.1:8188` behind the sidecar
+     (as with Invoke); never expose 8188;
+   - *provisioner:* `provision.sh` clones the node packs at pinned SHAs and
+     downloads pinned revisions (all ungated, ~12 min for 75 GB here);
+   - *output adapter:* ComfyUI's `/history` + `/view` instead of Invoke's
+     gallery; the runner in the scratchpad (`runner.py`) is a working
+     prototype of the API calls and of UI→API workflow conversion;
+   - *catalog:* a `backend: "comfyui"` field plus a workflow id per model.
+4. **Training LoRA (Phase C estimate):** paired dataset of target image +
+   caption + 1–3 references per sample (a front-view sheet makes a better
+   reference than the front+back pair used here); reported ~1,750 steps per
+   concept, on `krea2_turbo_training_adapter`, `arch: krea2`,
+   `model_kwargs.edit: true`. The Phase B card (48 GB) is enough. Rough cost:
+   a few dollars of GPU for a proof run, plus the dataset effort, which is
+   the real cost. Not started.
+5. **Open licensing questions:** (a) §4.2 content filters vs PLAN §9.3;
+   (b) the Acceptable Use Policy text was not read; (c) whether the launcher
+   counts as "distributing" a Derivative if it downloads merged weights to the
+   user's rented GPU (it does not host them, but the bundled LoRA/notice
+   requirements in §3 apply if we ever redistribute); (d) the $1M revenue
+   threshold if SlopTweak is ever monetised.
+6. **Cost note:** Vast billed ~$1.00 for a 32-minute 75 GB run. Download
+   bandwidth appears to cost more than compute; check `dph_total` against
+   per-GB charges before the next rental.
+
+## Identity Edit on ComfyUI: Step 0, the real image (2026-10-03)
+
+Goal: check the unverified assumptions behind the ComfyUI backend on the real
+`vastai/comfy` image before building further. RTX 3090 24 GB, Quebec,
+$0.23/hr (offer 51156488), `ssh_direct` runtype like the app's.
+**Spend: credit $6.4355 → $6.2972 = $0.14** over five short rentals (about
+$0.01–0.05 each). Four were thrown away while I worked out how to reach the box
+(below); the last, instance 54028798, ran the checks and was destroyed, and
+the Vast list showed none left. No Wulver download: the only model fetched was
+the 254 MB VAE.
+
+**Image pin:** `vastai/comfy:v0.38.0-cuda-12.9-py312@sha256:5375f2d8…`
+(tag digest read from Docker Hub 2026-10-03, last updated 2026-09-30). ComfyUI
+0.38.0, torch from the image's `/venv/main`.
+
+### Verified
+
+- ✅ **Boot:** `running` and SSH-reachable 80 s after create (image cached on the
+  host; a cold pull will take longer).
+- ✅ **Tools present:** `uv` (`/usr/local/bin/uv`), `curl`, `git`, `python3`
+  3.12.3 with `venv`+`ensurepip`, `pip3`, `tar`, `sha256sum`, `base64`. `gosu`
+  is missing (Invoke-only, not needed).
+- ✅ **Self-destroy credentials:** `CONTAINER_ID` and `CONTAINER_API_KEY` are in
+  PID 1's environment; `/root/.vast_api_key` exists. Same as the Invoke image,
+  so the watchdog and deadman work unchanged. 🧪 The actual DELETE from the
+  instance wasn't exercised on this image.
+- ✅ **Nothing starts by itself:** with the SSH runtype no ComfyUI runs until we
+  start it. Vast maps ports 22 and 3000 to public host ports (the image
+  `EXPOSE`s 3000), but nothing listens on 3000. After provisioning the only
+  listeners were `127.0.0.1:8188` (ComfyUI), `127.0.0.1:8080` (sidecar),
+  `127.0.0.1:20241` (cloudflared metrics) and Vast's own sshd on `:22`.
+- ✅ **The real `provision.sh` with `BACKEND=comfyui`** (bundle files copied by
+  hand, env as the app would set it, one model with `dest: vae`) reached
+  `ready` in **27 s** after the VAE: tunnel up and label published, download +
+  size + SHA-256 check, symlink into `models/vae`, `comfyui-krea2edit` cloned
+  and verified at `86f886da…`, ComfyUI-Manager moved to
+  `/opt/sloptweak/disabled-nodes`, ComfyUI started, `Krea2EditModelPatch`
+  registered. The sidecar venv was built with `uv` (it picked Python 3.11.16, and
+  the sidecar runs fine on it).
+- ✅ **Through the tunnel from the PC, with the launch secret and no `Origin`
+  (what the app's Rust client sends):** `/__status` and `/__heartbeat` 200;
+  `/queue` 200 (`queue_running`/`queue_pending`); `/system_stats` 200;
+  `/object_info/Krea2EditModelPatch` 200; the VAE shows up in `VAELoader`'s
+  choices; `POST /prompt` with an empty graph reaches ComfyUI (400
+  `prompt_no_outputs`, not 401/403). A wrong secret gets 401.
+
+### Differs from assumptions
+
+- ⚠️ **ComfyUI rejects any request with an `Origin` header, 403, even one equal
+  to the tunnel host.** The sidecar forwards `Origin`, so a browser talking to
+  ComfyUI through the tunnel can't work. That confirms the design: the Identity
+  Edit panel is in the local window and Rust makes the calls (no `Origin`).
+  The sidecar needs no Origin handling for this.
+- ⚠️ **SSH to the instance (test harness only; the app never uses SSH):** with
+  `ssh_direct` the account key was *associated* with the instance but sshd
+  rejected it until `/root`, `/root/.ssh` and `authorized_keys` were
+  `chown`ed to root, the same breakage `instance/dev/launch_dev.py` fixes on the
+  Invoke image. Direct SSH is `public_ipaddr` plus `ports["22/tcp"]`, not the
+  `ssh_host`/`ssh_port` the API also reports. My onstart added the fix and a
+  fresh key; the app's own onstart wasn't run in this test.
+
+### Not tested
+`onstart.sh` itself on this image (bundle fetch + hash check; Step 4), the full
+Wulver/LoRA download and a generation through the panel (Step 4), the
+deadman and idle/heartbeat destroy on this image, a cold image pull time.
+
+## Identity Edit: live acceptance in the real app (2026-10-03) ✅ 11/11
+
+`node dev/vast-acceptance.mjs r4` (debug build, real Vast, `TEST_MODEL=wulver-identity-edit`,
+price limit $0.75/hr, 90-min session cap, 75-min hard stop). The instance
+fetched its bundle from the dev pre-release
+[`instance-v0.1.3`](https://github.com/ljohnsoncpu/SlopTweak/releases/tag/instance-v0.1.3)
+(only `instance-assets.tar.gz`, SHA-256 `25966582…`, the app's pin).
+**Spend: credit $6.2876 → $6.0856 = $0.20.** One instance, 54038563, an RTX 4080S
+32 GB at $0.60/hr (offer 53490446, 7.4 Gbps down); Stop destroyed it and
+Vast showed none left. The harness restored the user's `settings.json` and
+the sheets/results lived in `.dev/acceptance/`, not Pictures.
+
+| Step | Result |
+| --- | --- |
+| Start → Ready | ✅ **692 s** (about 11.5 min). The cold host spent most of it building the image and downloading ~33 GB; the app's computed timeout for this model is ~28 min per attempt. |
+| Panel instead of Invoke | ✅ `active_backend` = `comfyui`; the Identity Edit panel showed, Open Invoke and the tutorial were hidden. |
+| 1 sheet + prompt, square | ✅ **64 s** including the first model load. Identity held (same fox, jacket and jeans), seated at a cafe table with a coffee. It repeated the sheet's front-and-back layout. |
+| 2 sheets, tall | ✅ **60 s.** Fox and wolf both recognisable (jacket, scarf, vest), seated together. |
+| Crash the app, relaunch | ✅ The orphan banner found the GPU, **Reconnect** reattached, and the panel came back. |
+| 1 sheet after Reconnect, wide | ✅ **36 s** (model already loaded). |
+| Output folder | ✅ All three images saved while running, none twice (the sync ledger survived the restart). |
+| Stop | ✅ Destroyed, record cleared. |
+
+Also confirmed live: the whole path works with no `Origin` header (the Rust
+client), the new `BACKEND=comfyui` provisioning from the published bundle, the
+`vastai/comfy` image by digest, and the sidecar's `/queue` idle check
+(no idle shutdown during generations).
+
+### Notes and caveats
+- ⚠️ **Time to ready is the weak spot:** ~11.5 min here on a fast host; a slower
+  one will take up to ~28 min (`ready_timeout_minutes`). The catalog text says
+  "15+ minutes".
+- ⚠️ **Layout copying:** with a front-and-back sheet as the reference, outputs
+  often repeat both views (also in the spike). A single-view sheet is better;
+  the user guide says a clean full-body picture on a plain background.
+- ⚠️ **GPU class:** the app chose an RTX 4080S with 32 GB, the cheapest offer that
+  met the model's floors. 60 s per 2-sheet image there, versus 32-57 s on the
+  48 GB RTX 6000 Ada in the spike.
+- 🧪 Not run: a longer session, 3 generations back to back, Cancel against the
+  real GPU (unit-tested against the mock), a cold-pull of a never-seen host,
+  and the idle shutdown (only the queue probe was exercised).
+- Debug-build hook: `SLOPTWEAK_DEV_PICK_REF=a.png;b.png` answers the file dialog;
+  it doesn't exist in release builds.

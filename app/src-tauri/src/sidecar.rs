@@ -140,6 +140,53 @@ pub trait SidecarApi: Send + Sync {
         fields: &[(&str, String)],
         file: Option<(&str, Vec<u8>)>,
     ) -> Result<serde_json::Value, SidecarError>;
+
+    // ComfyUI (the Identity Edit backend). Same proxy, but at the root: `path`
+    // segments are encoded one by one (`/history/<id>`, `/view`).
+
+    async fn comfy_json(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<serde_json::Value, SidecarError>;
+
+    async fn comfy_bytes(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        query: &[(&str, &str)],
+        max: usize,
+    ) -> Result<Vec<u8>, SidecarError>;
+
+    async fn comfy_post_json(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, SidecarError>;
+
+    /// Multipart POST with an image part: `(field, file name, bytes)`.
+    async fn comfy_upload(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        fields: &[(&str, String)],
+        file: (&str, &str, Vec<u8>),
+    ) -> Result<serde_json::Value, SidecarError>;
+}
+
+/// `<base>/<path…>?<query>`: ComfyUI's routes, each segment encoded.
+pub fn comfy_url(base: &Url, path: &[&str], query: &[(&str, &str)]) -> Url {
+    let mut u = api_url(base, path);
+    if !query.is_empty() {
+        u.query_pairs_mut().extend_pairs(query);
+    }
+    u
 }
 
 /// `/api/v1/<path…>`, each segment encoded.
@@ -394,6 +441,72 @@ impl SidecarApi for HttpSidecar {
             .multipart(form);
         self.send_json(req).await
     }
+
+    async fn comfy_json(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<serde_json::Value, SidecarError> {
+        self.get_json(comfy_url(base, path, query), secret).await
+    }
+
+    async fn comfy_bytes(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        query: &[(&str, &str)],
+        max: usize,
+    ) -> Result<Vec<u8>, SidecarError> {
+        self.get_bytes(comfy_url(base, path, query), secret, max, 120)
+            .await
+    }
+
+    async fn comfy_post_json(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, SidecarError> {
+        let req = self
+            .http
+            .post(comfy_url(base, path, &[]))
+            .bearer_auth(secret)
+            .json(body);
+        self.send_json(req).await
+    }
+
+    async fn comfy_upload(
+        &self,
+        base: &Url,
+        secret: &str,
+        path: &[&str],
+        fields: &[(&str, String)],
+        file: (&str, &str, Vec<u8>),
+    ) -> Result<serde_json::Value, SidecarError> {
+        use reqwest::multipart::{Form, Part};
+        let mut form = Form::new();
+        for (k, v) in fields {
+            form = form.text(k.to_string(), v.clone());
+        }
+        let (field, name, bytes) = file;
+        let (_, mime) = image_part_type(&bytes);
+        let part = Part::bytes(bytes)
+            .file_name(name.to_string())
+            .mime_str(mime)
+            .map_err(|e| SidecarError::Parse(e.to_string()))?;
+        let req = self
+            .http
+            .post(comfy_url(base, path, &[]))
+            .bearer_auth(secret)
+            .multipart(form.part(field.to_string(), part))
+            // Two reference sheets are a few MB each over a tunnel.
+            .timeout(Duration::from_secs(120));
+        self.send_json(req).await
+    }
 }
 
 /// File name and type for an uploaded image, by its magic bytes.
@@ -475,6 +588,24 @@ impl HttpSidecar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comfy_urls_are_at_the_root_and_encoded() {
+        let b = Url::parse("https://a-b.trycloudflare.com/x?y=1").unwrap();
+        assert_eq!(
+            comfy_url(&b, &["history", "a/b c"], &[]).as_str(),
+            "https://a-b.trycloudflare.com/history/a%2Fb%20c"
+        );
+        assert_eq!(
+            comfy_url(
+                &b,
+                &["view"],
+                &[("filename", "a b.png"), ("type", "output")]
+            )
+            .as_str(),
+            "https://a-b.trycloudflare.com/view?filename=a+b.png&type=output"
+        );
+    }
 
     #[test]
     fn invoke_api_urls() {

@@ -30,6 +30,12 @@ fn main() {
             "copy_diagnostics",
             "check_update",
             "install_update",
+            "identity_state",
+            "identity_pick_ref",
+            "identity_clear_ref",
+            "identity_use_result",
+            "identity_generate",
+            "identity_cancel",
         ]),
     ))
     .expect("tauri build");

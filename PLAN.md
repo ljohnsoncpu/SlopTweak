@@ -29,7 +29,9 @@ The user experience, end to end:
 ### Non-goals (v1)
 - macOS/Linux builds (keep the code portable; don't ship them yet).
 - Shared/pooled accounts, billing, or any server run by the app author.
-- ComfyUI or node-graph UIs.
+- Node-graph UIs. (Amended 2026-10-02, user decision: ComfyUI may run as a
+  hidden second backend for the Identity Edit panel; the user never sees a
+  node graph. See "Backends" under Key decisions.)
 - Persistent Vast volumes (outputs sync locally instead).
 - Training, LoRA management beyond "paste a CivitAI link".
 
@@ -75,6 +77,7 @@ The user experience, end to end:
 | Outputs | Launcher polls Invoke's images API via the sidecar and downloads new full-res files | Destroy is always safe; no volumes. |
 | Model catalog | `catalog.json` hosted in this repo (raw GitHub / release asset), cached locally | Add models by editing JSON. |
 | Provider abstraction | All Vast calls behind a `GpuProvider` trait | RunPod can be added later without touching the UI. |
+| Backends | `backend: invoke` (default, stock InvokeAI image) or `backend: comfyui` (Vast ComfyUI image, ComfyUI on 127.0.0.1:8188 behind the same sidecar) per catalog entry | Identity Edit (Wulver) needs ComfyUI; Invoke instances are untouched. The ComfyUI backend has a SlopTweak panel in the local window, no remote ComfyUI UI. |
 
 ---
 

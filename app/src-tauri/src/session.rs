@@ -28,6 +28,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use url::Url;
 
+use crate::catalog::Backend;
 use crate::catalog::Model;
 use crate::config::{self, Settings};
 use crate::library::{Builtins, LibraryStore, LibrarySync};
@@ -581,6 +582,36 @@ impl SessionManager {
         self.inner.lock().unwrap().state.clone()
     }
 
+    /// Which app the active instance runs, if there is one.
+    pub fn active_backend(&self) -> Option<Backend> {
+        let id = self.state().instance_id()?;
+        Some(self.backend_of(id))
+    }
+
+    /// Where to reach the running Identity Edit instance: its tunnel, launch
+    /// secret and the model it was rented for. Errors say why not.
+    pub fn comfy_endpoint(&self) -> Result<(Arc<dyn SidecarApi>, Url, String, String), String> {
+        let (id, base, secret) = {
+            let inner = self.inner.lock().unwrap();
+            if !matches!(inner.state, SessionState::Ready { .. }) {
+                return Err("The GPU isn't ready yet.".into());
+            }
+            let a = inner.active.as_ref().ok_or("There is no GPU running.")?;
+            (
+                a.instance_id,
+                a.base.clone().ok_or("The GPU has no connection yet.")?,
+                a.secret.clone(),
+            )
+        };
+        let rec = self
+            .deps
+            .records
+            .load()
+            .filter(|r| r.instance_id == id && r.backend == Backend::Comfyui)
+            .ok_or("This GPU isn't running Identity Edit.")?;
+        Ok((self.deps.sidecar.clone(), base, secret, rec.model_id))
+    }
+
     /// A fresh launch secret. Debug builds with the mock provider only:
     /// `SLOPTWEAK_DEV_LAUNCH_SECRET` fixes it, so a local sidecar.py
     /// (dev/sync-check.mjs) accepts the app's calls.
@@ -783,6 +814,11 @@ impl SessionManager {
             let inner = self.inner.lock().unwrap();
             if !matches!(inner.state, SessionState::Ready { .. }) {
                 return Err("Invoke isn't ready yet.".into());
+            }
+            if let Some(a) = &inner.active {
+                if self.backend_of(a.instance_id) == Backend::Comfyui {
+                    return Err("This GPU runs Identity Edit, not Invoke.".into());
+                }
             }
             let a = inner.active.as_ref().ok_or("no active instance")?;
             (a.base.clone().ok_or("no tunnel yet")?, a.secret.clone())
@@ -1277,25 +1313,33 @@ impl SessionManager {
             return self.finish_stop(Some(instance_id)).await;
         }
         self.log(format!("instance {instance_id} is ready"));
-        // Before the window opens, so Invoke's lists already have them.
-        let library = self.restore_library(instance_id, &base, secret).await;
-        self.start_sync(instance_id, &base, secret, library);
-        let mut opened = false;
-        for _ in 0..5 {
-            match self.deps.sidecar.ticket(&base, secret).await {
-                Ok(t) => {
-                    self.deps.ui.open_remote(auth_url(&base, &t));
-                    opened = true;
-                    break;
+        let backend = self.backend_of(instance_id);
+        match backend {
+            Backend::Invoke => {
+                // Before the window opens, so Invoke's lists already have them.
+                let library = self.restore_library(instance_id, &base, secret).await;
+                self.start_sync(instance_id, &base, secret, Some(library), backend);
+                let mut opened = false;
+                for _ in 0..5 {
+                    match self.deps.sidecar.ticket(&base, secret).await {
+                        Ok(t) => {
+                            self.deps.ui.open_remote(auth_url(&base, &t));
+                            opened = true;
+                            break;
+                        }
+                        Err(e) => self.log(format!("ticket failed: {e}")),
+                    }
+                    if self.wait(rx, Duration::from_secs(3)).await {
+                        return self.finish_stop(Some(instance_id)).await;
+                    }
                 }
-                Err(e) => self.log(format!("ticket failed: {e}")),
+                if !opened {
+                    self.log("couldn't open Invoke automatically; use Open Invoke");
+                }
             }
-            if self.wait(rx, Duration::from_secs(3)).await {
-                return self.finish_stop(Some(instance_id)).await;
-            }
-        }
-        if !opened {
-            self.log("couldn't open Invoke automatically; use Open Invoke");
+            // Identity Edit lives in the app's own window: no remote window,
+            // no Invoke templates or workflows.
+            Backend::Comfyui => self.start_sync(instance_id, &base, secret, None, backend),
         }
         let mut last_check = Instant::now();
         let mut failures = 0u32;
@@ -1338,23 +1382,37 @@ impl SessionManager {
         instance_id: u64,
         base: &Url,
         secret: &str,
-        library: Arc<AsyncMutex<LibrarySync>>,
+        library: Option<Arc<AsyncMutex<LibrarySync>>>,
+        backend: Backend,
     ) {
-        let sync = Arc::new(AsyncMutex::new(OutputSync::new(
-            self.deps.sidecar.clone(),
-            base.clone(),
-            secret.to_string(),
-            instance_id,
-            self.deps.syncs.clone(),
-            self.deps.output_dir.clone(),
-        )));
+        let sync = Arc::new(AsyncMutex::new(
+            OutputSync::new(
+                self.deps.sidecar.clone(),
+                base.clone(),
+                secret.to_string(),
+                instance_id,
+                self.deps.syncs.clone(),
+                self.deps.output_dir.clone(),
+            )
+            .with_backend(backend),
+        ));
         let task = tokio::spawn(self.clone().sync_loop(sync.clone(), library.clone()));
         let mut inner = self.inner.lock().unwrap();
         if let Some(old) = inner.sync_task.replace(task) {
             old.abort();
         }
         inner.sync = Some(sync);
-        inner.library = Some(library);
+        inner.library = library;
+    }
+
+    /// Which app the instance runs: from its record, else Invoke (records
+    /// from before the ComfyUI backend, and instances with none).
+    fn backend_of(&self, instance_id: u64) -> Backend {
+        self.deps
+            .records
+            .load()
+            .filter(|r| r.instance_id == instance_id)
+            .map_or(Backend::Invoke, |r| r.backend)
     }
 
     /// Templates and workflows for this instance, with the built-ins of the
@@ -1427,16 +1485,18 @@ impl SessionManager {
     async fn sync_loop(
         self: Arc<Self>,
         sync: Arc<AsyncMutex<OutputSync>>,
-        library: Arc<AsyncMutex<LibrarySync>>,
+        library: Option<Arc<AsyncMutex<LibrarySync>>>,
     ) {
         let mut rx = self.stop.subscribe();
         let mut failures = 0u32;
         let mut last_error: Option<String> = None;
         let mut last_library = Instant::now();
         loop {
-            if last_library.elapsed() >= self.timing.library_every {
-                last_library = Instant::now();
-                self.capture_library(&library).await;
+            if let Some(library) = &library {
+                if last_library.elapsed() >= self.timing.library_every {
+                    last_library = Instant::now();
+                    self.capture_library(library).await;
+                }
             }
             let (result, report) = {
                 let mut s = sync.lock().await;
@@ -1488,18 +1548,28 @@ impl SessionManager {
             return;
         };
         // No restore: only save what it has.
-        let library = self.library_for(instance_id, &base, &secret);
+        let backend = self.backend_of(instance_id);
+        let library = (backend == Backend::Invoke).then(|| {
+            Arc::new(AsyncMutex::new(self.library_for(
+                instance_id,
+                &base,
+                &secret,
+            )))
+        });
         {
             let mut inner = self.inner.lock().unwrap();
-            inner.sync = Some(Arc::new(AsyncMutex::new(OutputSync::new(
-                self.deps.sidecar.clone(),
-                base,
-                secret,
-                instance_id,
-                self.deps.syncs.clone(),
-                self.deps.output_dir.clone(),
-            ))));
-            inner.library = Some(Arc::new(AsyncMutex::new(library)));
+            inner.sync = Some(Arc::new(AsyncMutex::new(
+                OutputSync::new(
+                    self.deps.sidecar.clone(),
+                    base,
+                    secret,
+                    instance_id,
+                    self.deps.syncs.clone(),
+                    self.deps.output_dir.clone(),
+                )
+                .with_backend(backend),
+            )));
+            inner.library = library;
         }
         self.final_sync(self.timing.final_sync).await;
     }
@@ -1720,6 +1790,7 @@ impl SessionManager {
             model_id: model.id.clone(),
             created_unix: now_unix(),
             provider: self.deps.provider_name.clone(),
+            backend: model.backend,
         };
         if let Err(e) = self.deps.records.save(&rec) {
             self.log(format!("couldn't save the instance record: {e}"));

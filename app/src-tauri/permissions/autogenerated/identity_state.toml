@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-identity-state"
+description = "Enables the identity_state command without any pre-configured scope."
+commands.allow = ["identity_state"]
+
+[[permission]]
+identifier = "deny-identity-state"
+description = "Denies the identity_state command without any pre-configured scope."
+commands.deny = ["identity_state"]

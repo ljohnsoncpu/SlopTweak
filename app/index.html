@@ -65,6 +65,47 @@
           </div>
         </section>
 
+        <section id="identity" class="card" hidden>
+          <h2>Identity Edit</h2>
+          <p class="muted small">
+            Add one or two of your characters, say what they're doing, and press Make image. The
+            characters keep their look. Each image is saved to your output folder as it finishes.
+          </p>
+          <div class="refs">
+            <div class="ref">
+              <div id="ref-img-0" class="ref-img"></div>
+              <div class="actions">
+                <button id="ref-pick-0" type="button">Character 1…</button>
+                <button id="ref-clear-0" type="button" class="ghost" hidden>Clear</button>
+              </div>
+            </div>
+            <div class="ref">
+              <div id="ref-img-1" class="ref-img"></div>
+              <div class="actions">
+                <button id="ref-pick-1" type="button">Character 2 (optional)…</button>
+                <button id="ref-clear-1" type="button" class="ghost" hidden>Clear</button>
+              </div>
+            </div>
+          </div>
+          <label for="id-prompt">What are they doing?</label>
+          <textarea id="id-prompt" rows="3" maxlength="2000" spellcheck="true"
+            placeholder="They sit together at a sunny café table, laughing."></textarea>
+          <div class="row">
+            <label for="id-aspect">Shape</label>
+            <select id="id-aspect">
+              <option value="square">Square</option>
+              <option value="portrait">Tall</option>
+              <option value="landscape">Wide</option>
+            </select>
+          </div>
+          <div class="actions">
+            <button id="id-go" class="primary" type="button">Make image</button>
+            <button id="id-cancel" class="danger" type="button" hidden>Cancel</button>
+          </div>
+          <p id="id-msg" class="muted"></p>
+          <div id="id-results" class="results"></div>
+        </section>
+
         <details class="card">
           <summary>Details</summary>
           <p id="catalog-info" class="muted small"></p>

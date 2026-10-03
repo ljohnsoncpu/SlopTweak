@@ -1,18 +1,19 @@
 """SlopTweak instance sidecar.
 
-Sits between the cloudflared tunnel and InvokeAI:
+Sits between the cloudflared tunnel and the backend app (InvokeAI or ComfyUI):
 
 * Auth. The launcher holds a 256-bit secret whose SHA-256 is in the instance env
   (``LAUNCH_TOKEN_HASH``). It authenticates its own calls with
   ``Authorization: Bearer <secret>``. For the webview it mints a single-use ticket
   (``POST /__ticket``, valid 60 s) and opens ``/__auth?t=<ticket>``, which sets an
   HttpOnly session cookie. Everything else gets 401.
-* Reverse proxy (HTTP + websockets) to Invoke on 127.0.0.1:9090.
+* Reverse proxy (HTTP + websockets) to the backend on loopback: Invoke on
+  127.0.0.1:9090 or ComfyUI on 127.0.0.1:8188, chosen by ``BACKEND``.
 * ``POST /__heartbeat`` and ``GET /__status`` for the launcher.
 * Watchdog: destroys this instance through the Vast API using the instance-scoped
   ``CONTAINER_API_KEY`` on heartbeat loss, idle, or max session length.
 
-Idle means no Invoke queue activity and no state-changing (non-GET) requests
+Idle means no backend queue activity and no state-changing (non-GET) requests
 from a webview session. GETs, websockets, and launcher (bearer) traffic don't
 count, so a window left open doesn't keep the GPU alive.
 """
@@ -39,6 +40,14 @@ log = logging.getLogger("sloptweak.sidecar")
 
 Clock = Callable[[], float]
 Destroyer = Callable[[str], Coroutine[Any, Any, bool]]
+
+# Backend app behind the sidecar: where it listens (loopback only) and which
+# queue endpoint says it is busy. The upstream is derived from BACKEND, never
+# taken from the environment, so it can't be pointed elsewhere.
+BACKENDS = {
+    "invoke": "http://127.0.0.1:9090",
+    "comfyui": "http://127.0.0.1:8188",
+}
 
 SESSION_COOKIE = "st_session"
 TICKET_TTL_S = 60.0
@@ -71,7 +80,8 @@ class Config:
     heartbeat_timeout_s: float = 10 * 60
     idle_timeout_s: float = 20 * 60
     max_session_s: float | None = 4 * 60 * 60
-    upstream: str = "http://127.0.0.1:9090"
+    upstream: str = BACKENDS["invoke"]
+    backend: str = "invoke"
     status_file: Path = Path("/run/sloptweak/status.json")
     container_id: str = ""
     container_api_key: str = ""
@@ -84,7 +94,12 @@ class Config:
         if len(token_hash) != 64:
             raise ValueError("LAUNCH_TOKEN_HASH must be a 64-char SHA-256 hex digest")
         max_minutes = float(env.get("MAX_SESSION_MINUTES", "240"))
+        backend = env.get("BACKEND", "invoke").strip().lower() or "invoke"
+        if backend not in BACKENDS:
+            raise ValueError(f"BACKEND must be one of {sorted(BACKENDS)}")
         return cls(
+            backend=backend,
+            upstream=BACKENDS[backend],
             launch_token_hash=token_hash,
             heartbeat_timeout_s=float(env.get("HEARTBEAT_MINUTES", "10")) * 60,
             idle_timeout_s=float(env.get("IDLE_MINUTES", "20")) * 60,
@@ -235,9 +250,11 @@ class Sidecar:
 
     async def _queue_busy(self) -> bool:
         assert self._http is not None
+        comfy = self.cfg.backend == "comfyui"
+        path = "/queue" if comfy else "/api/v1/queue/default/status"
         try:
             async with self._http.get(
-                f"{self.cfg.upstream}/api/v1/queue/default/status",
+                f"{self.cfg.upstream}{path}",
                 timeout=ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
@@ -245,7 +262,14 @@ class Sidecar:
                 data = await resp.json()
         except (TimeoutError, OSError, ValueError):
             return False
-        queue = data.get("queue", data) if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return False
+        if comfy:
+            # ComfyUI: {"queue_running": [...], "queue_pending": [...]}
+            running = data.get("queue_running")
+            pending = data.get("queue_pending")
+            return bool(running) or bool(pending)
+        queue = data.get("queue", data)
         return int(queue.get("pending", 0)) + int(queue.get("in_progress", 0)) > 0
 
     async def tick(self) -> str | None:
@@ -344,7 +368,7 @@ class Sidecar:
                 request.method, url, headers=headers, data=body, allow_redirects=False
             )
         except OSError:
-            return web.Response(status=503, text="Invoke is not running yet")
+            return web.Response(status=503, text="The app is not running yet")
         async with upstream:
             out = web.StreamResponse(
                 status=upstream.status,
@@ -366,7 +390,7 @@ class Sidecar:
                 url.replace("http", "ws", 1), headers=ws_headers, autoping=True
             )
         except OSError:
-            return web.Response(status=503, text="Invoke is not running yet")
+            return web.Response(status=503, text="The app is not running yet")
         client = web.WebSocketResponse(autoping=True)
         await client.prepare(request)
 
@@ -418,9 +442,10 @@ def main() -> None:
     host = os.environ.get("SIDECAR_HOST", "127.0.0.1")
     port = int(os.environ.get("SIDECAR_PORT", "8080"))
     log.info(
-        "sidecar starting on %s:%d (heartbeat %.0fs, idle %.0fs, max %s)",
+        "sidecar starting on %s:%d for %s (heartbeat %.0fs, idle %.0fs, max %s)",
         host,
         port,
+        cfg.backend,
         cfg.heartbeat_timeout_s,
         cfg.idle_timeout_s,
         cfg.max_session_s,

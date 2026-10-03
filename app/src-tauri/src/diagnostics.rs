@@ -259,6 +259,7 @@ mod tests {
             model_id: "banana-splitz-xxl".into(),
             created_unix: 1_790_000_000,
             provider: "vast".into(),
+            backend: crate::catalog::Backend::Invoke,
         };
         report(
             &Inputs {
@@ -341,11 +342,13 @@ mod tests {
             "== state history ==",
             "== log ==",
             "ghcr.io/invoke-ai/invokeai:v6.14.1-cuda (digest 39a7e3b182c4…)",
-            "sha256 16e68e06a67d…",
             "Bearer [REDACTED]",
         ] {
             assert!(text.contains(want), "missing {want:?}:\n{text}");
         }
+        // The pinned bundle hash moves whenever instance/ changes; follow it.
+        let pin = format!("sha256 {}…", &crate::config::ASSETS_SHA256[..12]);
+        assert!(text.contains(&pin), "missing {pin:?}:\n{text}");
     }
 
     #[test]

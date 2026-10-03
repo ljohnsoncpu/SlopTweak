@@ -118,12 +118,162 @@ struct MockInstance {
     auto_made: usize,
     /// Invoke's templates and workflows.
     library: MockInvokeLibrary,
+    /// ComfyUI (the Identity Edit backend).
+    comfy: MockComfy,
 }
 
 impl MockInstance {
     /// Not listed by the provider yet (`LateCreate`).
     fn hidden(&self) -> bool {
         matches!(self.behavior, MockBehavior::LateCreate(d) if self.created.elapsed() < d)
+    }
+}
+
+/// A fake ComfyUI: `/upload/image`, `/prompt`, `/history`, `/view`, `/queue`,
+/// `/interrupt`, in memory. A queued prompt finishes at once and saves one
+/// image, like a very fast GPU; `hold_prompts` keeps them running instead.
+#[derive(Debug, Default)]
+pub struct MockComfy {
+    /// Finished prompts, oldest first: (prompt id, image file names).
+    pub done: Vec<(String, Vec<String>)>,
+    /// Uploaded reference images by name.
+    pub uploads: HashMap<String, Vec<u8>>,
+    /// Every prompt graph that was queued.
+    pub prompts: Vec<serde_json::Value>,
+    /// Prompt ids still running (when `hold_prompts` is set).
+    pub running: Vec<String>,
+    pub hold_prompts: bool,
+    pub interrupted: u32,
+    /// Make `/prompt` answer with a validation error.
+    pub reject_prompts: bool,
+    next: u64,
+}
+
+impl MockComfy {
+    fn stamp_ms(k: usize) -> u64 {
+        1_790_000_000_000 + k as u64 * 1_000
+    }
+
+    /// An image made outside the app (e.g. in a previous run).
+    #[cfg(test)]
+    pub fn add_output(&mut self, prompt_id: &str, name: &str) {
+        self.done
+            .push((prompt_id.to_string(), vec![name.to_string()]));
+    }
+
+    fn entry(k: usize, id: &str, names: &[String]) -> serde_json::Value {
+        let images: Vec<_> = names
+            .iter()
+            .map(|n| serde_json::json!({"filename": n, "subfolder": "", "type": "output"}))
+            .collect();
+        serde_json::json!({
+            "prompt": [],
+            "outputs": {"9": {"images": images}},
+            "status": {
+                "status_str": "success", "completed": true,
+                "messages": [["execution_start", {"prompt_id": id, "timestamp": Self::stamp_ms(k)}]]
+            }
+        })
+    }
+
+    fn get(
+        &self,
+        path: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<serde_json::Value, SidecarError> {
+        match path {
+            ["history"] => {
+                let max: usize = query
+                    .iter()
+                    .find(|(k, _)| *k == "max_items")
+                    .and_then(|(_, v)| v.parse().ok())
+                    .unwrap_or(usize::MAX);
+                let skip = self.done.len().saturating_sub(max);
+                let map: serde_json::Map<_, _> = self
+                    .done
+                    .iter()
+                    .enumerate()
+                    .skip(skip)
+                    .map(|(k, (id, names))| (id.clone(), Self::entry(k, id, names)))
+                    .collect();
+                Ok(serde_json::Value::Object(map))
+            }
+            ["history", id] => {
+                let mut map = serde_json::Map::new();
+                if let Some((k, (id, names))) =
+                    self.done.iter().enumerate().find(|(_, (p, _))| p == id)
+                {
+                    map.insert(id.clone(), Self::entry(k, id, names));
+                }
+                Ok(serde_json::Value::Object(map))
+            }
+            ["queue"] => Ok(serde_json::json!({
+                "queue_running": self.running.iter().map(|p| serde_json::json!([0, p])).collect::<Vec<_>>(),
+                "queue_pending": [],
+            })),
+            _ => Err(SidecarError::Http(404)),
+        }
+    }
+
+    fn view(&self, query: &[(&str, &str)]) -> Result<Vec<u8>, SidecarError> {
+        let q = |k: &str| query.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+        let name = q("filename").ok_or(SidecarError::Http(400))?;
+        match q("type") {
+            Some("input") => self
+                .uploads
+                .get(name)
+                .cloned()
+                .ok_or(SidecarError::Http(404)),
+            _ if self.done.iter().any(|(_, ns)| ns.iter().any(|n| n == name)) => {
+                Ok(MOCK_PNG.to_vec())
+            }
+            _ => Err(SidecarError::Http(404)),
+        }
+    }
+
+    fn post_json(
+        &mut self,
+        path: &[&str],
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, SidecarError> {
+        match path {
+            ["prompt"] => {
+                if self.reject_prompts || !body["prompt"].is_object() {
+                    return Err(SidecarError::Http(400));
+                }
+                self.prompts.push(body["prompt"].clone());
+                self.next += 1;
+                let id = format!("mock-prompt-{}", self.prompts.len());
+                if self.hold_prompts {
+                    self.running.push(id.clone());
+                } else {
+                    let name = format!("ComfyUI_{:05}_.png", self.next);
+                    self.done.push((id.clone(), vec![name]));
+                }
+                Ok(serde_json::json!({
+                    "prompt_id": id, "number": self.prompts.len(), "node_errors": {}
+                }))
+            }
+            ["interrupt"] => {
+                self.interrupted += 1;
+                self.running.clear();
+                Ok(serde_json::json!({}))
+            }
+            _ => Err(SidecarError::Http(404)),
+        }
+    }
+
+    fn upload(
+        &mut self,
+        path: &[&str],
+        file: (&str, &str, Vec<u8>),
+    ) -> Result<serde_json::Value, SidecarError> {
+        if path != ["upload", "image"] {
+            return Err(SidecarError::Http(404));
+        }
+        let (_, name, bytes) = file;
+        self.uploads.insert(name.to_string(), bytes);
+        Ok(serde_json::json!({"name": name, "subfolder": "", "type": "input"}))
     }
 }
 
@@ -426,6 +576,13 @@ impl MockProvider {
         self
     }
 
+    /// Change an instance's fake ComfyUI (tests), by instance id.
+    #[cfg(test)]
+    pub fn with_comfy<T>(&self, id: u64, f: impl FnOnce(&mut MockComfy) -> T) -> Option<T> {
+        let mut s = self.state.lock().unwrap();
+        s.instances.get_mut(&id).map(|i| f(&mut i.comfy))
+    }
+
     /// Add one gallery image to an instance's Invoke (newest).
     #[cfg(test)]
     pub fn add_image(&self, id: u64, img: InvokeImage) {
@@ -581,7 +738,11 @@ fn default_offers() -> Vec<Offer> {
     let mk = |id, gpu: &str, dph, down, rel| Offer {
         id,
         gpu_name: gpu.into(),
-        gpu_ram_mb: 16376.0,
+        gpu_ram_mb: if gpu.contains("A6000") {
+            49_140.0
+        } else {
+            16376.0
+        },
         num_gpus: 1,
         dph_total: dph,
         storage_cost: 0.2,
@@ -591,9 +752,13 @@ fn default_offers() -> Vec<Offer> {
         reliability: rel,
         verified: true,
         disk_space_gb: 120.0,
-        cuda_max_good: 12.8,
+        cuda_max_good: if gpu.contains("A6000") { 13.0 } else { 12.8 },
         compute_cap: 860,
-        cpu_ram_mb: 64_000.0,
+        cpu_ram_mb: if gpu.contains("A6000") {
+            96_000.0
+        } else {
+            64_000.0
+        },
         geolocation: Some("Mockland".into()),
         machine_id: Some(id * 10),
     };
@@ -602,6 +767,7 @@ fn default_offers() -> Vec<Offer> {
         mk(102, "RTX 4060 Ti", 0.1489, 0.0026, 0.992),
         mk(103, "RTX A4500", 0.1076, 0.0026, 0.993),
         mk(104, "RTX 3090", 0.1907, 0.0, 0.995),
+        mk(105, "RTX A6000", 0.5420, 0.0, 0.998),
     ]
 }
 
@@ -655,6 +821,7 @@ impl GpuProvider for MockProvider {
                 queue: Vec::new(),
                 auto_made: 0,
                 library: MockInvokeLibrary::default(),
+                comfy: MockComfy::default(),
             },
         );
         if matches!(
@@ -915,6 +1082,64 @@ impl SidecarApi for MockSidecar {
         file: Option<(&str, Vec<u8>)>,
     ) -> Result<serde_json::Value, SidecarError> {
         self.with_instance(secret, |inst, _| inst.library.post_form(path, fields, file))
+    }
+
+    async fn comfy_json(
+        &self,
+        _base: &Url,
+        secret: &str,
+        path: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<serde_json::Value, SidecarError> {
+        self.with_instance(secret, |inst, _| inst.comfy.get(path, query))
+    }
+
+    async fn comfy_bytes(
+        &self,
+        _base: &Url,
+        secret: &str,
+        path: &[&str],
+        query: &[(&str, &str)],
+        _max: usize,
+    ) -> Result<Vec<u8>, SidecarError> {
+        let delay = self.state.lock().unwrap().images.delay;
+        tokio::time::sleep(delay).await;
+        let name = query
+            .iter()
+            .find(|(k, _)| *k == "filename")
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default();
+        if path != ["view"] {
+            return Err(SidecarError::Http(404));
+        }
+        let bytes = self.with_instance(secret, |inst, _| inst.comfy.view(query))?;
+        let mut s = self.state.lock().unwrap();
+        if let Some(n) = s.images.fail.get_mut(&name).filter(|n| **n > 0) {
+            *n -= 1;
+            return Err(SidecarError::Unreachable("mock download failure".into()));
+        }
+        Ok(bytes)
+    }
+
+    async fn comfy_post_json(
+        &self,
+        _base: &Url,
+        secret: &str,
+        path: &[&str],
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, SidecarError> {
+        self.with_instance(secret, |inst, _| inst.comfy.post_json(path, body))
+    }
+
+    async fn comfy_upload(
+        &self,
+        _base: &Url,
+        secret: &str,
+        path: &[&str],
+        _fields: &[(&str, String)],
+        file: (&str, &str, Vec<u8>),
+    ) -> Result<serde_json::Value, SidecarError> {
+        self.with_instance(secret, |inst, _| inst.comfy.upload(path, file))
     }
 }
 

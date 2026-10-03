@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from aiohttp import WSMsgType, web
+from aiohttp import ClientSession, WSMsgType, web
 from aiohttp.test_utils import TestClient, TestServer
 
 import sidecar
@@ -354,6 +354,95 @@ async def test_max_session_destroys(h: Harness) -> None:
     h.set_stage("ready")
     h.invoke.queue = {"pending": 1, "in_progress": 0}  # busy forever
     assert await _keepalive(h, 4 * 3600) == "max_session"
+
+
+class FakeComfy:
+    """Stands in for ComfyUI on 127.0.0.1:8188."""
+
+    def __init__(self) -> None:
+        self.running: list[Any] = []
+        self.pending: list[Any] = []
+
+    def app(self) -> web.Application:
+        app = web.Application()
+        app.router.add_get("/queue", self.queue)
+        return app
+
+    async def queue(self, _: web.Request) -> web.Response:
+        return web.json_response({"queue_running": self.running, "queue_pending": self.pending})
+
+
+async def _comfy_sidecar(
+    tmp_path: Path, aiohttp_server: ServerFactory, fake: FakeComfy
+) -> tuple[Sidecar, FakeClock]:
+    upstream = await aiohttp_server(fake.app())
+    clock = FakeClock()
+    cfg = Config(
+        launch_token_hash=sha256_hex(SECRET),
+        heartbeat_timeout_s=600,
+        idle_timeout_s=1200,
+        max_session_s=None,
+        upstream=str(upstream.make_url("")).rstrip("/"),
+        backend="comfyui",
+        status_file=tmp_path / "status.json",
+    )
+    (tmp_path / "status.json").write_text(json.dumps({"stage": "ready"}))
+
+    async def destroyer(_: str) -> bool:
+        return True
+
+    return Sidecar(cfg, clock=clock, destroyer=destroyer), clock
+
+
+async def test_comfy_busy_queue_counts_as_activity(
+    tmp_path: Path, aiohttp_server: ServerFactory
+) -> None:
+    fake = FakeComfy()
+    car, clock = await _comfy_sidecar(tmp_path, aiohttp_server, fake)
+    car._http = ClientSession()
+    try:
+        await car.tick()  # becomes ready
+        fake.running = [[0, "prompt-id", {}, {}, []]]
+        for _ in range(8):  # 40 min of generating, heartbeats alive
+            clock.advance(300)
+            car.watchdog.heartbeat()
+            assert await car.tick() is None
+        fake.running = []
+        reason = None
+        for _ in range(5):
+            clock.advance(300)
+            car.watchdog.heartbeat()
+            reason = await car.tick() or reason
+        assert reason == "idle"
+    finally:
+        await car._http.close()
+
+
+async def test_comfy_pending_only_counts_too(tmp_path: Path, aiohttp_server: ServerFactory) -> None:
+    fake = FakeComfy()
+    car, _ = await _comfy_sidecar(tmp_path, aiohttp_server, fake)
+    car._http = ClientSession()
+    try:
+        assert await car._queue_busy() is False
+        fake.pending = [[1, "p2", {}, {}, []]]
+        assert await car._queue_busy() is True
+    finally:
+        await car._http.close()
+
+
+def test_backend_picks_the_loopback_upstream() -> None:
+    base = {"LAUNCH_TOKEN_HASH": "a" * 64}
+    assert Config.from_env(base).backend == "invoke"
+    assert Config.from_env(base).upstream == "http://127.0.0.1:9090"
+    comfy = Config.from_env({**base, "BACKEND": "ComfyUI"})
+    assert comfy.backend == "comfyui"
+    assert comfy.upstream == "http://127.0.0.1:8188"
+    # An upstream in the environment is ignored: the backend decides.
+    assert Config.from_env({**base, "UPSTREAM_URL": "http://evil.example"}).upstream.startswith(
+        "http://127.0.0.1:"
+    )
+    with pytest.raises(ValueError, match="BACKEND"):
+        Config.from_env({**base, "BACKEND": "automatic1111"})
 
 
 def test_watchdog_unit() -> None:

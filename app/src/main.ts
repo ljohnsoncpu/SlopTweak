@@ -54,6 +54,7 @@ interface ModelView {
   min_ram_gb: number | null;
   price_tier: number | null;
   good_for: string;
+  backend: "invoke" | "comfyui";
 }
 
 interface LoraView {
@@ -114,6 +115,8 @@ interface Snapshot {
   credit: number | null;
   cost: CostBar | null;
   sync: SyncReport | null;
+  /** Which app the running GPU has; null when nothing runs. */
+  active_backend: "invoke" | "comfyui" | null;
 }
 
 type Gate = { kind: "ok" } | { kind: "warn"; message: string } | { kind: "refuse"; message: string };
@@ -222,6 +225,13 @@ const ui = {
   openFolder: el<HTMLButtonElement>("open-folder"),
   outOpen: el<HTMLButtonElement>("out-open"),
   sync: el("sync"),
+  identity: el("identity"),
+  idPrompt: el<HTMLTextAreaElement>("id-prompt"),
+  idAspect: el<HTMLSelectElement>("id-aspect"),
+  idGo: el<HTMLButtonElement>("id-go"),
+  idCancel: el<HTMLButtonElement>("id-cancel"),
+  idMsg: el("id-msg"),
+  idResults: el("id-results"),
   stop: el<HTMLButtonElement>("stop"),
   dismiss: el<HTMLButtonElement>("dismiss"),
   catalogInfo: el("catalog-info"),
@@ -371,7 +381,7 @@ function stageText(stage: string | null, progress: number | null): string {
     case "registering":
       return "Almost ready…";
     case "ready":
-      return "Opening Invoke…";
+      return currentModel()?.backend === "comfyui" ? "Almost ready…" : "Opening Invoke…";
     default:
       return "Setting up…";
   }
@@ -404,8 +414,9 @@ function render(): void {
   ui.start.hidden = active();
   ui.start.disabled = !keysOk || refused || !currentModel() || installing;
   ui.stop.hidden = !active() || s.kind === "stopping";
-  ui.open.hidden = s.kind !== "ready";
-  ui.tutorial.hidden = s.kind !== "ready";
+  const identityGpu = isIdentity();
+  ui.open.hidden = s.kind !== "ready" || identityGpu;
+  ui.tutorial.hidden = s.kind !== "ready" || identityGpu;
   ui.dismiss.hidden = !(s.kind === "failed" || (s.kind === "idle" && s.notice));
   ui.model.disabled = active();
   ui.progress.hidden = true;
@@ -436,7 +447,9 @@ function render(): void {
     case "ready": {
       const update = () => {
         if (s.kind !== "ready") return;
-        ui.statusText.textContent = "Invoke is running in its own window.";
+        ui.statusText.textContent = identityGpu
+          ? "Identity Edit is ready."
+          : "Invoke is running in its own window.";
         ui.statusSub.textContent = `${describeOffer(s.offer)} · ready for ${elapsed(s.ready_unix)}`;
       };
       update();
@@ -454,6 +467,7 @@ function render(): void {
   }
   renderSync();
   renderCostBar();
+  renderIdentity();
 }
 
 function images(n: number): string {
@@ -1200,7 +1214,11 @@ await listen<SessionState>("session-state", (e) => {
   if (!active()) cost = null;
   render();
   renderOutLock();
-  if (was !== "ready" && e.payload.kind === "ready") chime();
+  if (was !== "ready" && e.payload.kind === "ready") {
+    chime();
+    // Which app the GPU runs comes with the snapshot, not the state event.
+    void load().then(refreshIdentity);
+  }
   if (was !== state.kind && (state.kind === "idle" || state.kind === "ready" || state.kind === "failed")) {
     void refreshCredit();
     if (!active()) void refreshEstimate();
@@ -1234,7 +1252,95 @@ await listen("close-requested", () => {
   ui.modal.hidden = false;
 });
 
+
+// ----- Identity Edit panel -------------------------------------------------------------
+
+interface IdentityImage {
+  id: string;
+  name: string;
+  data_url: string;
+}
+
+interface IdentityView {
+  refs: (IdentityImage | null)[];
+  results: IdentityImage[];
+  phase: "idle" | "uploading" | "running" | "done" | "failed" | "cancelled";
+  message: string;
+}
+
+let identity: IdentityView = { refs: [null, null], results: [], phase: "idle", message: "" };
+/** An error from the last click (a bad request), shown until the next state change. */
+let identityError = "";
+
+const isIdentity = () => state.kind === "ready" && snapshot?.active_backend === "comfyui";
+const identityBusy = () => identity.phase === "uploading" || identity.phase === "running";
+
+async function refreshIdentity(): Promise<void> {
+  try {
+    identity = await invoke<IdentityView>("identity_state");
+    identityError = "";
+  } catch (e) {
+    console.error(e);
+  }
+  renderIdentity();
+}
+
+function renderIdentity(): void {
+  ui.identity.hidden = !isIdentity();
+  if (!isIdentity()) return;
+  const busy = identityBusy();
+  identity.refs.forEach((r, slot) => {
+    const box = el(`ref-img-${slot}`);
+    box.replaceChildren(r ? h("img", { src: r.data_url, alt: r.name, title: r.name }) : "No character yet");
+    el<HTMLButtonElement>(`ref-clear-${slot}`).hidden = !r;
+    el<HTMLButtonElement>(`ref-pick-${slot}`).disabled = busy;
+  });
+  ui.idGo.disabled = busy || !identity.refs[0] && !identity.refs[1] || ui.idPrompt.value.trim() === "";
+  ui.idGo.hidden = busy;
+  ui.idCancel.hidden = !busy;
+  ui.idMsg.textContent = identityError || identity.message;
+  ui.idMsg.className = identity.phase === "failed" || identityError ? "notice" : "muted";
+  ui.idResults.replaceChildren(
+    ...identity.results.map((r) =>
+      h(
+        "figure",
+        {},
+        h("img", { src: r.data_url, alt: "Result" }),
+        h(
+          "figcaption",
+          {},
+          h("button", { class: "ghost", type: "button", disabled: busy, onclick: () => void identityUse(r.id, 0) }, "Use as character 1"),
+          h("button", { class: "ghost", type: "button", disabled: busy, onclick: () => void identityUse(r.id, 1) }, "As character 2"),
+        ),
+      ),
+    ),
+  );
+}
+
+async function identityAct(p: Promise<unknown>): Promise<void> {
+  try {
+    await p;
+    identityError = "";
+  } catch (e) {
+    identityError = String(e);
+  }
+  await refreshIdentity();
+}
+
+const identityUse = (id: string, slot: number) => identityAct(invoke("identity_use_result", { id, slot }));
+
+for (const slot of [0, 1]) {
+  el<HTMLButtonElement>(`ref-pick-${slot}`).onclick = () => void identityAct(invoke("identity_pick_ref", { slot }));
+  el<HTMLButtonElement>(`ref-clear-${slot}`).onclick = () => void identityAct(invoke("identity_clear_ref", { slot }));
+}
+ui.idPrompt.oninput = () => renderIdentity();
+ui.idGo.onclick = () =>
+  void identityAct(invoke("identity_generate", { prompt: ui.idPrompt.value, aspect: ui.idAspect.value }));
+ui.idCancel.onclick = () => void identityAct(invoke("identity_cancel"));
+await listen("identity-changed", () => void refreshIdentity());
+
 await load();
+void refreshIdentity();
 if (needsSetup()) {
   startWizard();
 } else {

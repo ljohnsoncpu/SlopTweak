@@ -27,8 +27,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
+use crate::catalog::Backend;
+use crate::comfy::{parse_history, ComfyImage};
 use crate::persist::now_unix;
-use crate::sidecar::{InvokeImage, SidecarApi, SidecarError};
+use crate::sidecar::{InvokeImage, SidecarApi, SidecarError, MAX_IMAGE_BYTES};
 
 /// Subfolder for Canvas results.
 pub const CANVAS_DIR: &str = "Canvas";
@@ -109,6 +111,20 @@ fn local_stamp(created_at: &str) -> Option<String> {
         .ok()?;
     let local = Utc.from_utc_datetime(&naive).with_timezone(&Local);
     Some(local.format("%Y-%m-%d_%H-%M-%S").to_string())
+}
+
+/// `unix` seconds as the local-time stamp used in file names.
+fn stamp_from_unix(unix: u64) -> Option<String> {
+    let local = Local.timestamp_opt(i64::try_from(unix).ok()?, 0).single()?;
+    Some(local.format("%Y-%m-%d_%H-%M-%S").to_string())
+}
+
+/// The same naming for a ComfyUI output (`ComfyUI_00001_.png`).
+pub fn comfy_file_name(img: &ComfyImage) -> String {
+    match img.started_unix.and_then(stamp_from_unix) {
+        Some(stamp) => format!("{stamp}_{}", img.filename),
+        None => format!("image_{}", img.filename),
+    }
 }
 
 /// `2026-09-25_14-03-22_<image_name>`: sorts by time in Explorer and stays
@@ -242,6 +258,7 @@ pub struct OutputSync {
     store: SyncStore,
     output_dir: OutputDir,
     ledger: Ledger,
+    backend: Backend,
     tries: HashMap<String, u32>,
     /// Failed [`MAX_TRIES`] times: skipped by quick passes, retried by full
     /// ones, and always counted as missing.
@@ -292,10 +309,17 @@ impl OutputSync {
             store,
             output_dir,
             ledger,
+            backend: Backend::Invoke,
             tries: HashMap::new(),
             deferred: BTreeSet::new(),
             report,
         }
+    }
+
+    /// Which app's outputs to save. Invoke unless told otherwise.
+    pub fn with_backend(mut self, backend: Backend) -> Self {
+        self.backend = backend;
+        self
     }
 
     pub fn report(&self) -> SyncReport {
@@ -314,9 +338,12 @@ impl OutputSync {
         let folder = (self.output_dir)();
         self.report.folder = folder.to_string_lossy().into_owned();
         let mut t = Tally::default();
-        let result = match self.gallery_pass(full, &folder, &mut t).await {
-            Ok(()) => self.canvas_pass(full, &folder, &mut t).await,
-            Err(e) => Err(e),
+        let result = match self.backend {
+            Backend::Invoke => match self.gallery_pass(full, &folder, &mut t).await {
+                Ok(()) => self.canvas_pass(full, &folder, &mut t).await,
+                Err(e) => Err(e),
+            },
+            Backend::Comfyui => self.comfy_pass(full, &folder, &mut t).await,
         };
         self.report.saved = self.ledger.gallery.len();
         self.report.canvas_saved = self.ledger.canvas.len();
@@ -358,6 +385,35 @@ impl OutputSync {
                 return Ok(());
             }
         }
+    }
+
+    /// ComfyUI keeps every finished prompt in `/history`; save the new output
+    /// images. A quick pass reads the latest few, the last pass everything.
+    async fn comfy_pass(
+        &mut self,
+        full: bool,
+        folder: &Path,
+        t: &mut Tally,
+    ) -> Result<(), SidecarError> {
+        let max = if full { "1000" } else { "64" };
+        let history = self
+            .sidecar
+            .comfy_json(
+                &self.base,
+                &self.secret,
+                &["history"],
+                &[("max_items", max)],
+            )
+            .await?;
+        for img in parse_history(&history) {
+            let key = img.key();
+            if self.ledger.knows(&key) || self.skip(&key, full) {
+                continue;
+            }
+            let outcome = self.fetch_comfy(&img, &key, folder).await;
+            self.record(&key, outcome, t);
+        }
+        Ok(())
     }
 
     async fn canvas_pass(
@@ -457,6 +513,41 @@ impl OutputSync {
     fn persist(&self) {
         if let Err(e) = self.store.save(self.instance_id, &self.ledger) {
             eprintln!("[sloptweak] couldn't save the sync ledger: {e}");
+        }
+    }
+
+    /// Download one ComfyUI output and write it.
+    async fn fetch_comfy(&mut self, img: &ComfyImage, key: &str, folder: &Path) -> Outcome {
+        let bytes = match self
+            .sidecar
+            .comfy_bytes(
+                &self.base,
+                &self.secret,
+                &["view"],
+                &img.view_query(),
+                MAX_IMAGE_BYTES,
+            )
+            .await
+        {
+            Ok(b) if looks_like_image(&b) => b,
+            // Cleared on the instance between listing and download.
+            Err(SidecarError::Http(404)) => return Outcome::Ignore(None),
+            other => {
+                let why = match other {
+                    Ok(_) => "the GPU sent something that isn't an image".to_string(),
+                    Err(e) => e.to_string(),
+                };
+                let n = self.tries.entry(key.to_string()).or_default();
+                *n += 1;
+                if *n >= MAX_TRIES {
+                    self.deferred.insert(key.to_string());
+                }
+                return Outcome::Retry(format!("Couldn't download an image: {why}"));
+            }
+        };
+        match write_atomic(&folder.join(comfy_file_name(img)), &bytes) {
+            Ok(()) => Outcome::Saved(Kind::Gallery),
+            Err(e) => Outcome::Retry(format!("Couldn't save to {}: {e}", folder.display())),
         }
     }
 
