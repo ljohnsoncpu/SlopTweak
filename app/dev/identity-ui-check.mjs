@@ -34,12 +34,13 @@ const FAKE_VAST = "ab".repeat(32);
 const FAKE_CIVITAI = "mockcivitaikey0123456789abcdef";
 
 // Two small "character sheets" (valid PNGs: a solid colour each).
-function png(r, g, b) {
-  // 8x8 RGB PNG built by hand (zlib via node).
-  const raw = Buffer.alloc(8 * (1 + 8 * 3));
-  for (let y = 0; y < 8; y++) {
-    raw[y * 25] = 0;
-    for (let x = 0; x < 8; x++) raw.set([r, g, b], y * 25 + 1 + x * 3);
+function png(r, g, b, w = 8, h = 8) {
+  // w x h RGB PNG built by hand (zlib via node).
+  const stride = 1 + w * 3;
+  const raw = Buffer.alloc(h * stride);
+  for (let y = 0; y < h; y++) {
+    raw[y * stride] = 0;
+    for (let x = 0; x < w; x++) raw.set([r, g, b], y * stride + 1 + x * 3);
   }
   const crcTable = Array.from({ length: 256 }, (_, n) => {
     let c = n;
@@ -60,8 +61,8 @@ function png(r, g, b) {
     return Buffer.concat([len, td, c]);
   };
   const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(8, 0);
-  ihdr.writeUInt32BE(8, 4);
+  ihdr.writeUInt32BE(w, 0);
+  ihdr.writeUInt32BE(h, 4);
   ihdr[8] = 8;
   ihdr[9] = 2;
   return Buffer.concat([
@@ -74,7 +75,7 @@ function png(r, g, b) {
 const sheetA = join(SHOTS, "fox.png");
 const sheetB = join(SHOTS, "wolf.png");
 writeFileSync(sheetA, png(210, 120, 40));
-writeFileSync(sheetB, png(90, 110, 130));
+writeFileSync(sheetB, png(90, 110, 130, 240, 300));
 
 function start(cmd, args, opts = {}) {
   const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, ...opts });
@@ -148,7 +149,7 @@ async function connect() {
     writeFileSync(file, Buffer.from(r.result.data, "base64"));
     console.log(`shot  ${file}`);
   };
-  return { ws, evaluate, shot };
+  return { ws, evaluate, shot, send };
 }
 
 const q = (id) => `document.getElementById(${JSON.stringify(id)})`;
@@ -169,7 +170,7 @@ async function run() {
       SLOPTWEAK_DEV_PICK_REF: `${sheetA};${sheetB};${sheetB}`,
     },
   });
-  const { ws, evaluate, shot } = await connect();
+  const { ws, evaluate, shot, send } = await connect();
   await waitFor(async () => (await evaluate(`${q("model")}.options.length`)) > 0, 30000, "ui");
   await sleep(800);
 
@@ -265,12 +266,55 @@ async function run() {
   await sleep(500);
   check("a result can become the picture to edit", await evaluate(`!!${q("ref-img-2")}.querySelector('img') && ${q("id-mode")}.value === 'edit'`));
   await shot("i5-edit-mode");
+
+  // Strength slider and a painted area (real mouse events on the editor canvas).
+  await evaluate(click("ref-pick-2")); // the mock's results are tiny: paint on a real-sized picture
+  await sleep(600);
+  await evaluate(setValue("id-strength", "70"));
+  check("the slider shows its value", (await evaluate(text("id-strength-val"))) === "70%");
+  check("no painted area yet", !(await evaluate(visible("mask-clear"))) && !(await evaluate(visible("mask-zoom-row"))));
+  await evaluate(click("mask-open"));
+  await waitFor(async () => await evaluate(`!${q("masker")}.hidden && ${q("mask-base")}.naturalWidth > 0`), 10000, "mask editor");
+  await evaluate(`${q("mask-base")}.style.width = '400px'; ${q("mask-base")}.style.maxWidth = 'none'`);
+  await sleep(300);
+  const box = await evaluate(`(() => { const r = ${q("mask-canvas")}.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; })()`);
+  const mouse = (type, fx, fy, buttons) =>
+    send("Input.dispatchMouseEvent", { type, x: box.x + box.w * fx, y: box.y + box.h * fy, button: "left", buttons, clickCount: 1 });
+  await evaluate(setValue("mask-size", "60"));
+  await mouse("mouseMoved", 0.25, 0.25, 0);
+  await mouse("mousePressed", 0.25, 0.25, 1);
+  await mouse("mouseMoved", 0.6, 0.4, 1);
+  await mouse("mouseMoved", 0.6, 0.7, 1);
+  await mouse("mouseReleased", 0.6, 0.7, 0);
+  const painted = () => evaluate(`(() => { const c = ${q("mask-canvas")}; const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let n = 0; for (let i = 3; i < d.length; i += 4) if (d[i] > 40) n++; return n; })()`);
+  const dots = await painted();
+  check("painting marks the canvas", dots > 4, `${dots} px`);
+  await evaluate(click("mask-undo"));
+  check("Undo takes the stroke back", (await painted()) === 0);
+  await mouse("mouseMoved", 0.3, 0.3, 0);
+  await mouse("mousePressed", 0.3, 0.3, 1);
+  await mouse("mouseMoved", 0.7, 0.6, 1);
+  await mouse("mouseReleased", 0.7, 0.6, 0);
+  await shot("i6-painting");
+  await evaluate(click("mask-done"));
+  await waitFor(async () => await evaluate(visible("mask-clear")), 10000, "painted area kept");
+  check("Done keeps the painted area and offers zoom", (await evaluate(visible("mask-zoom-row"))) && (await evaluate(`!!${q("ref-img-2")}.querySelector('img.mask-overlay')`)));
+  check("the hint says only the painted area changes", (await evaluate(text("id-strength-hint"))).includes("painted area"));
+  await evaluate(click("id-go"));
+  await waitFor(async () => (await evaluate(`${q("id-results")}.querySelectorAll('img').length`)) === 4, 30000, "painted-edit result");
+  check("a painted edit with zoom completes", !(await evaluate(text("id-msg"))).toLowerCase().includes("paint"));
+  await evaluate(click("mask-clear"));
+  check("Remove painted area clears it", !(await evaluate(visible("mask-clear"))));
+  await evaluate(`${q("ref-img-2")}.querySelector('img').click()`);
+  check("clicking a picture opens the big view", await evaluate(visible("lightbox")));
+  await evaluate(click("lightbox-close"));
+  check("Close closes it", !(await evaluate(visible("lightbox"))));
   await evaluate(setValue("id-mode", "new"));
   await sleep(300);
   check("New image mode brings back character 2 and Shape", (await evaluate(visible("ref-box-1"))) && (await evaluate(visible("id-aspect-row"))) && !(await evaluate(visible("ref-box-2"))));
 
   // Saved while running; Stop saves the rest and destroys.
-  await waitFor(async () => filesIn(MOCK_OUT) >= before + 3, 30000, "files saved");
+  await waitFor(async () => filesIn(MOCK_OUT) >= before + 4, 30000, "files saved");
   check("all images were saved to the output folder", filesIn(MOCK_OUT) >= before + 3, `${filesIn(MOCK_OUT) - before} new`);
   await evaluate(click("stop"));
   await waitFor(async () => await evaluate(visible("start")), 60000, "stopped");

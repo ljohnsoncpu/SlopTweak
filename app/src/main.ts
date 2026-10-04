@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 // ----- types mirrored from src-tauri/src (session.rs, lib.rs, cost.rs) --------
 
@@ -1304,7 +1305,7 @@ function renderIdentity(): void {
   el("ref-box-1").hidden = editing;
   ui.idAspectRow.hidden = editing;
   ui.idIntro.textContent = editing
-    ? "Add the picture you want to change, say what should change, and press Edit image. The result keeps the picture's shape. You can add a character sheet too. Each image is saved to your output folder as it finishes."
+    ? "Add the picture you want to change, say what should change, and press Edit image. The result keeps the picture's shape. You can add a character sheet too, and paint just the part to change. Each image is saved to your output folder as it finishes."
     : "Add one or two of your characters, say what they're doing, and press Make image. The characters keep their look. Each image is saved to your output folder as it finishes.";
   ui.idPromptLabel.textContent = editing ? "What should change?" : "What are they doing?";
   ui.idPrompt.placeholder = editing
@@ -1315,10 +1316,13 @@ function renderIdentity(): void {
   identity.refs.forEach((r, slot) => {
     const box = el(`ref-img-${slot}`);
     const empty = slot === BASE_SLOT ? "No picture yet" : editing ? "No sheet (optional)" : "No character yet";
-    box.replaceChildren(r ? h("img", { src: r.data_url, alt: r.name, title: r.name }) : empty);
+    box.replaceChildren(...(r ? [zoomable(h("img", { src: r.data_url, alt: r.name, title: `${r.name} (click to enlarge)` })),
+      ...(slot === BASE_SLOT && painted ? [h("img", { class: "mask-overlay", src: painted.overlay, alt: "" })] : []),
+    ] : [empty]));
     el<HTMLButtonElement>(`ref-clear-${slot}`).hidden = !r;
     el<HTMLButtonElement>(`ref-pick-${slot}`).disabled = busy;
   });
+  renderEditTools(editing, identity.refs[BASE_SLOT] ?? null);
   const haveInputs = editing ? !!identity.refs[BASE_SLOT] : !!identity.refs[0] || !!identity.refs[1];
   ui.idGo.disabled = busy || !haveInputs || ui.idPrompt.value.trim() === "";
   ui.idGo.hidden = busy;
@@ -1330,7 +1334,7 @@ function renderIdentity(): void {
       h(
         "figure",
         {},
-        h("img", { src: r.data_url, alt: "Result" }),
+        zoomable(h("img", { src: r.data_url, alt: "Result", title: "Click to enlarge" }), r.id),
         h(
           "figcaption",
           {},
@@ -1372,6 +1376,320 @@ for (const slot of [0, 1, BASE_SLOT]) {
   el<HTMLButtonElement>(`ref-clear-${slot}`).onclick = () => void identityAct(invoke("identity_clear_ref", { slot }));
 }
 ui.idPrompt.oninput = () => renderIdentity();
+
+// ----- strength slider and the painted area (Edit mode) -----
+interface PaintedArea {
+  baseId: string;
+  /** Working canvas (long side <= MASK_WORK), painted red on transparent. */
+  work: HTMLCanvasElement;
+  /** PNG, white where the picture changes, at the picture's own size (base64). */
+  png: string;
+  width: number;
+  height: number;
+  bbox: { x: number; y: number; w: number; h: number };
+  overlay: string;
+}
+let painted: PaintedArea | null = null;
+const MASK_WORK = 1536;
+const MASK_UNDO = 10;
+
+const idStrength = el<HTMLInputElement>("id-strength");
+
+function renderEditTools(editing: boolean, base: IdentityImage | null): void {
+  if (painted && painted.baseId !== base?.id) painted = null;
+  el("id-edit-tools").hidden = !editing;
+  el<HTMLButtonElement>("mask-open").disabled = !base || identityBusy();
+  el<HTMLButtonElement>("mask-open").textContent = painted ? "Change the painted area…" : "Paint the area to change…";
+  el("mask-clear").hidden = !painted;
+  el("mask-zoom-row").hidden = !painted;
+  const v = Number(idStrength.value);
+  el("id-strength-val").textContent = `${v}%`;
+  el("id-strength-hint").textContent = painted
+    ? "Only the painted area changes. Everything else keeps its exact pixels."
+    : v >= 100
+      ? "Redraws the picture from your words, keeping its look and its characters."
+      : "Starts from your picture, so it changes less. It follows your words less closely.";
+}
+
+idStrength.oninput = () => renderIdentity();
+el("mask-clear").onclick = () => {
+  painted = null;
+  renderIdentity();
+};
+
+const masker = el("masker");
+const maskBase = el<HTMLImageElement>("mask-base");
+const maskCanvas = el<HTMLCanvasElement>("mask-canvas");
+const maskSize = el<HTMLInputElement>("mask-size");
+const maskCtx = () => maskCanvas.getContext("2d", { willReadFrequently: true })!;
+let maskErase = false;
+let maskUndo: ImageData[] = [];
+let maskNatural = { w: 0, h: 0 };
+
+function setMaskTool(erase: boolean): void {
+  maskErase = erase;
+  el("mask-paint").classList.toggle("on", !erase);
+  el("mask-erase").classList.toggle("on", erase);
+}
+
+el("mask-open").onclick = async () => {
+  const base = identity.refs[BASE_SLOT];
+  if (!base) return;
+  maskBase.src = base.data_url;
+  await maskBase.decode();
+  maskNatural = { w: maskBase.naturalWidth, h: maskBase.naturalHeight };
+  const k = Math.min(1, MASK_WORK / Math.max(maskNatural.w, maskNatural.h));
+  maskCanvas.width = Math.max(1, Math.round(maskNatural.w * k));
+  maskCanvas.height = Math.max(1, Math.round(maskNatural.h * k));
+  maskCtx().clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+  if (painted) maskCtx().drawImage(painted.work, 0, 0);
+  maskUndo = [];
+  setMaskTool(false);
+  masker.hidden = false;
+};
+
+const maskPoint = (e: PointerEvent) => {
+  const r = maskCanvas.getBoundingClientRect();
+  const k = maskCanvas.width / r.width;
+  return { x: (e.clientX - r.left) * k, y: (e.clientY - r.top) * k, k };
+};
+
+let stroke: { x: number; y: number } | null = null;
+function strokeTo(e: PointerEvent): void {
+  const p = maskPoint(e);
+  const c = maskCtx();
+  c.globalCompositeOperation = maskErase ? "destination-out" : "source-over";
+  c.strokeStyle = c.fillStyle = "rgb(255, 40, 40)";
+  c.lineCap = c.lineJoin = "round";
+  c.lineWidth = Number(maskSize.value) * p.k;
+  c.beginPath();
+  c.moveTo(stroke!.x, stroke!.y);
+  c.lineTo(p.x, p.y);
+  c.stroke();
+  stroke = { x: p.x, y: p.y };
+}
+
+maskCanvas.onpointerdown = (e) => {
+  maskCanvas.setPointerCapture(e.pointerId);
+  maskUndo.push(maskCtx().getImageData(0, 0, maskCanvas.width, maskCanvas.height));
+  if (maskUndo.length > MASK_UNDO) maskUndo.shift();
+  const p = maskPoint(e);
+  stroke = { x: p.x, y: p.y };
+  strokeTo(e); // a click paints a dot
+};
+maskCanvas.onpointermove = (e) => {
+  if (stroke) strokeTo(e);
+};
+maskCanvas.onpointerup = maskCanvas.onpointercancel = () => {
+  stroke = null;
+};
+el("mask-paint").onclick = () => setMaskTool(false);
+el("mask-erase").onclick = () => setMaskTool(true);
+el("mask-undo").onclick = () => {
+  const s = maskUndo.pop();
+  if (s) maskCtx().putImageData(s, 0, 0);
+};
+el("mask-reset").onclick = () => {
+  maskUndo.push(maskCtx().getImageData(0, 0, maskCanvas.width, maskCanvas.height));
+  maskCtx().clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+};
+el("mask-cancel").onclick = () => {
+  masker.hidden = true;
+};
+
+el("mask-done").onclick = async () => {
+  const base = identity.refs[BASE_SLOT];
+  masker.hidden = true;
+  if (!base) return;
+  const { w, h } = maskNatural;
+  // The picture's own size: scale the painted layer up, keep what is painted.
+  const full = document.createElement("canvas");
+  full.width = w;
+  full.height = h;
+  const fc = full.getContext("2d", { willReadFrequently: true })!;
+  fc.drawImage(maskCanvas, 0, 0, w, h);
+  const px = fc.getImageData(0, 0, w, h);
+  let x0 = w;
+  let y0 = h;
+  let x1 = -1;
+  let y1 = -1;
+  const d = px.data;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const on = d[i + 3]! > 40;
+      d[i] = d[i + 1] = d[i + 2] = on ? 255 : 0;
+      d[i + 3] = 255;
+      if (on) {
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+      }
+    }
+  }
+  if (x1 < 0) {
+    painted = null; // nothing painted
+    renderIdentity();
+    return;
+  }
+  fc.putImageData(px, 0, 0);
+  const blob = await new Promise<Blob | null>((ok) => full.toBlob(ok, "image/png"));
+  if (!blob) {
+    identityError = "Couldn't keep the painted area.";
+    renderIdentity();
+    return;
+  }
+  const png = await new Promise<string>((ok) => {
+    const r = new FileReader();
+    r.onload = () => ok(String(r.result).split(",")[1] ?? "");
+    r.readAsDataURL(blob);
+  });
+  const work = document.createElement("canvas");
+  work.width = maskCanvas.width;
+  work.height = maskCanvas.height;
+  work.getContext("2d")!.drawImage(maskCanvas, 0, 0);
+  painted = {
+    baseId: base.id,
+    work,
+    png,
+    width: w,
+    height: h,
+    bbox: { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 },
+    overlay: work.toDataURL("image/png"),
+  };
+  renderIdentity();
+};
+
+// ----- zoom, copy, save -----
+const lightbox = el("lightbox");
+const lightboxImg = el<HTMLImageElement>("lightbox-img");
+const lightboxMsg = el("lightbox-msg");
+const lightboxSave = el<HTMLButtonElement>("lightbox-save");
+let lightboxResult = "";
+
+/** Click opens the big view; right-click copies the picture. */
+function zoomable(img: HTMLImageElement, resultId = ""): HTMLImageElement {
+  img.onclick = () => openLightbox(img.src, resultId);
+  img.oncontextmenu = (e) => {
+    e.preventDefault();
+    void copyImage(img.src);
+  };
+  return img;
+}
+
+function openLightbox(src: string, resultId: string): void {
+  lightboxImg.src = src;
+  lightboxResult = resultId;
+  lightboxSave.hidden = !resultId;
+  lightboxMsg.textContent = "";
+  lightbox.hidden = false;
+}
+
+const closeLightbox = () => {
+  lightbox.hidden = true;
+  lightboxImg.removeAttribute("src");
+};
+
+async function copyImage(dataUrl: string): Promise<void> {
+  try {
+    const img = new Image();
+    img.src = dataUrl;
+    await img.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    canvas.getContext("2d")!.drawImage(img, 0, 0);
+    const blob = await new Promise<Blob | null>((ok) => canvas.toBlob(ok, "image/png"));
+    if (!blob) throw new Error("no image");
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+    lightboxMsg.textContent = "Copied. Paste it into any app.";
+    ui.idMsg.textContent = "Image copied.";
+  } catch (e) {
+    console.error(e);
+    lightboxMsg.textContent = "Couldn't copy the image. Use Save to Downloads instead.";
+    ui.idMsg.textContent = "Couldn't copy the image.";
+  }
+}
+
+el("lightbox-close").onclick = closeLightbox;
+el("lightbox-copy").onclick = () => void copyImage(lightboxImg.src);
+lightboxImg.oncontextmenu = (e) => {
+  e.preventDefault();
+  void copyImage(lightboxImg.src);
+};
+lightbox.onclick = (e) => {
+  if (e.target === lightbox) closeLightbox();
+};
+lightboxSave.onclick = async () => {
+  try {
+    const path = await invoke<string>("identity_save_result", { id: lightboxResult });
+    lightboxMsg.textContent = `Saved to ${path}`;
+  } catch (e) {
+    lightboxMsg.textContent = String(e);
+  }
+};
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !lightbox.hidden) closeLightbox();
+});
+
+// ----- drop files / paste images into the picture boxes -----
+const visibleSlots = () => (identityEditing() ? [BASE_SLOT, 0] : [0, 1]);
+let hoverSlot: number | null = null;
+for (const slot of [0, 1, BASE_SLOT]) {
+  const box = el(`ref-box-${slot}`);
+  box.onmouseenter = () => (hoverSlot = slot);
+  box.onmouseleave = () => (hoverSlot = null);
+}
+
+function slotAt(x: number, y: number): number | null {
+  const box = document.elementFromPoint(x / devicePixelRatio, y / devicePixelRatio)?.closest(".ref");
+  const m = box?.id.match(/^ref-box-(\d)$/);
+  return m ? Number(m[1]) : null;
+}
+
+/** Where a pasted or dropped picture goes: the box it's over, else the first empty one. */
+function pickSlot(over: number | null, taken: Set<number>): number {
+  const slots = visibleSlots();
+  if (over !== null && slots.includes(over) && !taken.has(over)) return over;
+  return slots.find((s) => !identity.refs[s] && !taken.has(s)) ?? slots.find((s) => !taken.has(s)) ?? slots[0]!;
+}
+
+function markDrop(slot: number | null): void {
+  for (const s of [0, 1, BASE_SLOT]) el(`ref-img-${s}`).classList.toggle("drop", s === slot);
+}
+
+void getCurrentWebview().onDragDropEvent((event) => {
+  const p = event.payload;
+  if (!isIdentity() || identityBusy() || p.type === "leave") return markDrop(null);
+  const over = slotAt(p.position.x, p.position.y);
+  if (p.type !== "drop") return markDrop(over !== null && visibleSlots().includes(over) ? over : null);
+  markDrop(null);
+  const taken = new Set<number>();
+  const jobs = p.paths.slice(0, visibleSlots().length).map((path, i) => {
+    const slot = pickSlot(i === 0 ? over : null, taken);
+    taken.add(slot);
+    return invoke("identity_set_ref_path", { slot, path });
+  });
+  void identityAct(Promise.all(jobs));
+}).catch((e) => console.error("drag and drop is unavailable", e));
+
+document.addEventListener("paste", (e) => {
+  if (!isIdentity() || identityBusy()) return;
+  const files = [...(e.clipboardData?.files ?? [])].filter((f) => f.type.startsWith("image/"));
+  if (files.length === 0) return; // plain text: let the box handle it
+  e.preventDefault();
+  const taken = new Set<number>();
+  const jobs = files.slice(0, visibleSlots().length).map(async (f, i) => {
+    const slot = pickSlot(i === 0 ? hoverSlot : null, taken);
+    taken.add(slot);
+    const bytes = new Uint8Array(await f.arrayBuffer());
+    let bin = "";
+    for (let k = 0; k < bytes.length; k += 0x8000) bin += String.fromCharCode(...bytes.subarray(k, k + 0x8000));
+    await invoke("identity_set_ref_data", { slot, name: f.name || "pasted image", data: btoa(bin) });
+  });
+  void identityAct(Promise.all(jobs));
+});
 ui.idMode.onchange = () => renderIdentity();
 ui.idGo.onclick = () =>
   void identityAct(
@@ -1379,6 +1697,17 @@ ui.idGo.onclick = () =>
       prompt: ui.idPrompt.value,
       aspect: ui.idAspect.value,
       mode: ui.idMode.value,
+      strength: identityEditing() ? Number(idStrength.value) : null,
+      mask:
+        identityEditing() && painted
+          ? {
+              png: painted.png,
+              width: painted.width,
+              height: painted.height,
+              bbox: painted.bbox,
+              zoom: el<HTMLInputElement>("mask-zoom").checked,
+            }
+          : null,
     }),
   );
 ui.idCancel.onclick = () => void identityAct(invoke("identity_cancel"));

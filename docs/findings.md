@@ -2043,3 +2043,92 @@ framing were kept, and the output was 896×1152, the picture's own size. Stop
 destroyed the instance; Vast showed none left. **Spend: credit $5.2462 →
 $5.0851 = $0.16.** 2/2 checks. 🧪 Still not tried: JPEG/WebP bases, non-square
 and non-Wulver-made pictures, and prompts with faces or anatomy edits.
+
+## "Open ComfyUI" showed an empty workflow: sidecar decoded `%2F` (2026-10-04)
+User report: the preloaded `SlopTweak Identity Edit` workflow is listed but opens
+as an empty canvas. **Cause found by reading, not on a GPU:** the sidecar built the
+upstream URL from `request.rel_url.path_qs`, which is *decoded*. The frontend opens
+a saved workflow at `/api/userdata/workflows%2FSlopTweak%20Identity%20Edit.json`
+(one encoded segment); decoded, that became `/userdata/workflows/SlopTweak Identity
+Edit.json`, which ComfyUI's single-segment `/userdata/{file}` route doesn't match
+(404), so the listing worked and the load didn't. The JSON itself is fine (valid
+v0.4 graph, 24 nodes, all in view).
+- **Fix:** the sidecar forwards `request.raw_path` and sends it as
+  `yarl.URL(..., encoded=True)` (HTTP and `/ws`). Test
+  `test_comfy_encoded_slash_and_spaces_reach_comfy_unchanged` fails before and
+  passes after. Affects both backends.
+- 🧪 Needs a new instance bundle (new `ASSETS_SHA256`, release) and a live check:
+  click the workflow and see the graph. Not published yet.
+- Still untested live: that every node in that graph is available (it uses
+  `ResolutionSelector`, which should be core) and that the file names inside it
+  match our model files (its `Krea2/krea2_identity_edit_v1_2.safetensors` LoRA
+  path may differ from what `provision.sh` installs), so a first run from that
+  workflow may still need its loaders picked by hand.
+
+## Edit strength, painted-area edits, zoomed redraw (2026-10-04)
+Built and unit-tested (198 Rust tests, 41 sidecar tests); live results are in the
+next section.
+Spend while building: $0. All node classes used are ComfyUI core: `ImageScale`, `ImageCrop`,
+`VAEEncode`, `ImageToMask`, `GrowMask`, `SetLatentNoiseMask`, `MaskToImage`,
+`ImageBlur`, `ImageCompositeMasked`.
+- **Strength slider (50-100, default 100):** 100 with no painted area is the
+  unchanged route 1 graph (test: byte-equal to the plain graph). Lower values use
+  route 2 (`VAEEncode` of the picture scaled to the canvas, KSampler `denoise` =
+  value/100). The patch's `target_latent` stays the empty canvas latent.
+- **Painted area:** the window sends a PNG at the picture's own size (white = change)
+  plus the painted bounding box. The graph is route 3 (`SetLatentNoiseMask` on the
+  encoded picture, mask grown 8 px) and then pastes the redrawn area back into the
+  **original** picture through a blurred copy of the mask (`ImageCompositeMasked`),
+  so pixels outside the area are untouched and the result has the picture's own size.
+  Sampling uses `denoise` = the slider (default 1.0, the best setting in the spike).
+- **Zoomed redraw:** `plan_crop` cuts the painted box plus a quarter of its size
+  (at least 64 px) as context, grows the short side to the canvas's shape, and uses
+  a ~1 MP canvas (`fit_size`); the model sees the crop as its picture (reference 1),
+  the result is scaled back to the crop's size and pasted at the crop's place. It is
+  skipped (whole picture) when the crop would already be the size of the canvas or
+  more than 60 % of the picture.
+- 🧪 To confirm live: the seam quality, that `ImageBlur`/`GrowMask` inputs match the
+  pinned ComfyUI v0.38.0 (the graph is validated by ComfyUI at queue time, a wrong
+  input fails with HTTP 400 "The GPU didn't accept the request"), whether `ref_boost`
+  4.0 is too strong on a zoomed crop, and EXIF-rotated JPEGs (the window sizes the
+  mask from the browser's decoded size; ComfyUI also applies the EXIF rotation).
+- **Preloaded workflow:** `provision.sh` now rewrites the four loader widgets of the
+  pack's workflow to the files we installed (the pack's own names differ), so its
+  model pickers don't show missing files. Bundle `instance-v0.1.6`
+  (SHA-256 `f0f7075e...1fa1`), published as a dev pre-release; `config.rs` pinned.
+- ⚠️ The mock UI check (`app/dev/identity-ui-check.mjs`) and the live spike script
+  launch their own `sloptweak.exe`. **They very likely cannot get a window while another debug
+  SlopTweak is open** (e.g. one started by `cargo run` / run-dev): the harness times
+  out with "main window" (seen 2026-10-04 with a `cargo run` instance open; probably the earlier unexplained timeout too, not confirmed). Close the other
+  window first.
+
+## Edit strength, painted-area edits, zoomed redraw: live run ✅ (2026-10-04)
+Instance 54168098, RTX 4080S 32 GB, Minnesota, $0.6022/hr, bundle `instance-v0.1.6`,
+ready in 943 s (model download ~14 min). **Spend: credit $14.3315 → $14.0564 =
+$0.28.** Stop destroyed it; none left. Script: `app/dev/edit-live.mjs`, which drives
+the panel itself (real mouse events paint the mask). Base: the fox+wolf café image
+(896x1152) with its sheet as reference 2, seed random per run. 8/8 checks.
+
+- **Open ComfyUI workflow:** `/api/userdata/workflows%2FSlopTweak%20Identity%20Edit.json`
+  now returns 200 (24 nodes); `app.loadGraphData` puts all 24 on the canvas; the four
+  loader widgets name the installed files (`wulver-v0.5-turbo`, `qwen3vl_4b_fp8_scaled`,
+  `qwen_image_vae`, `krea2_identity_edit_v1_2`). This confirms the `%2F` fix.
+  ⚠️ What a user sees on opening the window is ComfyUI's own **Templates** dialog
+  (first run), covering the canvas, with two "Unsaved Workflow" tabs; the SlopTweak
+  workflow is in the Workflows sidebar (`w`), not opened for them. That, plus the
+  404, is probably what "empty" looked like. Not changed.
+- **S1** strength 100, nothing painted: 76 s, 896x1152. The plain graph still works.
+- **S2** strength 70: 53 s. Keeps the green jacket and adds a red hoodie under it
+  (less change than S1, which swaps the jacket). Mean pixel change vs the base
+  outside the jacket 9.3 (S1: 13.8).
+- **S3** jacket painted, zoom off: 58 s, 896x1152. Clean red hoodie over the painted
+  area; only 0.21 mean change outside a box slightly larger than the jacket (the
+  painted strokes spill a little past it); no visible seam.
+- **S4** eyes painted, zoom on (crop with context, ~1 MP canvas, pasted back):
+  64 s, 896x1152. Bright green eyes, **0 pixels changed by more than 8 outside the
+  crop box**, no visible seam. This is the "regenerate a small area at higher
+  resolution without touching the style elsewhere" case.
+- All graph nodes were accepted by ComfyUI v0.38.0 (no HTTP 400). The earlier open
+  questions on node inputs are closed. Still untried: very large pictures,
+  EXIF-rotated JPEGs, very thin masks, and harder content (faces, hands).
+- Images are in the session scratch folder, not the repo.

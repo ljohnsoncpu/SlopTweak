@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-identity-set-ref-data"
+description = "Enables the identity_set_ref_data command without any pre-configured scope."
+commands.allow = ["identity_set_ref_data"]
+
+[[permission]]
+identifier = "deny-identity-set-ref-data"
+description = "Denies the identity_set_ref_data command without any pre-configured scope."
+commands.deny = ["identity_set_ref_data"]
