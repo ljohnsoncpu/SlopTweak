@@ -68,11 +68,22 @@
 
         <section id="identity" class="card" hidden>
           <h2>Identity Edit</h2>
-          <p class="muted small">
-            Add one or two of your characters, say what they're doing, and press Make image. The
-            characters keep their look. Each image is saved to your output folder as it finishes.
-          </p>
+          <div class="row">
+            <label for="id-mode">I want to</label>
+            <select id="id-mode">
+              <option value="new">Make a new image of my characters</option>
+              <option value="edit">Edit a picture</option>
+            </select>
+          </div>
+          <p id="id-intro" class="muted small"></p>
           <div class="refs">
+            <div id="ref-box-2" class="ref" hidden>
+              <div id="ref-img-2" class="ref-img"></div>
+              <div class="actions">
+                <button id="ref-pick-2" type="button">Picture to edit…</button>
+                <button id="ref-clear-2" type="button" class="ghost" hidden>Clear</button>
+              </div>
+            </div>
             <div class="ref">
               <div id="ref-img-0" class="ref-img"></div>
               <div class="actions">
@@ -80,7 +91,7 @@
                 <button id="ref-clear-0" type="button" class="ghost" hidden>Clear</button>
               </div>
             </div>
-            <div class="ref">
+            <div id="ref-box-1" class="ref">
               <div id="ref-img-1" class="ref-img"></div>
               <div class="actions">
                 <button id="ref-pick-1" type="button">Character 2 (optional)…</button>
@@ -88,10 +99,10 @@
               </div>
             </div>
           </div>
-          <label for="id-prompt">What are they doing?</label>
+          <label id="id-prompt-label" for="id-prompt">What are they doing?</label>
           <textarea id="id-prompt" rows="3" maxlength="2000" spellcheck="true"
             placeholder="They sit together at a sunny café table, laughing."></textarea>
-          <div class="row">
+          <div id="id-aspect-row" class="row">
             <label for="id-aspect">Shape</label>
             <select id="id-aspect">
               <option value="square">Square</option>

@@ -787,6 +787,7 @@ async fn identity_generate(
     st: State<'_, AppState>,
     prompt: String,
     aspect: identity::Aspect,
+    mode: Option<identity::Mode>,
 ) -> Result<(), String> {
     let target = identity_target(&st)?;
     let seed = std::time::SystemTime::now()
@@ -798,7 +799,9 @@ async fn identity_generate(
     // continues in the background.
     let (tx, rx) = tokio::sync::oneshot::channel();
     tauri::async_runtime::spawn(async move {
-        let r = svc.generate(&target, &prompt, aspect, seed).await;
+        let r = svc
+            .generate(&target, &prompt, mode.unwrap_or_default(), aspect, seed)
+            .await;
         let _ = tx.send(r);
     });
     // `generate` returns early with Err on a bad request, and otherwise only

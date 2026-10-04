@@ -166,7 +166,7 @@ async function run() {
       SLOPTWEAK_DEV_RESET: "1",
       SLOPTWEAK_CATALOG_URL: `http://127.0.0.1:${CATALOG_PORT}/catalog.json`,
       SLOPTWEAK_MAIN_DEBUG_PORT: String(CDP_PORT),
-      SLOPTWEAK_DEV_PICK_REF: `${sheetA};${sheetB}`,
+      SLOPTWEAK_DEV_PICK_REF: `${sheetA};${sheetB};${sheetB}`,
     },
   });
   const { ws, evaluate, shot } = await connect();
@@ -247,9 +247,31 @@ async function run() {
   check("Clear removes a sheet", await evaluate(`!${q("ref-img-1")}.querySelector('img')`));
   await shot("i4-two-results");
 
+  // Edit mode: a picture to edit (plus the sheet), size follows the picture.
+  await evaluate(setValue("id-mode", "edit"));
+  await sleep(400);
+  check("Edit mode shows the picture slot and hides character 2 and Shape", (await evaluate(visible("ref-box-2"))) && !(await evaluate(visible("ref-box-1"))) && !(await evaluate(visible("id-aspect-row"))));
+  check("the button says Edit image", (await evaluate(text("id-go"))) === "Edit image");
+  await evaluate(setValue("id-prompt", "Change the jacket into a red hoodie. Keep everything else."));
+  await sleep(300);
+  check("Edit image needs a picture", await evaluate(`${q("id-go")}.disabled`));
+  await evaluate(click("ref-pick-2"));
+  await waitFor(async () => await evaluate(`!!${q("ref-img-2")}.querySelector('img')`), 10000, "picture to edit");
+  check("Edit image turns on", !(await evaluate(`${q("id-go")}.disabled`)));
+  await evaluate(click("id-go"));
+  await waitFor(async () => (await evaluate(`${q("id-results")}.querySelectorAll('img').length`)) === 3, 30000, "edit result");
+  check("an edited image appears", true);
+  await evaluate(`${q("id-results")}.querySelectorAll('figure')[0].querySelectorAll('figcaption button')[2].click()`);
+  await sleep(500);
+  check("a result can become the picture to edit", await evaluate(`!!${q("ref-img-2")}.querySelector('img') && ${q("id-mode")}.value === 'edit'`));
+  await shot("i5-edit-mode");
+  await evaluate(setValue("id-mode", "new"));
+  await sleep(300);
+  check("New image mode brings back character 2 and Shape", (await evaluate(visible("ref-box-1"))) && (await evaluate(visible("id-aspect-row"))) && !(await evaluate(visible("ref-box-2"))));
+
   // Saved while running; Stop saves the rest and destroys.
-  await waitFor(async () => filesIn(MOCK_OUT) >= before + 2, 30000, "files saved");
-  check("both images were saved to the output folder", filesIn(MOCK_OUT) >= before + 2, `${filesIn(MOCK_OUT) - before} new`);
+  await waitFor(async () => filesIn(MOCK_OUT) >= before + 3, 30000, "files saved");
+  check("all images were saved to the output folder", filesIn(MOCK_OUT) >= before + 3, `${filesIn(MOCK_OUT) - before} new`);
   await evaluate(click("stop"));
   await waitFor(async () => await evaluate(visible("start")), 60000, "stopped");
   check("Stop returns to idle and hides the panel", !(await evaluate(visible("identity"))) && !(await evaluate(visible("open-comfy"))));

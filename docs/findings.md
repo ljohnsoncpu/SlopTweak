@@ -2019,3 +2019,27 @@ later. Two instances, both destroyed; Vast showed none left.
 - Content policy (PLAN §9.3) and the Krea license §4.2: this spike used SFW images;
   base-image editing lets users alter images they bring in, which is worth
   deciding on explicitly before shipping it.
+
+## Edit mode built: route 1 only (2026-10-03)
+The panel has **I want to: Make a new image / Edit a picture**. Edit mode sends
+the picture as reference 1 and the optional character sheet (slot 0) as reference
+2, with the canvas at the picture's own shape: `identity::fit_size` (about 1 MP,
+multiples of 64, 512-1536) from `identity::image_size` (PNG/JPEG/WebP headers;
+unreadable falls back to square). Slots: 0 and 1 are sheets, 2 is the picture
+(`BASE_SLOT`). No img2img or mask yet (routes 2 and 3 of the spike). Unit tests:
+header sizes, canvas rounding, reference order, a mock end-to-end edit; the mock
+UI check covers the mode switch and a mock edit (26/26). 🧪 Not run on a real GPU
+since the spike (the graph is the spike's route 1, except `fit_size` rounds to
+the base's shape instead of passing its exact size). Content policy (PLAN §9.3)
+and Krea license §4.2 are still undecided; editing user-supplied images touches both.
+
+### Edit mode, live (2026-10-03) ✅
+`node dev/vast-acceptance.mjs r5` (new run: debug file dialog answers slot 2 =
+the café picture, slot 0 = the fox sheet; `instance-v0.1.5`; price limit
+$0.75/hr, 60-min caps). Instance 54067728, RTX A6000 48 GB at $0.5422/hr, ready
+in 580 s. Edit mode made the edit in **71 s** (first image, includes the model
+load): the fox's green jacket became a red hoodie, the wolf, café, layout and
+framing were kept, and the output was 896×1152, the picture's own size. Stop
+destroyed the instance; Vast showed none left. **Spend: credit $5.2462 →
+$5.0851 = $0.16.** 2/2 checks. 🧪 Still not tried: JPEG/WebP bases, non-square
+and non-Wulver-made pictures, and prompts with faces or anatomy edits.

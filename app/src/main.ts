@@ -227,6 +227,10 @@ const ui = {
   outOpen: el<HTMLButtonElement>("out-open"),
   sync: el("sync"),
   identity: el("identity"),
+  idMode: el<HTMLSelectElement>("id-mode"),
+  idIntro: el("id-intro"),
+  idPromptLabel: el("id-prompt-label"),
+  idAspectRow: el("id-aspect-row"),
   idPrompt: el<HTMLTextAreaElement>("id-prompt"),
   idAspect: el<HTMLSelectElement>("id-aspect"),
   idGo: el<HTMLButtonElement>("id-go"),
@@ -1271,7 +1275,10 @@ interface IdentityView {
   message: string;
 }
 
-let identity: IdentityView = { refs: [null, null], results: [], phase: "idle", message: "" };
+let identity: IdentityView = { refs: [null, null, null], results: [], phase: "idle", message: "" };
+/** Slot 2 holds the picture to edit; slots 0 and 1 are character sheets. */
+const BASE_SLOT = 2;
+const identityEditing = () => ui.idMode.value === "edit";
 /** An error from the last click (a bad request), shown until the next state change. */
 let identityError = "";
 
@@ -1292,13 +1299,28 @@ function renderIdentity(): void {
   ui.identity.hidden = !isIdentity();
   if (!isIdentity()) return;
   const busy = identityBusy();
+  const editing = identityEditing();
+  el("ref-box-2").hidden = !editing;
+  el("ref-box-1").hidden = editing;
+  ui.idAspectRow.hidden = editing;
+  ui.idIntro.textContent = editing
+    ? "Add the picture you want to change, say what should change, and press Edit image. The result keeps the picture's shape. You can add a character sheet too. Each image is saved to your output folder as it finishes."
+    : "Add one or two of your characters, say what they're doing, and press Make image. The characters keep their look. Each image is saved to your output folder as it finishes.";
+  ui.idPromptLabel.textContent = editing ? "What should change?" : "What are they doing?";
+  ui.idPrompt.placeholder = editing
+    ? "Change the jacket into a red hoodie. Keep everything else the same."
+    : "They sit together at a sunny café table, laughing.";
+  ui.idGo.textContent = editing ? "Edit image" : "Make image";
+  el<HTMLButtonElement>("ref-pick-0").textContent = editing ? "Character sheet (optional)…" : "Character 1…";
   identity.refs.forEach((r, slot) => {
     const box = el(`ref-img-${slot}`);
-    box.replaceChildren(r ? h("img", { src: r.data_url, alt: r.name, title: r.name }) : "No character yet");
+    const empty = slot === BASE_SLOT ? "No picture yet" : editing ? "No sheet (optional)" : "No character yet";
+    box.replaceChildren(r ? h("img", { src: r.data_url, alt: r.name, title: r.name }) : empty);
     el<HTMLButtonElement>(`ref-clear-${slot}`).hidden = !r;
     el<HTMLButtonElement>(`ref-pick-${slot}`).disabled = busy;
   });
-  ui.idGo.disabled = busy || !identity.refs[0] && !identity.refs[1] || ui.idPrompt.value.trim() === "";
+  const haveInputs = editing ? !!identity.refs[BASE_SLOT] : !!identity.refs[0] || !!identity.refs[1];
+  ui.idGo.disabled = busy || !haveInputs || ui.idPrompt.value.trim() === "";
   ui.idGo.hidden = busy;
   ui.idCancel.hidden = !busy;
   ui.idMsg.textContent = identityError || identity.message;
@@ -1314,6 +1336,19 @@ function renderIdentity(): void {
           {},
           h("button", { class: "ghost", type: "button", disabled: busy, onclick: () => void identityUse(r.id, 0) }, "Use as character 1"),
           h("button", { class: "ghost", type: "button", disabled: busy, onclick: () => void identityUse(r.id, 1) }, "As character 2"),
+          h(
+            "button",
+            {
+              class: "ghost",
+              type: "button",
+              disabled: busy,
+              onclick: () => {
+                ui.idMode.value = "edit";
+                void identityUse(r.id, BASE_SLOT);
+              },
+            },
+            "Edit this image",
+          ),
         ),
       ),
     ),
@@ -1332,13 +1367,20 @@ async function identityAct(p: Promise<unknown>): Promise<void> {
 
 const identityUse = (id: string, slot: number) => identityAct(invoke("identity_use_result", { id, slot }));
 
-for (const slot of [0, 1]) {
+for (const slot of [0, 1, BASE_SLOT]) {
   el<HTMLButtonElement>(`ref-pick-${slot}`).onclick = () => void identityAct(invoke("identity_pick_ref", { slot }));
   el<HTMLButtonElement>(`ref-clear-${slot}`).onclick = () => void identityAct(invoke("identity_clear_ref", { slot }));
 }
 ui.idPrompt.oninput = () => renderIdentity();
+ui.idMode.onchange = () => renderIdentity();
 ui.idGo.onclick = () =>
-  void identityAct(invoke("identity_generate", { prompt: ui.idPrompt.value, aspect: ui.idAspect.value }));
+  void identityAct(
+    invoke("identity_generate", {
+      prompt: ui.idPrompt.value,
+      aspect: ui.idAspect.value,
+      mode: ui.idMode.value,
+    }),
+  );
 ui.idCancel.onclick = () => void identityAct(invoke("identity_cancel"));
 await listen("identity-changed", () => void refreshIdentity());
 
