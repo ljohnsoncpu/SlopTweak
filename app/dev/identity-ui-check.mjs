@@ -303,6 +303,17 @@ async function run() {
   await evaluate(click("id-go"));
   await waitFor(async () => (await evaluate(`${q("id-results")}.querySelectorAll('img').length`)) === 4, 30000, "painted-edit result");
   check("a painted edit with zoom completes", !(await evaluate(text("id-msg"))).toLowerCase().includes("paint"));
+  await evaluate(click("ref-pick-2")); // choosing a picture again starts without the old painted area
+  await sleep(800);
+  check("a new picture drops the painted area", !(await evaluate(visible("mask-clear"))));
+  await evaluate(click("mask-open"));
+  await waitFor(async () => await evaluate(`!${q("masker")}.hidden && ${q("mask-base")}.naturalWidth > 0`), 10000, "mask editor again");
+  const leftover = await evaluate(`(() => { const c = ${q("mask-canvas")}; const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let n = 0; for (let i = 3; i < d.length; i += 4) if (d[i] > 40) n++; return n; })()`);
+  check("the editor opens blank for the new picture", leftover === 0, `${leftover} px`);
+  await evaluate(click("mask-cancel"));
+  await evaluate(click("mask-open"));
+  await waitFor(async () => await evaluate(visible("masker")), 10000, "editor");
+  await evaluate(click("mask-cancel"));
   await evaluate(click("mask-clear"));
   check("Remove painted area clears it", !(await evaluate(visible("mask-clear"))));
   await evaluate(`${q("ref-img-2")}.querySelector('img').click()`);

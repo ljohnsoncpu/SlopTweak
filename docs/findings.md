@@ -2125,10 +2125,46 @@ the panel itself (real mouse events paint the mask). Base: the fox+wolf café im
   area; only 0.21 mean change outside a box slightly larger than the jacket (the
   painted strokes spill a little past it); no visible seam.
 - **S4** eyes painted, zoom on (crop with context, ~1 MP canvas, pasted back):
-  64 s, 896x1152. Bright green eyes, **0 pixels changed by more than 8 outside the
-  crop box**, no visible seam. This is the "regenerate a small area at higher
-  resolution without touching the style elsewhere" case.
+  64 s, 896x1152. Bright green eyes, no visible seam, **0 pixels changed by more
+  than 8 outside a box around the crop**. ⚠️ Caveat found later (see the large-picture
+  run): the script's S4 may have run with S3's jacket mask still on the picture, so
+  the crop was probably bigger than the eyes alone. The preserved-outside claim
+  holds for "outside the zoomed crop", not for "outside the eyes".
 - All graph nodes were accepted by ComfyUI v0.38.0 (no HTTP 400). The earlier open
   questions on node inputs are closed. Still untried: very large pictures,
   EXIF-rotated JPEGs, very thin masks, and harder content (faces, hands).
 - Images are in the session scratch folder, not the repo.
+
+## Large references: scaled down before encoding; live run (2026-10-04)
+Report: a job hung after two fairly large reference images. Cause (from the node
+README and our graph, not reproduced): `build_graph` VAE-encoded each reference at its
+own size (`LoadImage -> VAEEncode`), whatever the node later does with its own copy;
+a 20-50 MP picture then needs far more GPU memory than is free next to the 29 GB of
+models, ComfyUI offloads weights and the job crawls. The only limit was 15 MB of
+*file size*, which a well-compressed 50 MP JPEG passes.
+- **Fix:** references over 1.5 MP (or of unreadable size) go through core
+  `ImageScaleToTotalPixels` (`area`, 1 MP, steps of 8) before `VAEEncode`, the patch's
+  `source_image` and the grounded encode; smaller ones are untouched (never enlarged).
+  Pictures over 36 MP (about 6000x6000) are refused when added, with a plain message;
+  the painted-area mask has the same cap. Unit-tested (201 Rust tests).
+- **Live, A100 SXM4 80 GB, $0.7022/hr** (instance 54181677; a hair over the $0.70 cap
+  because Vast's price includes storage), ready in ~17 min, **spend $0.17**
+  (credit $13.3713 -> $13.2023). References: a 4480x5760 JPEG (25.8 MP) as the picture
+  and a 6144x4778 JPEG (29.4 MP) as the sheet, both about 2 MB. All 7 checks passed:
+  S1 (plain edit) 55 s; S3 (jacket painted, no zoom) 49 s with the result saved at the
+  picture's full 4480x5760; S4 (zoom) 49 s at 4480x5760. No hang, no OOM.
+- ⚠️ **S3/S4 in this run were not clean tests of the painted area.** The script
+  re-picked the picture and then opened the editor after a fixed 1.5 s; with three
+  26 MP results held in the panel (the window's state sends every result at full
+  size, so a refresh takes seconds) the old painted area had not cleared yet, so S4's
+  mask was S3's jacket plus the eyes. The edited region was therefore the whole upper
+  body, and its edges are slightly softer (re-rendered at 1 MP and scaled back); the
+  rest of the picture is the original. `edit-live.mjs` now waits for the old painted
+  area to clear. A clean S4 (eyes only) on a big picture has not been run.
+- **Open issue:** the panel's `identity_state` sends every kept result and reference
+  as a full-size base64 data URL on every refresh (up to 6 results). With 25 MP
+  results that is tens of MB per refresh. Fine for 1 MP images, sluggish for big
+  ones. Not changed (needs thumbnails; Rust has no image decoder).
+- **Mock UI check:** the harness's own cold vite start makes it time out waiting for the
+  UI most runs; with a warm `vite --port 1420` already running it passes (38/38 now,
+  including "a new picture drops the painted area").

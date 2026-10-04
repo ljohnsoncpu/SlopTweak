@@ -21,6 +21,14 @@ use crate::sidecar::{SidecarApi, SidecarError, MAX_IMAGE_BYTES};
 
 /// A reference sheet bigger than this is refused before it is sent.
 pub const MAX_REF_BYTES: usize = 15 * 1024 * 1024;
+/// A picture with more pixels than this is refused when it is added (about
+/// 6000 x 6000). The byte limit alone lets a well-compressed 50 MP photo through.
+pub const MAX_REF_PIXELS: u64 = 36 * 1024 * 1024;
+/// A reference bigger than this (in pixels) is scaled down on the GPU before it
+/// is encoded; smaller ones are used as they are (never enlarged).
+const SHRINK_ABOVE_PIXELS: u64 = 3 * 1024 * 1024 / 2;
+/// What a shrunken reference is scaled to (the model itself works at about 1 MP).
+const SHRUNK_MEGAPIXELS: f64 = 1.0;
 /// Finished images kept in the panel (they are also saved to the output folder).
 pub const MAX_RESULTS: usize = 6;
 const MAX_PROMPT_CHARS: usize = 2000;
@@ -290,7 +298,7 @@ fn make_plan(opts: &EditOpts, plain: (u32, u32)) -> Result<((u32, u32), EditPlan
     };
     let bad = || "The painted area doesn't fit the picture. Paint it again.".to_string();
     let (w, h, b) = (m.width, m.height, m.bbox);
-    if w == 0 || h == 0 || w > 16384 || h > 16384 {
+    if w == 0 || h == 0 || u64::from(w) * u64::from(h) > MAX_REF_PIXELS {
         return Err(bad());
     }
     let fits = |a: u32, len: u32, max: u32| len > 0 && a.checked_add(len).is_some_and(|e| e <= max);
@@ -334,6 +342,7 @@ const SEAM_BLUR: u32 = 8;
 /// The ComfyUI "API format" graph for one generation. `refs` are the file
 /// names of the uploaded pictures (1 or 2, in order; for an edit, the picture
 /// to edit comes first).
+#[cfg(test)]
 pub fn build_graph(
     files: &ModelFiles,
     refs: &[String],
@@ -341,6 +350,27 @@ pub fn build_graph(
     size: (u32, u32),
     seed: u64,
     edit: Option<&EditGraph>,
+) -> Value {
+    build_graph_with(files, refs, prompt, size, seed, edit, &[])
+}
+
+/// True when a reference is big enough to be scaled down before it is encoded
+/// (a header we can't read counts as big: scaling is always safe).
+pub fn needs_shrink(bytes: &[u8]) -> bool {
+    image_size(bytes).is_none_or(|(w, h)| u64::from(w) * u64::from(h) > SHRINK_ABOVE_PIXELS)
+}
+
+/// [`build_graph`] plus `shrink`: which references to scale down to about 1 MP
+/// first, so a huge picture is never VAE-encoded at its own size (that can fill
+/// the GPU's memory and make a job crawl).
+pub fn build_graph_with(
+    files: &ModelFiles,
+    refs: &[String],
+    prompt: &str,
+    size: (u32, u32),
+    seed: u64,
+    edit: Option<&EditGraph>,
+    shrink: &[bool],
 ) -> Value {
     let (w, h) = size;
     let edit = edit.filter(|e| !e.is_plain());
@@ -370,6 +400,12 @@ pub fn build_graph(
         // A zoomed edit shows the model the zoomed area, not the whole picture.
         let pixels = if i == 0 && zoomed {
             json!(["40", 0])
+        } else if shrink.get(i).copied().unwrap_or(false) {
+            let small = format!("7{i}");
+            g[&small] = json!({"class_type": "ImageScaleToTotalPixels", "inputs": {
+                "image": [&load, 0], "upscale_method": "area",
+                "megapixels": SHRUNK_MEGAPIXELS, "resolution_steps": 8}});
+            json!([&small, 0])
         } else {
             json!([&load, 0])
         };
@@ -613,6 +649,14 @@ impl IdentityService {
                 bytes.len() / 1_000_000,
                 MAX_REF_BYTES / 1_000_000
             ));
+        }
+        if let Some((w, h)) = image_size(&bytes) {
+            if u64::from(w) * u64::from(h) > MAX_REF_PIXELS {
+                return Err(format!(
+                    "That picture is too large ({w} x {h} pixels). Please use one under \
+                     36 megapixels, for example 6000 x 6000."
+                ));
+            }
         }
         {
             let mut i = self.inner.lock().unwrap();
@@ -924,7 +968,8 @@ impl IdentityService {
                 return Ok(None);
             }
         }
-        let graph = build_graph(&t.files, &names, prompt, size, seed, edit.as_ref());
+        let shrink: Vec<bool> = refs.iter().map(|r| needs_shrink(&r.bytes)).collect();
+        let graph = build_graph_with(&t.files, &names, prompt, size, seed, edit.as_ref(), &shrink);
         let queued = t
             .sidecar
             .comfy_post_json(
@@ -1163,6 +1208,46 @@ mod tests {
             None,
         );
         assert!(g3.get("22").is_none());
+    }
+
+    #[test]
+    fn big_references_are_scaled_down_before_they_are_encoded() {
+        let g = build_graph_with(
+            &files(),
+            &["a.png".into(), "b.png".into()],
+            "x",
+            (896, 1152),
+            1,
+            None,
+            &[true, false],
+        );
+        assert_eq!(g["70"]["class_type"], "ImageScaleToTotalPixels");
+        assert_eq!(g["70"]["inputs"]["image"], json!(["20", 0]));
+        assert_eq!(g["70"]["inputs"]["megapixels"], 1.0);
+        assert_eq!(g["30"]["inputs"]["pixels"], json!(["70", 0]));
+        assert_eq!(g["12"]["inputs"]["source_image"], json!(["70", 0]));
+        assert_eq!(g["4"]["inputs"]["image"], json!(["70", 0]));
+        // The small one is used as it is (not enlarged).
+        assert!(g.get("71").is_none());
+        assert_eq!(g["31"]["inputs"]["pixels"], json!(["21", 0]));
+    }
+
+    #[test]
+    fn only_big_or_unreadable_pictures_are_shrunk() {
+        assert!(!needs_shrink(&png_header(1024, 1024)));
+        assert!(!needs_shrink(&png_header(1200, 1200)));
+        assert!(needs_shrink(&png_header(2000, 2000)));
+        assert!(needs_shrink(&png_header(6000, 4000)));
+        assert!(needs_shrink(b"\x89PNG not really"));
+    }
+
+    #[test]
+    fn huge_pictures_are_refused_when_added() {
+        let s = svc();
+        assert!(s.set_ref(2, "ok.png", png_header(6000, 6000)).is_ok());
+        let err = s.set_ref(2, "big.png", png_header(8000, 8000)).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        assert!(err.contains("8000 x 8000"), "{err}");
     }
 
     fn edit_graph(denoise: f64, mask: Option<&str>, crop: Option<Rect>) -> EditGraph {
