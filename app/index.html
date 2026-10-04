@@ -76,6 +76,7 @@
             </select>
           </div>
           <p id="id-intro" class="muted small"></p>
+          <p class="muted small">Tip: drop picture files onto a box, or copy an image and press Ctrl+V. Click any picture to see it bigger; right-click copies it.</p>
           <div class="refs">
             <div id="ref-box-2" class="ref" hidden>
               <div id="ref-img-2" class="ref-img"></div>
@@ -84,7 +85,7 @@
                 <button id="ref-clear-2" type="button" class="ghost" hidden>Clear</button>
               </div>
             </div>
-            <div class="ref">
+            <div id="ref-box-0" class="ref">
               <div id="ref-img-0" class="ref-img"></div>
               <div class="actions">
                 <button id="ref-pick-0" type="button">Character 1…</button>
@@ -98,6 +99,24 @@
                 <button id="ref-clear-1" type="button" class="ghost" hidden>Clear</button>
               </div>
             </div>
+          </div>
+          <div id="id-edit-tools" hidden>
+            <div class="row">
+              <label for="id-strength">How much to change</label>
+              <span class="muted small">Stay close</span>
+              <input id="id-strength" type="range" min="50" max="100" step="5" value="100" />
+              <span class="muted small">Follow my words</span>
+              <strong id="id-strength-val"></strong>
+            </div>
+            <p id="id-strength-hint" class="muted small"></p>
+            <div class="actions">
+              <button id="mask-open" type="button">Paint the area to change…</button>
+              <button id="mask-clear" type="button" class="ghost" hidden>Remove painted area</button>
+            </div>
+            <label id="mask-zoom-row" class="small" hidden>
+              <input id="mask-zoom" type="checkbox" checked />
+              Zoom in on the painted area for more detail
+            </label>
           </div>
           <label id="id-prompt-label" for="id-prompt">What are they doing?</label>
           <textarea id="id-prompt" rows="3" maxlength="2000" spellcheck="true"
@@ -211,6 +230,34 @@
         </section>
       </div>
     </main>
+
+    <div id="lightbox" class="lightbox" hidden>
+      <img id="lightbox-img" alt="" />
+      <div class="actions">
+        <button id="lightbox-copy" type="button">Copy image</button>
+        <button id="lightbox-save" type="button">Save to Downloads</button>
+        <button id="lightbox-close" type="button" class="ghost">Close</button>
+      </div>
+      <p id="lightbox-msg" class="muted small"></p>
+    </div>
+
+    <div id="masker" class="lightbox" hidden>
+      <div class="mask-stage">
+        <img id="mask-base" alt="" />
+        <canvas id="mask-canvas"></canvas>
+      </div>
+      <div class="actions mask-tools">
+        <label for="mask-size" class="small">Brush</label>
+        <input id="mask-size" type="range" min="6" max="160" value="40" />
+        <button id="mask-paint" type="button" class="on">Paint</button>
+        <button id="mask-erase" type="button">Erase</button>
+        <button id="mask-undo" type="button">Undo</button>
+        <button id="mask-reset" type="button">Clear</button>
+        <button id="mask-done" type="button" class="primary">Done</button>
+        <button id="mask-cancel" type="button" class="ghost">Cancel</button>
+      </div>
+      <p class="muted small">Paint over what should change. The rest of the picture is kept exactly as it is.</p>
+    </div>
 
     <div id="modal" class="modal" hidden>
       <div class="dialog">

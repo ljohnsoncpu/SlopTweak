@@ -292,8 +292,38 @@ finish_comfy() {
   fi
   # Raw-UI users start from the working Identity Edit graph (Workflows sidebar).
   mkdir -p "$COMFY_DIR/user/default/workflows"
-  cp "$nodes/comfyui-krea2edit/workflows/krea2_identity_edit.json" \
-    "$COMFY_DIR/user/default/workflows/SlopTweak Identity Edit.json"
+  # The pack's file names differ from ours, so point its loaders at the files
+  # placed above (otherwise the pickers show missing models).
+  MODEL_LINES="$MODEL_LINES" "$SIDECAR_VENV/bin/python" - \
+    "$nodes/comfyui-krea2edit/workflows/krea2_identity_edit.json" \
+    "$COMFY_DIR/user/default/workflows/SlopTweak Identity Edit.json" <<'PY' ||
+import json
+import os
+import sys
+
+loaders = {
+    "diffusion_models": "UNETLoader",
+    "text_encoders": "CLIPLoader",
+    "vae": "VAELoader",
+    "loras": "LoraLoaderModelOnly",
+}
+names = {}
+for line in os.environ["MODEL_LINES"].splitlines():
+    parts = line.split("\t")
+    if len(parts) >= 6 and parts[5] in loaders:
+        names[loaders[parts[5]]] = parts[3]
+with open(sys.argv[1], encoding="utf-8") as f:
+    graph = json.load(f)
+for node in graph["nodes"]:
+    if node.get("type") in names and node.get("widgets_values"):
+        node["widgets_values"][0] = names[node["type"]]
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(graph, f)
+PY
+    log "WARNING: could not adapt the preloaded workflow; copying it as is"
+  [[ -s "$COMFY_DIR/user/default/workflows/SlopTweak Identity Edit.json" ]] ||
+    cp "$nodes/comfyui-krea2edit/workflows/krea2_identity_edit.json" \
+      "$COMFY_DIR/user/default/workflows/SlopTweak Identity Edit.json"
 
   status starting "starting ComfyUI"
   (cd "$COMFY_DIR" && nohup setsid "$COMFY_PYTHON" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention \

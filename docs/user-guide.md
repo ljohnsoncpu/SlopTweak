@@ -263,6 +263,24 @@ Your words win over a character sheet: if the sheet shows a green jacket and you
 ask for a red hoodie, you get the hoodie. *Edit this image* under a result sends
 it back in to be edited again.
 
+**How much to change.** The slider under the pictures goes from *Stay close* to
+*Follow my words*. At the right end (the default) the picture is redrawn from your
+words. Moving it left starts from your picture instead, so it changes less, but it
+follows your words less closely.
+
+**Paint just the part to change.** *Paint the area to change…* opens your picture
+full size: paint over what should change (the brush size, Undo, Erase and Clear are
+under it) and press Done. Only that area is redrawn; the rest of the picture keeps
+its exact pixels, and the result is saved at your picture's own size. With *Zoom in
+on the painted area* ticked (the default), a small area is cut out, redrawn at much
+higher detail, and put back. That's the way to fix a face or hands without changing
+the style of everything else. Painting again, or choosing another picture, replaces
+the painted area.
+
+**Pictures.** Click any picture to see it bigger; right-click copies it. A result's
+zoomed view also has *Save to Downloads*. To add a picture, drag a file onto its box
+or copy an image and press Ctrl+V.
+
 Notes: *Cancel* stops an image that's running. **Stop** works as always: it saves
 what's left and shuts the GPU down, so nothing keeps billing. The Invoke-only
 parts of SlopTweak (the tutorial, templates, workflows and your CivitAI LoRAs)

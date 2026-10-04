@@ -722,7 +722,11 @@ async fn identity_pick_ref(
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
-        .set_title("Choose a character sheet")
+        .set_title(if slot == identity::BASE_SLOT {
+            "Choose the picture to edit"
+        } else {
+            "Choose a character sheet"
+        })
         .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
         .pick_file(move |p| {
             let _ = tx.send(p);
@@ -734,16 +738,67 @@ async fn identity_pick_ref(
     else {
         return Ok(());
     };
-    let meta = std::fs::metadata(&path).map_err(|e| format!("Couldn't open that file: {e}"))?;
+    set_ref_from_path(&st, slot, &path)
+}
+
+/// Read an image file into a reference slot (size checked before reading).
+fn set_ref_from_path(st: &AppState, slot: usize, path: &std::path::Path) -> Result<(), String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("Couldn't open that file: {e}"))?;
+    if !meta.is_file() {
+        return Err("That isn't a file.".into());
+    }
     if meta.len() > identity::MAX_REF_BYTES as u64 {
         return Err("That image is too big (the limit is 15 MB).".into());
     }
-    let bytes = std::fs::read(&path).map_err(|e| format!("Couldn't read that file: {e}"))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("Couldn't read that file: {e}"))?;
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "image".into());
     st.identity.set_ref(slot, &name, bytes)
+}
+
+/// A file dropped on a slot (the window reports its path).
+#[tauri::command]
+async fn identity_set_ref_path(
+    st: State<'_, AppState>,
+    slot: usize,
+    path: String,
+) -> Result<(), String> {
+    set_ref_from_path(&st, slot, std::path::Path::new(&path))
+}
+
+/// An image pasted from the clipboard (base64 of the file bytes).
+#[tauri::command]
+async fn identity_set_ref_data(
+    st: State<'_, AppState>,
+    slot: usize,
+    name: String,
+    data: String,
+) -> Result<(), String> {
+    use base64::Engine;
+    if data.len() > identity::MAX_REF_BYTES / 3 * 4 + 8 {
+        return Err("That image is too big (the limit is 15 MB).".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|_| "Couldn't read that image.".to_string())?;
+    st.identity.set_ref(slot, &name, bytes)
+}
+
+/// Copy a finished image into the Downloads folder; returns where it went.
+#[tauri::command]
+async fn identity_save_result(
+    app: AppHandle,
+    st: State<'_, AppState>,
+    id: String,
+) -> Result<String, String> {
+    let dir = app
+        .path()
+        .download_dir()
+        .map_err(|_| "Couldn't find your Downloads folder.".to_string())?;
+    let path = st.identity.save_result(&id, &dir)?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -788,8 +843,11 @@ async fn identity_generate(
     prompt: String,
     aspect: identity::Aspect,
     mode: Option<identity::Mode>,
+    strength: Option<u32>,
+    mask: Option<identity::MaskInput>,
 ) -> Result<(), String> {
     let target = identity_target(&st)?;
+    let opts = identity::EditOpts { strength, mask };
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64 & ((1 << 52) - 1))
@@ -800,7 +858,14 @@ async fn identity_generate(
     let (tx, rx) = tokio::sync::oneshot::channel();
     tauri::async_runtime::spawn(async move {
         let r = svc
-            .generate(&target, &prompt, mode.unwrap_or_default(), aspect, seed)
+            .generate_with(
+                &target,
+                &prompt,
+                mode.unwrap_or_default(),
+                aspect,
+                seed,
+                &opts,
+            )
             .await;
         let _ = tx.send(r);
     });
@@ -1524,6 +1589,9 @@ pub fn run() {
             identity_state,
             identity_pick_ref,
             identity_clear_ref,
+            identity_set_ref_path,
+            identity_set_ref_data,
+            identity_save_result,
             identity_use_result,
             identity_generate,
             identity_cancel,

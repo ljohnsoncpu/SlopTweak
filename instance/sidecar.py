@@ -36,6 +36,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
+from yarl import URL
 
 log = logging.getLogger("sloptweak.sidecar")
 
@@ -344,7 +345,9 @@ class Sidecar:
         headers = self._upstream_headers(request)
         if self.cfg.backend == "comfyui" and not self._rewrite_browser_origin(request, headers):
             return web.Response(status=403, text="cross-origin request refused")
-        url = self.cfg.upstream + request.rel_url.path_qs
+        # The path as the browser sent it: decoding it would turn ComfyUI's
+        # `/userdata/workflows%2Fname.json` into a path with a real slash (404).
+        url = self.cfg.upstream + request.raw_path
         if request.headers.get("Upgrade", "").lower() == "websocket":
             return await self._proxy_ws(request, url, headers)
         return await self._proxy_http(request, url, headers)
@@ -387,7 +390,11 @@ class Sidecar:
         body = await request.read()
         try:
             upstream = await self._http.request(
-                request.method, url, headers=headers, data=body, allow_redirects=False
+                request.method,
+                URL(url, encoded=True),
+                headers=headers,
+                data=body,
+                allow_redirects=False,
             )
         except OSError:
             return web.Response(status=503, text="The app is not running yet")
@@ -409,7 +416,7 @@ class Sidecar:
         ws_headers = {k: v for k, v in headers.items() if not k.lower().startswith("sec-websocket")}
         try:
             upstream = await self._http.ws_connect(
-                url.replace("http", "ws", 1), headers=ws_headers, autoping=True
+                URL(url.replace("http", "ws", 1), encoded=True), headers=ws_headers, autoping=True
             )
         except OSError:
             return web.Response(status=503, text="The app is not running yet")

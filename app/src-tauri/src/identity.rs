@@ -5,6 +5,7 @@
 //! ever sees the launch secret, never a browser (ComfyUI refuses requests that
 //! carry an `Origin`, so a webview couldn't talk to it anyway).
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -159,6 +160,177 @@ pub fn fit_size(w: u32, h: u32) -> (u32, u32) {
     (snap(w), snap(h))
 }
 
+/// A rectangle in picture pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// The area the user painted over the picture to edit.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MaskInput {
+    /// A PNG, white where the picture should change (base64).
+    pub png: String,
+    /// The picture's size as the window sees it (the mask has the same size).
+    pub width: u32,
+    pub height: u32,
+    /// Smallest rectangle around everything painted.
+    pub bbox: Rect,
+    /// Work on the painted area alone, zoomed in, for more detail.
+    pub zoom: bool,
+}
+
+/// Optional extras for an edit: how far to go, and where.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EditOpts {
+    /// 50..=100: how much the picture may change. 100 re-draws it from the
+    /// words alone (the default); lower stays closer to the original.
+    pub strength: Option<u32>,
+    pub mask: Option<MaskInput>,
+}
+
+/// What the graph needs beyond the plain edit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditGraph {
+    /// Denoise of the sampler (1.0 = no head start from the picture).
+    pub denoise: f64,
+    /// The picture's size (or the zoomed area's size) the result is put back at.
+    pub region: (u32, u32),
+    /// Uploaded file name of the mask, when the user painted one.
+    pub mask: Option<String>,
+    /// The zoomed area, when working on part of the picture.
+    pub crop: Option<Rect>,
+}
+
+impl EditGraph {
+    /// True when the plain "empty canvas" graph is enough.
+    fn is_plain(&self) -> bool {
+        self.mask.is_none() && self.denoise >= 1.0
+    }
+}
+
+/// How the area around a painted region is cut out and zoomed, and what
+/// canvas the model works on. `None` = use the whole picture.
+pub fn plan_crop(image: (u32, u32), bbox: Rect) -> (Option<Rect>, (u32, u32)) {
+    let whole = fit_size(image.0, image.1);
+    let (iw, ih) = (i64::from(image.0), i64::from(image.1));
+    // Context around the painted area: a quarter of its size, at least 64 px.
+    let pad = (i64::from(bbox.w.max(bbox.h)) / 4).max(64);
+    let mut x0 = (i64::from(bbox.x) - pad).max(0);
+    let mut y0 = (i64::from(bbox.y) - pad).max(0);
+    let mut x1 = (i64::from(bbox.x) + i64::from(bbox.w) + pad).min(iw);
+    let mut y1 = (i64::from(bbox.y) + i64::from(bbox.h) + pad).min(ih);
+    let canvas = fit_size(
+        u32::try_from(x1 - x0).unwrap_or(1).max(1),
+        u32::try_from(y1 - y0).unwrap_or(1).max(1),
+    );
+    // Grow the short side so the crop has the canvas's shape (no stretching).
+    let aspect = f64::from(canvas.0) / f64::from(canvas.1);
+    let grow = |lo: &mut i64, hi: &mut i64, want: f64, max: i64| {
+        let want = (want.round() as i64).min(max);
+        let extra = want - (*hi - *lo);
+        if extra > 0 {
+            *lo = (*lo - extra / 2).max(0);
+            *hi = (*lo + want).min(max);
+            *lo = (*hi - want).max(0);
+        }
+    };
+    let (cw, ch) = ((x1 - x0) as f64, (y1 - y0) as f64);
+    if cw / ch < aspect {
+        grow(&mut x0, &mut x1, ch * aspect, iw);
+    } else {
+        grow(&mut y0, &mut y1, cw / aspect, ih);
+    }
+    let crop = Rect {
+        x: x0 as u32,
+        y: y0 as u32,
+        w: (x1 - x0) as u32,
+        h: (y1 - y0) as u32,
+    };
+    // Zooming only pays when the area is much smaller than the picture and
+    // gets enlarged on the canvas.
+    let area = u64::from(crop.w) * u64::from(crop.h);
+    let enlarges = area < u64::from(canvas.0) * u64::from(canvas.1);
+    let small = area * 10 < u64::from(image.0) * u64::from(image.1) * 6;
+    if enlarges && small {
+        (Some(crop), canvas)
+    } else {
+        (None, whole)
+    }
+}
+
+/// A checked edit request: the canvas, the graph extras, and the mask file.
+#[derive(Debug, Clone)]
+pub struct EditPlan {
+    pub graph: EditGraph,
+    pub mask_png: Option<Vec<u8>>,
+}
+
+/// Check the extras of an edit and work out its canvas. `plain` is the canvas
+/// of an edit without a painted area.
+fn make_plan(opts: &EditOpts, plain: (u32, u32)) -> Result<((u32, u32), EditPlan), String> {
+    let denoise = f64::from(opts.strength.unwrap_or(100).clamp(50, 100)) / 100.0;
+    let Some(m) = &opts.mask else {
+        let graph = EditGraph {
+            denoise,
+            region: plain,
+            mask: None,
+            crop: None,
+        };
+        return Ok((
+            plain,
+            EditPlan {
+                graph,
+                mask_png: None,
+            },
+        ));
+    };
+    let bad = || "The painted area doesn't fit the picture. Paint it again.".to_string();
+    let (w, h, b) = (m.width, m.height, m.bbox);
+    if w == 0 || h == 0 || w > 16384 || h > 16384 {
+        return Err(bad());
+    }
+    let fits = |a: u32, len: u32, max: u32| len > 0 && a.checked_add(len).is_some_and(|e| e <= max);
+    if !fits(b.x, b.w, w) || !fits(b.y, b.h, h) {
+        return Err(bad());
+    }
+    if m.png.len() > MAX_REF_BYTES / 3 * 4 + 8 {
+        return Err("The painted area is too big.".into());
+    }
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(m.png.as_bytes())
+        .map_err(|_| bad())?;
+    if !png.starts_with(b"\x89PNG") || image_size(&png) != Some((w, h)) {
+        return Err(bad());
+    }
+    let (crop, canvas) = if m.zoom {
+        plan_crop((w, h), b)
+    } else {
+        (None, fit_size(w, h))
+    };
+    let graph = EditGraph {
+        denoise,
+        region: crop.map_or((w, h), |c| (c.w, c.h)),
+        mask: Some(String::new()),
+        crop,
+    };
+    Ok((
+        canvas,
+        EditPlan {
+            graph,
+            mask_png: Some(png),
+        },
+    ))
+}
+
+/// Pixels the painted area is widened by before sampling (a clean seam).
+const MASK_GROW: u32 = 8;
+/// Softness of the seam when the result is put back.
+const SEAM_BLUR: u32 = 8;
+
 /// The ComfyUI "API format" graph for one generation. `refs` are the file
 /// names of the uploaded pictures (1 or 2, in order; for an edit, the picture
 /// to edit comes first).
@@ -168,8 +340,11 @@ pub fn build_graph(
     prompt: &str,
     size: (u32, u32),
     seed: u64,
+    edit: Option<&EditGraph>,
 ) -> Value {
     let (w, h) = size;
+    let edit = edit.filter(|e| !e.is_plain());
+    let zoomed = edit.is_some_and(|e| e.crop.is_some());
     let mut g = json!({
         "1": {"class_type": "UNETLoader",
               "inputs": {"unet_name": files.unet, "weight_dtype": "default"}},
@@ -192,9 +367,16 @@ pub fn build_graph(
         g[&latent] = json!({"class_type": "VAEEncode",
                             "inputs": {"pixels": [&load, 0], "vae": ["3", 0]}});
         let suffix = if i == 0 { "" } else { "_b" };
+        // A zoomed edit shows the model the zoomed area, not the whole picture.
+        let pixels = if i == 0 && zoomed {
+            json!(["40", 0])
+        } else {
+            json!([&load, 0])
+        };
+        g[&latent]["inputs"]["pixels"] = pixels.clone();
         patch[format!("source_latent{suffix}")] = json!([&latent, 0]);
-        patch[format!("source_image{suffix}")] = json!([&load, 0]);
-        enc[if i == 0 { "image" } else { "image_b" }] = json!([&load, 0]);
+        patch[format!("source_image{suffix}")] = pixels.clone();
+        enc[if i == 0 { "image" } else { "image_b" }] = pixels;
     }
     g["12"] = json!({"class_type": "Krea2EditModelPatch", "inputs": patch});
     let encode = |text: String| {
@@ -206,16 +388,98 @@ pub fn build_graph(
     };
     g["4"] = encode(format!("{PROMPT_PREFIX}{prompt}"));
     g["5"] = encode(String::new());
+    let mut latent = json!(["6", 0]);
+    let mut denoise = 1.0;
+    if let Some(e) = edit {
+        denoise = e.denoise;
+        latent = add_edit_nodes(&mut g, e, size);
+    }
     g["7"] = json!({"class_type": "KSampler", "inputs": {
         "seed": seed, "steps": STEPS, "cfg": 1.0, "sampler_name": "euler",
-        "scheduler": "simple", "denoise": 1.0,
+        "scheduler": "simple", "denoise": denoise,
         "model": ["12", 0], "positive": ["4", 0], "negative": ["5", 0],
-        "latent_image": ["6", 0]}});
+        "latent_image": latent}});
     g["8"] = json!({"class_type": "VAEDecode",
                     "inputs": {"samples": ["7", 0], "vae": ["3", 0]}});
+    let result = match edit {
+        Some(e) if e.mask.is_some() => add_composite_nodes(&mut g, e, size),
+        _ => json!(["8", 0]),
+    };
     g["9"] = json!({"class_type": "SaveImage",
-                    "inputs": {"filename_prefix": "SlopTweak", "images": ["8", 0]}});
+                    "inputs": {"filename_prefix": "SlopTweak", "images": result}});
     g
+}
+
+/// Nodes that start the sampler from the picture (and, with a painted area,
+/// only redraw that area). Returns the latent the sampler starts from.
+/// "20" is the picture to edit; "40" is the picture at the canvas's size.
+fn add_edit_nodes(g: &mut Value, e: &EditGraph, size: (u32, u32)) -> Value {
+    let (w, h) = size;
+    let scale = |image: Value| {
+        json!({"class_type": "ImageScale", "inputs": {"image": image,
+            "upscale_method": "lanczos", "width": w, "height": h, "crop": "disabled"}})
+    };
+    let mut source = json!(["20", 0]);
+    if let Some(c) = e.crop {
+        g["41"] = crop_node(json!(["20", 0]), c);
+        source = json!(["41", 0]);
+    }
+    g["40"] = scale(source);
+    g["42"] = json!({"class_type": "VAEEncode",
+                     "inputs": {"pixels": ["40", 0], "vae": ["3", 0]}});
+    let Some(mask) = &e.mask else {
+        return json!(["42", 0]);
+    };
+    g["50"] = json!({"class_type": "LoadImage", "inputs": {"image": mask}});
+    let mut region = json!(["50", 0]);
+    if let Some(c) = e.crop {
+        g["51"] = crop_node(json!(["50", 0]), c);
+        region = json!(["51", 0]);
+    }
+    g["52"] = scale(region);
+    g["53"] = json!({"class_type": "ImageToMask",
+                     "inputs": {"image": ["52", 0], "channel": "red"}});
+    g["54"] = json!({"class_type": "GrowMask",
+                     "inputs": {"mask": ["53", 0], "expand": MASK_GROW, "tapered_corners": false}});
+    g["55"] = json!({"class_type": "SetLatentNoiseMask",
+                     "inputs": {"samples": ["42", 0], "mask": ["54", 0]}});
+    json!(["55", 0])
+}
+
+fn crop_node(image: Value, c: Rect) -> Value {
+    json!({"class_type": "ImageCrop", "inputs": {
+        "image": image, "width": c.w, "height": c.h, "x": c.x, "y": c.y}})
+}
+
+/// Put the redrawn area back into the untouched picture through a soft seam,
+/// so everything outside the painted area keeps its exact pixels. Returns the
+/// image to save.
+fn add_composite_nodes(g: &mut Value, e: &EditGraph, size: (u32, u32)) -> Value {
+    let (rw, rh) = e.region;
+    let at = e.crop.map_or((0, 0), |c| (c.x, c.y));
+    // The decoded canvas, back at the region's size.
+    g["56"] = json!({"class_type": "ImageScale", "inputs": {"image": ["8", 0],
+        "upscale_method": "lanczos", "width": rw, "height": rh, "crop": "disabled"}});
+    let region_mask = if e.crop.is_some() {
+        json!(["51", 0])
+    } else {
+        json!(["50", 0])
+    };
+    // The seam widens in step with the canvas's zoom.
+    let grow = (MASK_GROW * rw / size.0.max(1)).max(2);
+    g["57"] = json!({"class_type": "ImageToMask",
+                     "inputs": {"image": region_mask, "channel": "red"}});
+    g["58"] = json!({"class_type": "GrowMask",
+                     "inputs": {"mask": ["57", 0], "expand": grow, "tapered_corners": false}});
+    g["59"] = json!({"class_type": "MaskToImage", "inputs": {"mask": ["58", 0]}});
+    g["60"] = json!({"class_type": "ImageBlur", "inputs": {
+        "image": ["59", 0], "blur_radius": SEAM_BLUR, "sigma": f64::from(SEAM_BLUR) / 2.0}});
+    g["61"] = json!({"class_type": "ImageToMask",
+                     "inputs": {"image": ["60", 0], "channel": "red"}});
+    g["62"] = json!({"class_type": "ImageCompositeMasked", "inputs": {
+        "destination": ["20", 0], "source": ["56", 0], "x": at.0, "y": at.1,
+        "resize_source": false, "mask": ["61", 0]}});
+    json!(["62", 0])
 }
 
 // ----- what the window shows -----------------------------------------------------
@@ -384,6 +648,64 @@ impl IdentityService {
         self.set_ref(slot, &name, bytes)
     }
 
+    /// Write a finished image into `dir` (the Downloads folder) under a name
+    /// that doesn't overwrite anything; returns the path written.
+    pub fn save_result(&self, result_id: &str, dir: &std::path::Path) -> Result<PathBuf, String> {
+        let (name, bytes) = {
+            let i = self.inner.lock().unwrap();
+            let r = i
+                .results
+                .iter()
+                .find(|r| r.id == result_id)
+                .ok_or("That image is no longer in the panel.")?;
+            (r.name.clone(), r.bytes.clone())
+        };
+        let ext = if bytes.starts_with(b"\x89PNG") {
+            "png"
+        } else if bytes.starts_with(b"RIFF") {
+            "webp"
+        } else {
+            "jpg"
+        };
+        // The name came from the GPU: keep only plain characters.
+        let stem: String = std::path::Path::new(&name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' '))
+            .take(60)
+            .collect();
+        let stem = if stem.trim().is_empty() {
+            "SlopTweak".to_string()
+        } else {
+            stem
+        };
+        std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't open the folder: {e}"))?;
+        for n in 0..1000 {
+            let file = if n == 0 {
+                format!("{stem}.{ext}")
+            } else {
+                format!("{stem} ({n}).{ext}")
+            };
+            let path = dir.join(file);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    std::io::Write::write_all(&mut f, &bytes)
+                        .map_err(|e| format!("Couldn't save the image: {e}"))?;
+                    return Ok(path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(format!("Couldn't save the image: {e}")),
+            }
+        }
+        Err("Couldn't find a free file name in that folder.".into())
+    }
+
     fn set_phase(&self, phase: Phase, message: impl Into<String>) {
         {
             let mut i = self.inner.lock().unwrap();
@@ -406,6 +728,7 @@ impl IdentityService {
 
     /// Check the request and take the pictures (and work out the canvas);
     /// marks the service busy.
+    #[cfg(test)]
     #[allow(clippy::type_complexity)]
     fn begin(
         &self,
@@ -413,6 +736,19 @@ impl IdentityService {
         mode: Mode,
         aspect: Aspect,
     ) -> Result<(Vec<Kept>, (u32, u32), Arc<AtomicBool>), String> {
+        let (refs, size, cancel, _) =
+            self.begin_with(prompt, mode, aspect, &EditOpts::default())?;
+        Ok((refs, size, cancel))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn begin_with(
+        &self,
+        prompt: &str,
+        mode: Mode,
+        aspect: Aspect,
+        opts: &EditOpts,
+    ) -> Result<(Vec<Kept>, (u32, u32), Arc<AtomicBool>, Option<EditPlan>), String> {
         let prompt = prompt.trim();
         if prompt.is_empty() {
             return Err(match mode {
@@ -436,13 +772,13 @@ impl IdentityService {
                 bytes: r.bytes.clone(),
             })
         };
-        let (refs, size): (Vec<Kept>, _) = match mode {
+        let (refs, size, plan): (Vec<Kept>, _, _) = match mode {
             Mode::New => {
                 let refs: Vec<Kept> = i.refs[..2].iter().filter_map(take).collect();
                 if refs.is_empty() {
                     return Err("Add at least one character sheet.".into());
                 }
-                (refs, aspect.size())
+                (refs, aspect.size(), None)
             }
             Mode::Edit => {
                 let base =
@@ -450,9 +786,10 @@ impl IdentityService {
                 // The picture's own shape; a header we can't read falls back to square.
                 let size =
                     image_size(&base.bytes).map_or(Aspect::Square.size(), |(w, h)| fit_size(w, h));
+                let (size, plan) = make_plan(opts, size)?;
                 let mut refs = vec![base];
                 refs.extend(take(&i.refs[0]));
-                (refs, size)
+                (refs, size, Some(plan))
             }
         };
         let cancel = Arc::new(AtomicBool::new(false));
@@ -461,12 +798,13 @@ impl IdentityService {
         i.message = "Sending your pictures…".into();
         drop(i);
         (self.notify)();
-        Ok((refs, size, cancel))
+        Ok((refs, size, cancel, plan))
     }
 
     /// Make one image. Returns quickly with an error if the request is
     /// invalid; otherwise runs to the end and records the outcome in the
     /// service's phase/message (the window reads those).
+    #[cfg(test)]
     pub async fn generate(
         self: &Arc<Self>,
         target: &Target,
@@ -475,9 +813,23 @@ impl IdentityService {
         aspect: Aspect,
         seed: u64,
     ) -> Result<(), String> {
-        let (refs, size, cancel) = self.begin(prompt, mode, aspect)?;
+        self.generate_with(target, prompt, mode, aspect, seed, &EditOpts::default())
+            .await
+    }
+
+    /// [`generate`](Self::generate) with the edit extras (strength, painted area).
+    pub async fn generate_with(
+        self: &Arc<Self>,
+        target: &Target,
+        prompt: &str,
+        mode: Mode,
+        aspect: Aspect,
+        seed: u64,
+        opts: &EditOpts,
+    ) -> Result<(), String> {
+        let (refs, size, cancel, plan) = self.begin_with(prompt, mode, aspect, opts)?;
         let outcome = self
-            .run(target, &refs, prompt.trim(), size, seed, &cancel)
+            .run(target, &refs, prompt.trim(), size, seed, plan, &cancel)
             .await;
         match outcome {
             Ok(Some(kept)) => {
@@ -499,6 +851,7 @@ impl IdentityService {
     }
 
     /// Upload, queue, wait, download. `Ok(None)` = cancelled.
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
         t: &Target,
@@ -506,6 +859,7 @@ impl IdentityService {
         prompt: &str,
         size: (u32, u32),
         seed: u64,
+        plan: Option<EditPlan>,
         cancel: &AtomicBool,
     ) -> Result<Option<Kept>, String> {
         let unreachable = |e: SidecarError| match e {
@@ -546,7 +900,31 @@ impl IdentityService {
             }
         }
 
-        let graph = build_graph(&t.files, &names, prompt, size, seed);
+        let mut edit = plan.as_ref().map(|p| p.graph.clone());
+        if let Some(png) = plan.as_ref().and_then(|p| p.mask_png.as_ref()) {
+            let name = format!("sloptweak_mask_{tag}.png");
+            let answer = t
+                .sidecar
+                .comfy_upload(
+                    &t.base,
+                    &t.secret,
+                    &["upload", "image"],
+                    &[
+                        ("type", "input".to_string()),
+                        ("overwrite", "true".to_string()),
+                    ],
+                    ("image", &name, png.clone()),
+                )
+                .await
+                .map_err(unreachable)?;
+            if let Some(e) = edit.as_mut() {
+                e.mask = Some(answer["name"].as_str().unwrap_or(&name).to_string());
+            }
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+        }
+        let graph = build_graph(&t.files, &names, prompt, size, seed, edit.as_ref());
         let queued = t
             .sidecar
             .comfy_post_json(
@@ -712,6 +1090,7 @@ mod tests {
             "sitting at a cafe",
             Aspect::Square.size(),
             7,
+            None,
         );
         assert_eq!(
             g["1"]["inputs"]["unet_name"],
@@ -759,6 +1138,7 @@ mod tests {
             "together",
             Aspect::Portrait.size(),
             1,
+            None,
         );
         let p = &g["12"]["inputs"];
         assert_eq!(p["source_latent_b"], json!(["31", 0]));
@@ -780,8 +1160,234 @@ mod tests {
             "x",
             Aspect::Square.size(),
             1,
+            None,
         );
         assert!(g3.get("22").is_none());
+    }
+
+    fn edit_graph(denoise: f64, mask: Option<&str>, crop: Option<Rect>) -> EditGraph {
+        EditGraph {
+            denoise,
+            region: crop.map_or((1000, 1500), |c| (c.w, c.h)),
+            mask: mask.map(String::from),
+            crop,
+        }
+    }
+
+    #[test]
+    fn full_strength_without_a_mask_is_the_plain_graph() {
+        let plain = build_graph(&files(), &["a.png".into()], "x", (896, 1152), 1, None);
+        let same = build_graph(
+            &files(),
+            &["a.png".into()],
+            "x",
+            (896, 1152),
+            1,
+            Some(&edit_graph(1.0, None, None)),
+        );
+        assert_eq!(plain, same);
+    }
+
+    #[test]
+    fn lower_strength_starts_from_the_picture() {
+        let g = build_graph(
+            &files(),
+            &["a.png".into()],
+            "x",
+            (896, 1152),
+            1,
+            Some(&edit_graph(0.7, None, None)),
+        );
+        assert_eq!(g["7"]["inputs"]["denoise"], 0.7);
+        assert_eq!(g["7"]["inputs"]["latent_image"], json!(["42", 0]));
+        assert_eq!(g["42"]["inputs"]["pixels"], json!(["40", 0]));
+        assert_eq!(g["40"]["inputs"]["image"], json!(["20", 0]));
+        assert_eq!(g["40"]["inputs"]["width"], 896);
+        // The patch's own canvas and the picture reference are unchanged.
+        assert_eq!(g["12"]["inputs"]["target_latent"], json!(["6", 0]));
+        assert_eq!(g["12"]["inputs"]["source_image"], json!(["20", 0]));
+        assert_eq!(g["9"]["inputs"]["images"], json!(["8", 0]));
+    }
+
+    #[test]
+    fn a_painted_area_redraws_only_that_area_and_puts_it_back() {
+        let g = build_graph(
+            &files(),
+            &["a.png".into(), "s.png".into()],
+            "x",
+            (896, 1152),
+            1,
+            Some(&edit_graph(1.0, Some("m.png"), None)),
+        );
+        assert_eq!(g["50"]["inputs"]["image"], "m.png");
+        assert_eq!(g["55"]["class_type"], "SetLatentNoiseMask");
+        assert_eq!(g["7"]["inputs"]["latent_image"], json!(["55", 0]));
+        assert_eq!(g["7"]["inputs"]["denoise"], 1.0);
+        // Pasted over the original picture, so the rest keeps its pixels.
+        assert_eq!(g["62"]["inputs"]["destination"], json!(["20", 0]));
+        assert_eq!(g["62"]["inputs"]["x"], 0);
+        assert_eq!(g["9"]["inputs"]["images"], json!(["62", 0]));
+        assert_eq!(g["56"]["inputs"]["width"], 1000);
+        assert!(g.get("41").is_none());
+        // Every link points at a node that exists.
+        for (id, node) in g.as_object().unwrap() {
+            for v in node["inputs"].as_object().unwrap().values() {
+                if let Some([src, _]) = v.as_array().map(Vec::as_slice) {
+                    assert!(g.get(src.as_str().unwrap()).is_some(), "{id} -> {src}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_zoomed_area_is_cut_out_enlarged_and_pasted_back_in_place() {
+        let crop = Rect {
+            x: 300,
+            y: 200,
+            w: 400,
+            h: 500,
+        };
+        let g = build_graph(
+            &files(),
+            &["a.png".into()],
+            "x",
+            (832, 1024),
+            1,
+            Some(&edit_graph(1.0, Some("m.png"), Some(crop))),
+        );
+        assert_eq!(g["41"]["class_type"], "ImageCrop");
+        assert_eq!(g["41"]["inputs"]["x"], 300);
+        assert_eq!(g["40"]["inputs"]["image"], json!(["41", 0]));
+        assert_eq!(g["51"]["inputs"]["y"], 200);
+        // The model sees the zoomed area as its picture.
+        assert_eq!(g["12"]["inputs"]["source_image"], json!(["40", 0]));
+        assert_eq!(g["30"]["inputs"]["pixels"], json!(["40", 0]));
+        assert_eq!(g["4"]["inputs"]["image"], json!(["40", 0]));
+        // Back at the crop's size, pasted at the crop's place.
+        assert_eq!(g["56"]["inputs"]["width"], 400);
+        assert_eq!(g["62"]["inputs"]["x"], 300);
+        assert_eq!(g["62"]["inputs"]["y"], 200);
+        assert_eq!(g["62"]["inputs"]["destination"], json!(["20", 0]));
+    }
+
+    #[test]
+    fn small_areas_are_zoomed_and_big_ones_are_not() {
+        // A face-sized patch in a 2000x3000 picture: crop with context, ~1 MP canvas.
+        let (crop, canvas) = plan_crop(
+            (2000, 3000),
+            Rect {
+                x: 800,
+                y: 500,
+                w: 300,
+                h: 300,
+            },
+        );
+        let c = crop.unwrap();
+        assert!(c.x <= 800 && c.y <= 500 && c.x + c.w >= 1100 && c.y + c.h >= 800);
+        assert!(c.x + c.w <= 2000 && c.y + c.h <= 3000);
+        assert_eq!(canvas.0 % 64, 0);
+        assert!(u64::from(c.w) * u64::from(c.h) < u64::from(canvas.0) * u64::from(canvas.1));
+        // Same shape as the canvas (within a few pixels).
+        let (ca, ka) = (
+            f64::from(c.w) / f64::from(c.h),
+            f64::from(canvas.0) / f64::from(canvas.1),
+        );
+        assert!((ca - ka).abs() < 0.02, "{ca} vs {ka}");
+        // Most of the picture painted: work on the whole picture.
+        let (crop, canvas) = plan_crop(
+            (1000, 1000),
+            Rect {
+                x: 50,
+                y: 50,
+                w: 900,
+                h: 900,
+            },
+        );
+        assert_eq!(crop, None);
+        assert_eq!(canvas, fit_size(1000, 1000));
+        // A tiny picture is never enlarged by cropping.
+        let (crop, _) = plan_crop(
+            (700, 700),
+            Rect {
+                x: 300,
+                y: 300,
+                w: 50,
+                h: 50,
+            },
+        );
+        assert!(crop.is_none_or(|c| c.w <= 700 && c.h <= 700));
+        // The crop hugs the picture's edge instead of leaving it.
+        let (crop, _) = plan_crop(
+            (2000, 3000),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 100,
+            },
+        );
+        let c = crop.unwrap();
+        assert_eq!((c.x, c.y), (0, 0));
+    }
+
+    fn mask_png(w: u32, h: u32) -> String {
+        base64::engine::general_purpose::STANDARD.encode(png_header(w, h))
+    }
+
+    #[test]
+    fn a_mask_must_match_the_picture() {
+        let mask = |w, h, bbox, zoom| EditOpts {
+            strength: Some(80),
+            mask: Some(MaskInput {
+                png: mask_png(w, h),
+                width: w,
+                height: h,
+                bbox,
+                zoom,
+            }),
+        };
+        let inside = Rect {
+            x: 100,
+            y: 100,
+            w: 200,
+            h: 200,
+        };
+        let (canvas, plan) = make_plan(&mask(2000, 3000, inside, true), (704, 1024)).unwrap();
+        assert!(plan.mask_png.is_some());
+        assert!(plan.graph.crop.is_some());
+        assert_eq!(plan.graph.denoise, 0.8);
+        assert_eq!(canvas.0 % 64, 0);
+        let (canvas, plan) = make_plan(&mask(2000, 3000, inside, false), (704, 1024)).unwrap();
+        assert_eq!((canvas, plan.graph.crop), (fit_size(2000, 3000), None));
+        // Wrong size, or a box outside the picture: refused.
+        let wrong = EditOpts {
+            strength: None,
+            mask: Some(MaskInput {
+                png: mask_png(10, 10),
+                width: 20,
+                height: 20,
+                bbox: inside,
+                zoom: false,
+            }),
+        };
+        assert!(make_plan(&wrong, (704, 1024)).is_err());
+        let out = Rect {
+            x: 1900,
+            y: 0,
+            w: 200,
+            h: 10,
+        };
+        assert!(make_plan(&mask(2000, 3000, out, false), (704, 1024)).is_err());
+        // The strength is kept in range; no mask = plain canvas.
+        let (canvas, plan) = make_plan(
+            &EditOpts {
+                strength: Some(5),
+                mask: None,
+            },
+            (704, 1024),
+        )
+        .unwrap();
+        assert_eq!((canvas, plan.graph.denoise), ((704, 1024), 0.5));
     }
 
     #[test]
@@ -824,6 +1430,25 @@ mod tests {
         assert!(v.refs[1].is_none());
         s.clear_ref(0);
         assert!(s.view().refs[0].is_none());
+    }
+
+    #[test]
+    fn saving_a_result_never_overwrites_and_cleans_the_name() {
+        let s = svc();
+        s.inner.lock().unwrap().results.push(Kept {
+            id: "r1".into(),
+            name: "../evil:name?.png".into(),
+            bytes: png(),
+        });
+        let dir = std::env::temp_dir().join(format!("sloptweak-save-{}", std::process::id()));
+        let a = s.save_result("r1", &dir).unwrap();
+        let b = s.save_result("r1", &dir).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.parent().unwrap(), dir);
+        assert_eq!(a.file_name().unwrap(), "evilname.png");
+        assert_eq!(b.file_name().unwrap(), "evilname (1).png");
+        assert!(s.save_result("nope", &dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

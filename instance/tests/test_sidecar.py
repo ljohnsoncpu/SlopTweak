@@ -368,7 +368,12 @@ class FakeComfy:
         app.router.add_get("/queue", self.queue)
         app.router.add_get("/ws", self.ws_check)
         app.router.add_route("*", "/echo", self.origin_check)
+        app.router.add_get("/userdata/{file}", self.userdata)
         return app
+
+    async def userdata(self, request: web.Request) -> web.Response:
+        # Like ComfyUI: the whole path inside the folder is ONE encoded segment.
+        return web.json_response({"file": request.match_info["file"]})
 
     async def origin_check(self, request: web.Request) -> web.Response:
         # Like ComfyUI: any Origin that isn't its own loopback address is a 403.
@@ -541,6 +546,19 @@ async def test_comfy_same_host_origin_is_rewritten(
     assert body["origin"].startswith("http://127.0.0.1:")
     assert body["origin"] != host
     assert body["referer"].endswith("/x?a=1")
+
+
+async def test_comfy_encoded_slash_and_spaces_reach_comfy_unchanged(
+    tmp_path: Path, aiohttp_client: ClientFactory, aiohttp_server: ServerFactory
+) -> None:
+    client, cookie, _ = await _comfy_browser(tmp_path, aiohttp_client, aiohttp_server)
+    # How the frontend opens a saved workflow.
+    resp = await client.get(
+        "/userdata/workflows%2FSlopTweak%20Identity%20Edit.json?x=1%262",
+        headers=cookie,
+    )
+    assert resp.status == 200
+    assert await resp.json() == {"file": "workflows/SlopTweak Identity Edit.json"}
 
 
 async def test_comfy_foreign_origin_is_refused(

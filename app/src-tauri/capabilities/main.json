@@ -37,6 +37,9 @@
     "allow-identity-state",
     "allow-identity-pick-ref",
     "allow-identity-clear-ref",
+    "allow-identity-set-ref-path",
+    "allow-identity-set-ref-data",
+    "allow-identity-save-result",
     "allow-identity-use-result",
     "allow-identity-generate",
     "allow-identity-cancel"
