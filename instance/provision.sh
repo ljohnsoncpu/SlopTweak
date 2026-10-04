@@ -5,9 +5,11 @@
 #
 # Env (from the Vast create call):
 #   LAUNCH_TOKEN_HASH   sha256 hex of the launcher's per-session secret (required)
+#   BACKEND             invoke (default) or comfyui: the app behind the sidecar
 #   MODELS_B64          base64 JSON: [{url, sha256, size_bytes, filename,
 #                                      requires_civitai_token,
-#                                      default_settings?}] (required)
+#                                      default_settings?, dest?}] (required).
+#                       dest (comfyui only) is the ComfyUI models subfolder.
 #   CIVITAI_TOKEN       user's CivitAI key (only if a model needs it)
 #   IDLE_MINUTES, HEARTBEAT_MINUTES, MAX_SESSION_MINUTES   watchdog timers
 #   CONTAINER_ID, CONTAINER_API_KEY   injected by Vast
@@ -16,16 +18,21 @@ set -Eeuo pipefail
 ASSET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR=/run/sloptweak
 LOG_DIR=/var/log/sloptweak
-MODELS_DIR=/invokeai/sloptweak-models
 SIDECAR_VENV=/opt/sloptweak/sidecar-venv
 STATUS_FILE="$STATE_DIR/status.json"
 INVOKE_URL=http://127.0.0.1:9090
+COMFY_URL=http://127.0.0.1:8188
+COMFY_DIR=/opt/workspace-internal/ComfyUI
+COMFY_PYTHON=/venv/main/bin/python
+# Identity Edit's ComfyUI nodes, pinned by commit (reviewed in the 2026-10-02 spike).
+KREA2EDIT_REPO=https://github.com/lbouaraba/comfyui-krea2edit.git
+KREA2EDIT_SHA=86f886dac23013d88996e3a2e99093ba44d322fb
 CLOUDFLARED_VERSION=2026.9.3
 CLOUDFLARED_SHA256=77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2
 CLOUDFLARED_METRICS=127.0.0.1:20241
 VAST_API=https://console.vast.ai/api/v0
 
-mkdir -p "$STATE_DIR" "$LOG_DIR" "$MODELS_DIR"
+mkdir -p "$STATE_DIR" "$LOG_DIR"
 chmod 700 "$STATE_DIR"
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -59,11 +66,20 @@ load_from_pid1() {
   done
 }
 load_from_pid1 CONTAINER_ID CONTAINER_API_KEY LAUNCH_TOKEN_HASH MODELS_B64 CIVITAI_TOKEN \
-  IDLE_MINUTES HEARTBEAT_MINUTES MAX_SESSION_MINUTES
+  IDLE_MINUTES HEARTBEAT_MINUTES MAX_SESSION_MINUTES BACKEND
 if [[ -z "${CONTAINER_API_KEY:-}" && -f /root/.vast_api_key ]]; then
   CONTAINER_API_KEY="$(tr -d '\n' </root/.vast_api_key)"
   export CONTAINER_API_KEY
 fi
+
+BACKEND="${BACKEND:-invoke}"
+export BACKEND
+case "$BACKEND" in
+  invoke) MODELS_DIR=/invokeai/sloptweak-models ;;
+  comfyui) MODELS_DIR=/opt/sloptweak/models ;;
+  *) fail "unknown BACKEND: $BACKEND" ;;
+esac
+mkdir -p "$MODELS_DIR"
 
 [[ -n "${LAUNCH_TOKEN_HASH:-}" ]] || fail "LAUNCH_TOKEN_HASH missing"
 [[ -n "${MODELS_B64:-}" ]] || fail "MODELS_B64 missing"
@@ -73,15 +89,31 @@ fi
 status booting "starting services"
 
 # ---- Invoke (Vast replaces the image entrypoint in ssh runtypes) -------------
-export INVOKEAI_ROOT=/invokeai INVOKEAI_HOST=127.0.0.1 INVOKEAI_PORT=9090
-export HF_HOME=/invokeai/.cache/huggingface
-chown -R ubuntu /invokeai || true
-(cd /invokeai && nohup setsid gosu ubuntu invokeai-web >"$LOG_DIR/invokeai.log" 2>&1 &)
+start_invoke() {
+  export INVOKEAI_ROOT=/invokeai INVOKEAI_HOST=127.0.0.1 INVOKEAI_PORT=9090
+  export HF_HOME=/invokeai/.cache/huggingface
+  chown -R ubuntu /invokeai || true
+  (cd /invokeai && nohup setsid gosu ubuntu invokeai-web >"$LOG_DIR/invokeai.log" 2>&1 &)
+}
+if [[ "$BACKEND" == invoke ]]; then
+  start_invoke
+fi
 
-# ---- Sidecar (own venv, hashed deps; never touches Invoke's /opt/venv) --------
-uv venv -q "$SIDECAR_VENV"
-uv pip install -q --python "$SIDECAR_VENV/bin/python" --require-hashes \
-  -r "$ASSET_DIR/requirements.txt"
+# ---- Sidecar (own venv, hashed deps; never touches the app's own venv) --------
+# uv ships in the Invoke image; the ComfyUI image may not have it, so fall back to
+# the system python3's venv + pip (same hash-pinned requirements).
+make_sidecar_venv() {
+  if command -v uv >/dev/null 2>&1; then
+    uv venv -q "$SIDECAR_VENV"
+    uv pip install -q --python "$SIDECAR_VENV/bin/python" --require-hashes \
+      -r "$ASSET_DIR/requirements.txt"
+  else
+    python3 -m venv "$SIDECAR_VENV"
+    "$SIDECAR_VENV/bin/python" -m pip install -q --require-hashes --no-deps \
+      -r "$ASSET_DIR/requirements.txt"
+  fi
+}
+make_sidecar_venv
 (
   export SLOPTWEAK_STATUS_FILE="$STATUS_FILE" SIDECAR_HOST=127.0.0.1 SIDECAR_PORT=8080
   nohup setsid "$SIDECAR_VENV/bin/python" "$ASSET_DIR/sidecar.py" \
@@ -115,16 +147,18 @@ if [[ -n "${CONTAINER_ID:-}" && -n "${CONTAINER_API_KEY:-}" ]]; then
 fi
 
 # ---- Models ------------------------------------------------------------------
-# One line per model: url<TAB>sha256<TAB>size_bytes<TAB>filename<TAB>needs_token
+# One line per model: url<TAB>sha256<TAB>size_bytes<TAB>filename<TAB>needs_token<TAB>dest
+# (dest is "-" when the catalog entry has none).
 MODEL_LINES="$(printf '%s' "$MODELS_B64" | base64 -d | "$SIDECAR_VENV/bin/python" -c '
 import json, sys
 for m in json.load(sys.stdin):
     print("\t".join([m["url"], m["sha256"].lower(), str(int(m["size_bytes"])),
-                     m["filename"], "1" if m.get("requires_civitai_token") else "0"]))
+                     m["filename"], "1" if m.get("requires_civitai_token") else "0",
+                     m.get("dest") or "-"]))
 ')" || fail "MODELS_B64 is not valid"
 
 TOTAL_BYTES=0
-while IFS=$'\t' read -r _ _ size _ _; do
+while IFS=$'\t' read -r _ _ size _ _ _; do
   TOTAL_BYTES=$((TOTAL_BYTES + size))
 done <<<"$MODEL_LINES"
 
@@ -178,18 +212,11 @@ download_model() {
   mv "$part" "$dest"
 }
 
-while IFS=$'\t' read -r url sha size name needs_token; do
+while IFS=$'\t' read -r url sha size name needs_token _; do
   download_model "$url" "$sha" "$size" "$name" "$needs_token"
 done <<<"$MODEL_LINES"
 
 # ---- Register with Invoke ----------------------------------------------------
-status starting "waiting for Invoke"
-for _ in $(seq 1 120); do
-  curl -fsS "$INVOKE_URL/api/v1/app/version" >/dev/null 2>&1 && break
-  sleep 2
-done
-curl -fsS "$INVOKE_URL/api/v1/app/version" >/dev/null || fail "Invoke did not start"
-
 register_model() {
   local path="$1" resp job_id job_status
   resp="$(curl -sS -X POST -H 'Content-Type: application/json' -d '{}' \
@@ -215,15 +242,75 @@ register_model() {
   fail "model install timed out: $(basename "$path")"
 }
 
-status registering "adding models to Invoke"
-while IFS=$'\t' read -r _ _ _ name _; do
-  register_model "$MODELS_DIR/$name"
-done <<<"$MODEL_LINES"
+finish_invoke() {
+  status starting "waiting for Invoke"
+  for _ in $(seq 1 120); do
+    curl -fsS "$INVOKE_URL/api/v1/app/version" >/dev/null 2>&1 && break
+    sleep 2
+  done
+  curl -fsS "$INVOKE_URL/api/v1/app/version" >/dev/null || fail "Invoke did not start"
 
-# Catalog-recommended CFG/steps/scheduler into each model's Invoke config.
-# Not fatal: without them the model still works with Invoke's own defaults.
-status registering "applying recommended settings"
-"$SIDECAR_VENV/bin/python" "$ASSET_DIR/model_defaults.py" >>"$LOG_DIR/model-defaults.log" 2>&1 ||
-  log "WARNING: some recommended settings were not applied (see model-defaults.log)"
+  status registering "adding models to Invoke"
+  while IFS=$'\t' read -r _ _ _ name _ _; do
+    register_model "$MODELS_DIR/$name"
+  done <<<"$MODEL_LINES"
+
+  # Catalog-recommended CFG/steps/scheduler into each model's Invoke config.
+  # Not fatal: without them the model still works with Invoke's own defaults.
+  status registering "applying recommended settings"
+  "$SIDECAR_VENV/bin/python" "$ASSET_DIR/model_defaults.py" >>"$LOG_DIR/model-defaults.log" 2>&1 ||
+    log "WARNING: some recommended settings were not applied (see model-defaults.log)"
+}
+
+# ---- ComfyUI (Identity Edit) --------------------------------------------------
+# Models stay in $MODELS_DIR (so a re-run skips finished downloads) and are
+# symlinked into ComfyUI's model folders.
+finish_comfy() {
+  local models="$COMFY_DIR/models" name dest
+  status registering "placing models"
+  while IFS=$'\t' read -r _ _ _ name _ dest; do
+    case "$dest" in
+      diffusion_models | text_encoders | vae | loras) ;;
+      *) fail "bad model folder for $name" ;;
+    esac
+    mkdir -p "$models/$dest"
+    ln -sfn "$MODELS_DIR/$name" "$models/$dest/$name"
+  done <<<"$MODEL_LINES"
+
+  status registering "installing the Identity Edit nodes"
+  local nodes="$COMFY_DIR/custom_nodes"
+  if [[ ! -d "$nodes/comfyui-krea2edit" ]]; then
+    git clone -q "$KREA2EDIT_REPO" "$nodes/comfyui-krea2edit"
+  fi
+  git -C "$nodes/comfyui-krea2edit" checkout -q "$KREA2EDIT_SHA"
+  [[ "$(git -C "$nodes/comfyui-krea2edit" rev-parse HEAD)" == "$KREA2EDIT_SHA" ]] ||
+    fail "Identity Edit nodes are not at the pinned commit"
+  # ComfyUI-Manager can install code at runtime; keep it out of the instance.
+  if [[ -d "$nodes/ComfyUI-Manager" ]]; then
+    mkdir -p /opt/sloptweak/disabled-nodes
+    mv "$nodes/ComfyUI-Manager" /opt/sloptweak/disabled-nodes/
+  fi
+  # Raw-UI users start from the working Identity Edit graph (Workflows sidebar).
+  mkdir -p "$COMFY_DIR/user/default/workflows"
+  cp "$nodes/comfyui-krea2edit/workflows/krea2_identity_edit.json" \
+    "$COMFY_DIR/user/default/workflows/SlopTweak Identity Edit.json"
+
+  status starting "starting ComfyUI"
+  (cd "$COMFY_DIR" && nohup setsid "$COMFY_PYTHON" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention \
+    >"$LOG_DIR/comfyui.log" 2>&1 </dev/null &)
+  local out=""
+  for _ in $(seq 1 180); do
+    out="$(curl -fsS "$COMFY_URL/object_info/Krea2EditModelPatch" 2>/dev/null || true)"
+    [[ "$out" == *Krea2EditModelPatch* ]] && break
+    sleep 2
+  done
+  [[ "$out" == *Krea2EditModelPatch* ]] || fail "ComfyUI did not start with the Identity Edit nodes"
+}
+
+if [[ "$BACKEND" == comfyui ]]; then
+  finish_comfy
+else
+  finish_invoke
+fi
 
 status ready "" 1

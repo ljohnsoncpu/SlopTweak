@@ -3,9 +3,11 @@
 mod assets;
 mod catalog;
 mod civitai;
+mod comfy;
 mod config;
 mod cost;
 mod diagnostics;
+mod identity;
 mod library;
 mod persist;
 mod provider;
@@ -42,7 +44,7 @@ use crate::provider::mock::{parse_script, MockProvider, MockTimings};
 use crate::provider::offers;
 use crate::provider::vast::VastProvider;
 use crate::provider::GpuProvider;
-use crate::remote::{RemoteWindows, TutorialSignal, TutorialStart};
+use crate::remote::{RemoteApp, RemoteWindows, TutorialSignal, TutorialStart};
 use crate::secrets::{KeyringStore, SecretStore};
 use crate::session::{Deps, Orphan, SessionManager, SessionState, Timing, Ui};
 use crate::sidecar::HttpSidecar;
@@ -70,11 +72,11 @@ impl Ui for TauriUi {
         let _ = self.app.emit_to("main", "session-log", line);
     }
 
-    fn open_remote(&self, url: Url) {
+    fn open_remote(&self, url: Url, app: RemoteApp) {
         let st = self.app.state::<AppState>();
         let tutorial = tutorial_start(&st.settings(), &st.catalog.lock().unwrap());
-        if let Err(e) = self.remote.open(url, &tutorial) {
-            eprintln!("[sloptweak] couldn't open the Invoke window: {e}");
+        if let Err(e) = self.remote.open(url, app, &tutorial) {
+            eprintln!("[sloptweak] couldn't open the remote window: {e}");
         }
     }
 
@@ -98,6 +100,7 @@ enum PendingUpdate {
 type Backends = (Arc<dyn GpuProvider>, Arc<dyn sidecar::SidecarApi>);
 
 struct AppState {
+    identity: Arc<identity::IdentityService>,
     mode: Mode,
     secrets: Arc<dyn SecretStore>,
     data_dir: PathBuf,
@@ -295,6 +298,8 @@ struct ModelView {
     min_ram_gb: Option<f64>,
     price_tier: Option<u8>,
     good_for: String,
+    /// `invoke` or `comfyui` (Identity Edit).
+    backend: catalog::Backend,
 }
 
 impl From<&Model> for ModelView {
@@ -313,6 +318,7 @@ impl From<&Model> for ModelView {
             min_ram_gb: m.min_ram_gb,
             price_tier: m.price_tier,
             good_for: m.good_for.clone(),
+            backend: m.backend,
         }
     }
 }
@@ -371,6 +377,9 @@ struct Snapshot {
     cost: Option<CostBar>,
     /// What output sync saved (this or the last session).
     sync: Option<SyncReport>,
+    /// Which app the running GPU has (the window shows Invoke's own window
+    /// or the Identity Edit panel); `None` when nothing is running.
+    active_backend: Option<catalog::Backend>,
 }
 
 fn settings_view(st: &AppState, s: &Settings) -> SettingsView {
@@ -394,9 +403,14 @@ fn settings_view(st: &AppState, s: &Settings) -> SettingsView {
 
 #[tauri::command]
 async fn get_snapshot(app: AppHandle, st: State<'_, AppState>) -> Result<Snapshot, String> {
-    let (state, log, sync) = match st.manager() {
-        Ok(m) => (m.state(), m.log_lines(), m.sync_report()),
-        Err(_) => (SessionState::idle(), vec![], None),
+    let (state, log, sync, active_backend) = match st.manager() {
+        Ok(m) => (
+            m.state(),
+            m.log_lines(),
+            m.sync_report(),
+            m.active_backend(),
+        ),
+        Err(_) => (SessionState::idle(), vec![], None, None),
     };
     let catalog = st.catalog.lock().unwrap().clone();
     let settings = st.settings();
@@ -417,6 +431,7 @@ async fn get_snapshot(app: AppHandle, st: State<'_, AppState>) -> Result<Snapsho
         settings: settings_view(&st, &settings),
         credit: st.credit.lock().unwrap().map(|(c, _)| c),
         sync,
+        active_backend,
     })
 }
 
@@ -542,6 +557,7 @@ async fn start_session(st: State<'_, AppState>, model_id: String) -> Result<(), 
     if *installing {
         return Err(UPDATING.into());
     }
+    st.identity.reset_run();
     m.start(model, settings, civitai)
 }
 
@@ -556,6 +572,11 @@ async fn stop_session(st: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn open_invoke(st: State<'_, AppState>) -> Result<(), String> {
     st.manager()?.open_invoke().await
+}
+
+#[tauri::command]
+async fn open_comfyui(st: State<'_, AppState>) -> Result<(), String> {
+    st.manager()?.open_comfyui().await
 }
 
 #[tauri::command]
@@ -670,6 +691,132 @@ async fn save_settings(
         u.min_credit = form.min_credit;
         Ok(())
     })
+}
+
+// ----- Identity Edit -------------------------------------------------------------
+
+#[tauri::command]
+async fn identity_state(st: State<'_, AppState>) -> Result<identity::IdentityView, String> {
+    Ok(st.identity.view())
+}
+
+/// Ask for an image file and put it in a reference slot.
+#[tauri::command]
+async fn identity_pick_ref(
+    app: AppHandle,
+    st: State<'_, AppState>,
+    slot: usize,
+) -> Result<(), String> {
+    // Debug builds only: the UI check can't drive a native file dialog, so
+    // `SLOPTWEAK_DEV_PICK_REF=a.png;b.png` answers it (slot 0 gets the first).
+    #[cfg(debug_assertions)]
+    if let Ok(list) = std::env::var("SLOPTWEAK_DEV_PICK_REF") {
+        if let Some(path) = list.split(';').nth(slot) {
+            let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map_or_else(|| "image".into(), |n| n.to_string_lossy().into_owned());
+            return st.identity.set_ref(slot, &name, bytes);
+        }
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Choose a character sheet")
+        .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+        .pick_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(path) = rx
+        .await
+        .map_err(|e| e.to_string())?
+        .and_then(|p| p.into_path().ok())
+    else {
+        return Ok(());
+    };
+    let meta = std::fs::metadata(&path).map_err(|e| format!("Couldn't open that file: {e}"))?;
+    if meta.len() > identity::MAX_REF_BYTES as u64 {
+        return Err("That image is too big (the limit is 15 MB).".into());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("Couldn't read that file: {e}"))?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "image".into());
+    st.identity.set_ref(slot, &name, bytes)
+}
+
+#[tauri::command]
+async fn identity_clear_ref(st: State<'_, AppState>, slot: usize) -> Result<(), String> {
+    st.identity.clear_ref(slot);
+    Ok(())
+}
+
+#[tauri::command]
+async fn identity_use_result(
+    st: State<'_, AppState>,
+    id: String,
+    slot: usize,
+) -> Result<(), String> {
+    st.identity.use_result(&id, slot)
+}
+
+/// Where the running Identity Edit GPU is, and which files to load on it.
+fn identity_target(st: &AppState) -> Result<identity::Target, String> {
+    let (sidecar, base, secret, model_id) = st.manager()?.comfy_endpoint()?;
+    let model = st
+        .catalog
+        .lock()
+        .unwrap()
+        .find(&model_id)
+        .cloned()
+        .ok_or("This GPU's model isn't in the model list any more.")?;
+    let files = identity::ModelFiles::of(&model).ok_or("That model can't do Identity Edit.")?;
+    Ok(identity::Target {
+        sidecar,
+        base,
+        secret,
+        files,
+    })
+}
+
+/// Start one image. Returns at once; progress and the result arrive through
+/// `identity-changed` and `identity_state`.
+#[tauri::command]
+async fn identity_generate(
+    st: State<'_, AppState>,
+    prompt: String,
+    aspect: identity::Aspect,
+    mode: Option<identity::Mode>,
+) -> Result<(), String> {
+    let target = identity_target(&st)?;
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64 & ((1 << 52) - 1))
+        .unwrap_or(1);
+    let svc = st.identity.clone();
+    // Checked here so a bad request comes back as an error; the run itself
+    // continues in the background.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tauri::async_runtime::spawn(async move {
+        let r = svc
+            .generate(&target, &prompt, mode.unwrap_or_default(), aspect, seed)
+            .await;
+        let _ = tx.send(r);
+    });
+    // `generate` returns early with Err on a bad request, and otherwise only
+    // when the image is done; give a bad request a moment to report itself.
+    match tokio::time::timeout(Duration::from_millis(300), rx).await {
+        Ok(Ok(Err(e))) => Err(e),
+        _ => Ok(()),
+    }
+}
+
+#[tauri::command]
+async fn identity_cancel(st: State<'_, AppState>) -> Result<(), String> {
+    let target = identity_target(&st)?;
+    st.identity.cancel(&target).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1165,7 +1312,7 @@ fn ask_stop_on_invoke_close(window: &tauri::Window) {
         .message(
             "Do you want to stop renting the GPU too?\n\n\
              Yes: stop it now. Your images are saved to your PC first.\n\
-             No: keep it running. You can reopen Invoke from SlopTweak, \
+             No: keep it running. You can reopen the window from SlopTweak, \
              and you're still paying while it runs.",
         )
         .title("Stop renting the GPU?")
@@ -1290,6 +1437,12 @@ pub fn run() {
                 settings_lock: Mutex::new(()),
                 update: Mutex::new(None),
                 installing: tokio::sync::Mutex::new(false),
+                identity: Arc::new(identity::IdentityService::new({
+                    let h = handle.clone();
+                    Arc::new(move || {
+                        let _ = h.emit_to("main", "identity-changed", ());
+                    })
+                })),
             });
             eprintln!("[sloptweak] provider mode: {mode:?}");
             // Created here rather than from config so dev builds can attach a
@@ -1319,7 +1472,7 @@ pub fn run() {
                 .and_then(|u| Url::parse(&u).ok())
             {
                 // Dev-only: open the remote window directly (local webview check).
-                ui.open_remote(u);
+                ui.open_remote(u, RemoteApp::Invoke);
             }
             // Fetch on launch; the cached or bundled list shows meanwhile.
             let h = handle.clone();
@@ -1368,12 +1521,19 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            identity_state,
+            identity_pick_ref,
+            identity_clear_ref,
+            identity_use_result,
+            identity_generate,
+            identity_cancel,
             get_snapshot,
             refresh_catalog,
             estimate,
             start_session,
             stop_session,
             open_invoke,
+            open_comfyui,
             dismiss,
             set_secret,
             check_credit,

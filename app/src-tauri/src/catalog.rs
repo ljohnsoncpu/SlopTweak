@@ -24,6 +24,20 @@ const CACHE_FILE: &str = "catalog-cache.json";
 const MAX_BYTES: usize = 1 << 20;
 const MAX_FILE_BYTES: u64 = 100_000_000_000;
 
+/// Which app runs on the instance for this model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    /// InvokeAI (stock image); the SlopTweak window opens its web UI.
+    #[default]
+    Invoke,
+    /// ComfyUI, hidden behind SlopTweak's own Identity Edit panel.
+    Comfyui,
+}
+
+/// ComfyUI model folders a file may be placed in (`ModelFile::dest`).
+pub const COMFY_DESTS: &[&str] = &["diffusion_models", "text_encoders", "vae", "loras"];
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelFile {
     pub url: String,
@@ -34,6 +48,10 @@ pub struct ModelFile {
     pub kind: String,
     #[serde(default)]
     pub requires_civitai_token: bool,
+    /// ComfyUI backend only: the `models/` subfolder this file goes in
+    /// (one of [`COMFY_DESTS`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest: Option<String>,
 }
 
 /// A prompt template SlopTweak puts into Invoke for this model (an Invoke
@@ -63,6 +81,9 @@ pub struct Model {
     pub id: String,
     pub name: String,
     pub description: String,
+    /// What runs on the instance. Absent = Invoke.
+    #[serde(default)]
+    pub backend: Backend,
     /// Model family: `sdxl`, `sd1`, `flux`, ...
     pub base: String,
     pub files: Vec<ModelFile>,
@@ -407,9 +428,32 @@ fn validate(m: &Model) -> Result<(), String> {
     if !m.files.iter().any(|f| f.kind == "main") {
         return Err("no main model file".into());
     }
+    if m.backend == Backend::Comfyui
+        && (m.invoke_min_version.is_some()
+            || m.default_settings.is_some()
+            || !m.templates.is_empty())
+    {
+        return Err("a ComfyUI model can't have Invoke settings or templates".into());
+    }
     let mut names = HashSet::new();
     for f in &m.files {
         validate_file(f)?;
+        match (m.backend, f.dest.as_deref()) {
+            (Backend::Comfyui, Some(d)) if COMFY_DESTS.contains(&d) => {}
+            (Backend::Comfyui, _) => {
+                return Err(format!(
+                    "{} needs a valid ComfyUI folder (dest)",
+                    f.filename
+                ));
+            }
+            (Backend::Invoke, None) => {}
+            (Backend::Invoke, Some(_)) => {
+                return Err(format!(
+                    "{} has a ComfyUI folder but the model is Invoke",
+                    f.filename
+                ));
+            }
+        }
         if !names.insert(f.filename.to_ascii_lowercase()) {
             return Err(format!("duplicate file name {}", f.filename));
         }
@@ -715,6 +759,83 @@ mod tests {
         let snofs = models.iter().find(|m| m.id == "snofs-krea-2").unwrap();
         let d = snofs.default_settings.as_ref().unwrap();
         assert_eq!((d.steps, d.cfg_scale), (Some(52), Some(3.5)));
+    }
+
+    #[test]
+    fn bundled_identity_edit_is_a_complete_comfyui_entry() {
+        let models = bundled();
+        let m = models
+            .iter()
+            .find(|m| m.id == "wulver-identity-edit")
+            .unwrap();
+        assert_eq!(m.backend, Backend::Comfyui);
+        assert!(m.invoke_min_version.is_none() && m.default_settings.is_none());
+        assert!(m.templates.is_empty());
+        assert!(!m.needs_civitai());
+        let placed: Vec<(&str, &str)> = m
+            .files
+            .iter()
+            .map(|f| (f.kind.as_str(), f.dest.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            placed,
+            [
+                ("main", "diffusion_models"),
+                ("text_encoder", "text_encoders"),
+                ("vae", "vae"),
+                ("lora", "loras"),
+            ]
+        );
+        // The Wulver weights are the very same file the Invoke entry uses.
+        let wulver = models.iter().find(|m| m.id == "wulver-turbo").unwrap();
+        assert_eq!(wulver.backend, Backend::Invoke);
+        assert_eq!(m.files[0].sha256, wulver.files[0].sha256);
+        assert!(m.min_vram_gb >= 32.0);
+        // Every other bundled model stays on Invoke with no ComfyUI folders.
+        for o in models.iter().filter(|o| o.id != m.id) {
+            assert_eq!(o.backend, Backend::Invoke, "{}", o.id);
+            assert!(o.files.iter().all(|f| f.dest.is_none()), "{}", o.id);
+        }
+    }
+
+    #[test]
+    fn comfyui_entries_need_a_valid_folder_and_no_invoke_settings() {
+        let comfy = |mutate: &dyn Fn(&mut serde_json::Value)| {
+            let mut e = entry("c");
+            e["backend"] = json!("comfyui");
+            e["base"] = json!("krea-2");
+            e["files"][0]["url"] = json!("https://huggingface.co/x/y/resolve/z/m.safetensors");
+            e["files"][0]["requires_civitai_token"] = json!(false);
+            e["files"][0]["dest"] = json!("diffusion_models");
+            e.as_object_mut().unwrap().remove("invoke_min_version");
+            mutate(&mut e);
+            parse(&catalog(vec![e, entry("ok")])).unwrap().1
+        };
+        assert!(comfy(&|_| {}).is_empty());
+        let skipped = |s: Vec<String>| s.iter().any(|m| m.starts_with("c:") || m.contains("\"c\""));
+        assert!(skipped(comfy(
+            &|e| e["files"][0]["dest"] = json!("checkpoints")
+        )));
+        assert!(skipped(comfy(&|e| {
+            e["files"][0].as_object_mut().unwrap().remove("dest");
+        })));
+        assert!(skipped(comfy(
+            &|e| e["invoke_min_version"] = json!("6.13.8")
+        )));
+        assert!(skipped(comfy(&|e| {
+            e["default_settings"] = json!({"cfg_scale": 1, "steps": 8});
+        })));
+        // An Invoke entry can't carry a ComfyUI folder either.
+        let mut inv = entry("inv");
+        inv["files"][0]["dest"] = json!("vae");
+        let (ok, skipped) = parse(&catalog(vec![inv, entry("ok")])).unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(skipped.len(), 1);
+        // Without a `backend` key a model is an Invoke model.
+        assert_eq!(
+            parse(&catalog(vec![entry("ok")])).unwrap().0[0].backend,
+            Backend::Invoke
+        );
     }
 
     #[test]

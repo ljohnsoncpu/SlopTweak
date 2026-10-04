@@ -13,6 +13,7 @@
     "allow-start-session",
     "allow-stop-session",
     "allow-open-invoke",
+    "allow-open-comfyui",
     "allow-dismiss",
     "allow-set-secret",
     "allow-check-credit",
@@ -32,6 +33,12 @@
     "allow-confirm-close",
     "allow-copy-diagnostics",
     "allow-check-update",
-    "allow-install-update"
+    "allow-install-update",
+    "allow-identity-state",
+    "allow-identity-pick-ref",
+    "allow-identity-clear-ref",
+    "allow-identity-use-result",
+    "allow-identity-generate",
+    "allow-identity-cancel"
   ]
 }

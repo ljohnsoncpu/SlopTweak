@@ -7,12 +7,15 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::catalog::Model;
+use crate::catalog::{Backend, Model};
 use crate::civitai::{compatible, Lora};
 use crate::provider::{offers::CostInputs, LaunchSpec, OfferQuery, LABEL};
 
 /// Official InvokeAI image, pinned by digest (findings §3; never below 6.13.8).
 pub const IMAGE: &str = "ghcr.io/invoke-ai/invokeai:v6.14.1-cuda@sha256:39a7e3b182c4646634d62cf3ebdefd2082573ae20cdba773f9703fee29e600dd";
+/// Vast's ComfyUI image for the Identity Edit backend, pinned by the digest of
+/// the `v0.38.0-cuda-12.9-py312` tag (read from Docker Hub 2026-10-03).
+pub const IMAGE_COMFY: &str = "vastai/comfy:v0.38.0-cuda-12.9-py312@sha256:5375f2d87a09461cc1755d13eec0c4775770831cef51cb35583480d12c842255";
 /// Instance asset bundle (provision.sh, sidecar.py, requirements.txt),
 /// published by the release workflow to this app version's own release. CI
 /// rebuilds the bundle and refuses to release if its hash isn't
@@ -23,7 +26,7 @@ pub const ASSETS_URL: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "/instance-assets.tar.gz"
 );
-pub const ASSETS_SHA256: &str = "16e68e06a67dbcd2a43bf5da510490d5c639abc966998720abae32de60461255";
+pub const ASSETS_SHA256: &str = "3751a40ce390b2f2b6722cdc76012e9abaaa561081769df744f7546a5be93625";
 /// Debug builds of a version that has no release yet fetch the same bytes
 /// from the `instance-v0.1.2` dev pre-release; `SLOPTWEAK_DEV_ASSETS_URL` overrides it
 /// (the instance still checks [`ASSETS_SHA256`]).
@@ -51,6 +54,23 @@ pub const ONSTART_LIMIT: usize = 4048;
 pub const INVOKE_VERSION: &str = "6.14.1";
 /// The Invoke CUDA image needs a driver that supports at least this.
 pub const MIN_CUDA: f64 = 12.4;
+/// The ComfyUI image is built for CUDA 12.9.
+pub const MIN_CUDA_COMFY: f64 = 12.9;
+
+/// The Docker image a model's backend runs on.
+pub fn image_for(model: &Model) -> &'static str {
+    match model.backend {
+        Backend::Invoke => IMAGE,
+        Backend::Comfyui => IMAGE_COMFY,
+    }
+}
+
+fn min_cuda_for(model: &Model) -> f64 {
+    match model.backend {
+        Backend::Invoke => MIN_CUDA,
+        Backend::Comfyui => MIN_CUDA_COMFY,
+    }
+}
 
 pub fn onstart() -> String {
     let s = include_str!("../../../instance/onstart.sh").replace("\r\n", "\n");
@@ -224,6 +244,10 @@ impl Settings {
 /// made unique so nothing overwrites anything on the instance.
 pub fn with_loras(model: &Model, loras: &[Lora]) -> Model {
     let mut out = model.clone();
+    // User LoRAs are Invoke LoRAs; the Identity Edit backend has its own.
+    if model.backend == Backend::Comfyui {
+        return out;
+    }
     let mut names: HashSet<String> = out
         .files
         .iter()
@@ -262,6 +286,10 @@ pub fn ready_timeout_minutes(model: &Model, s: &Settings) -> u32 {
     s.ready_timeout_minutes.max(for_size)
 }
 
+/// Newest GPU architecture the ComfyUI image runs Identity Edit on: Blackwell
+/// (compute cap 1200) fails in xformers ("No operator found"), live 2026-10-03.
+pub const COMFY_MAX_COMPUTE_CAP: u32 = 1199;
+
 pub fn offer_query(model: &Model, s: &Settings) -> OfferQuery {
     OfferQuery {
         min_vram_gb: model.min_vram_gb,
@@ -270,8 +298,12 @@ pub fn offer_query(model: &Model, s: &Settings) -> OfferQuery {
         min_inet_down_mbps: s.min_inet_down_mbps,
         min_disk_bw_mbps: s.min_disk_bw_mbps,
         max_dph: s.max_dph,
-        min_cuda: MIN_CUDA,
+        min_cuda: min_cuda_for(model),
         min_compute_cap: s.min_compute_cap.max(model.min_compute_cap.unwrap_or(0)),
+        max_compute_cap: match model.backend {
+            Backend::Comfyui => COMFY_MAX_COMPUTE_CAP,
+            _ => u32::MAX,
+        },
         min_ram_gb: model.min_ram_gb.unwrap_or(0.0),
         limit: 64,
     }
@@ -307,6 +339,9 @@ pub fn launch_spec(
                 "filename": f.filename,
                 "requires_civitai_token": f.requires_civitai_token,
             });
+            if let Some(d) = &f.dest {
+                v["dest"] = json!(d);
+            }
             if let (Some(d), true) = (&model.default_settings, Some(i) == main_idx) {
                 v["default_settings"] = json!(d);
             }
@@ -339,8 +374,11 @@ pub fn launch_spec(
     if let Some(t) = civitai_token.filter(|_| model.needs_civitai()) {
         env.push(("CIVITAI_TOKEN".to_string(), t.to_string()));
     }
+    if model.backend == Backend::Comfyui {
+        env.push(("BACKEND".to_string(), "comfyui".to_string()));
+    }
     LaunchSpec {
-        image: IMAGE.to_string(),
+        image: image_for(model).to_string(),
         disk_gb: disk_gb(model),
         label: LABEL.to_string(),
         env,
@@ -385,6 +423,74 @@ mod tests {
         assert!(IMAGE.contains(&format!(":v{INVOKE_VERSION}-cuda@")));
         assert_eq!(ASSETS_SHA256.len(), 64);
         assert!(ASSETS_SHA256.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    fn bundled_model(id: &str) -> Model {
+        catalog::bundled().into_iter().find(|m| m.id == id).unwrap()
+    }
+
+    #[test]
+    fn comfy_image_is_pinned_by_digest() {
+        assert!(IMAGE_COMFY.starts_with("vastai/comfy:v0.38.0-cuda-12.9-py312@sha256:"));
+        let digest = IMAGE_COMFY.rsplit_once("sha256:").unwrap().1;
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+        // The image is CUDA 12.9: hosts must support it.
+        const { assert!(MIN_CUDA_COMFY >= 12.9 && MIN_CUDA_COMFY > MIN_CUDA) };
+    }
+
+    #[test]
+    fn the_backend_picks_image_cuda_and_env() {
+        let (comfy, invoke) = (
+            &bundled_model("wulver-identity-edit"),
+            &bundled_model("wulver-turbo"),
+        );
+        assert_eq!(image_for(comfy), IMAGE_COMFY);
+        assert_eq!(image_for(invoke), IMAGE);
+        let s = Settings::default();
+        assert_eq!(offer_query(comfy, &s).min_cuda, MIN_CUDA_COMFY);
+        assert_eq!(offer_query(invoke, &s).min_cuda, MIN_CUDA);
+
+        let spec = launch_spec(comfy, &s, &"a".repeat(64), Some("civitai-key"));
+        assert_eq!(spec.image, IMAGE_COMFY);
+        let env = |k: &str| {
+            spec.env
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(env("BACKEND").as_deref(), Some("comfyui"));
+        // No file needs the CivitAI key, so it isn't sent.
+        assert!(env("CIVITAI_TOKEN").is_none());
+        let files: Vec<serde_json::Value> = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(env("MODELS_B64").unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let dests: Vec<&str> = files.iter().map(|f| f["dest"].as_str().unwrap()).collect();
+        assert_eq!(dests, ["diffusion_models", "text_encoders", "vae", "loras"]);
+        assert!(files[0].get("default_settings").is_none());
+
+        // Invoke launches are unchanged: no BACKEND, no dest.
+        let spec = launch_spec(invoke, &s, &"a".repeat(64), None);
+        assert_eq!(spec.image, IMAGE);
+        assert!(spec.env.iter().all(|(n, _)| n != "BACKEND"));
+        let b64 = &spec.env.iter().find(|(n, _)| n == "MODELS_B64").unwrap().1;
+        let files: Vec<serde_json::Value> = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(files.iter().all(|f| f.get("dest").is_none()));
+    }
+
+    #[test]
+    fn user_loras_are_not_added_to_a_comfyui_model() {
+        let comfy = bundled_model("wulver-identity-edit");
+        let l = lora(7, "Krea 2", "extra.safetensors");
+        assert_eq!(with_loras(&comfy, &[l]).files.len(), comfy.files.len());
     }
 
     #[test]
@@ -529,6 +635,16 @@ mod tests {
         assert_eq!(offer_query(&model, &s).min_compute_cap, 800);
         model.min_compute_cap = Some(600);
         assert_eq!(offer_query(&model, &s).min_compute_cap, 750);
+    }
+
+    #[test]
+    fn comfyui_models_exclude_blackwell_others_do_not() {
+        let s = Settings::default();
+        let mut model = catalog::bundled()[0].clone();
+        model.backend = Backend::Invoke;
+        assert_eq!(offer_query(&model, &s).max_compute_cap, u32::MAX);
+        model.backend = Backend::Comfyui;
+        assert_eq!(offer_query(&model, &s).max_compute_cap, 1199);
     }
 
     fn decoded_models(spec: &LaunchSpec) -> serde_json::Value {

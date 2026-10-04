@@ -239,6 +239,7 @@ fn launch_secret_is_256_bit_urlsafe() {
 struct Recorder {
     states: Mutex<Vec<SessionState>>,
     opened: Mutex<Vec<Url>>,
+    opened_apps: Mutex<Vec<RemoteApp>>,
     closed: Mutex<u32>,
     lines: Mutex<Vec<String>>,
     syncs: Mutex<Vec<SyncReport>>,
@@ -251,8 +252,9 @@ impl Ui for Recorder {
     fn log(&self, line: &str) {
         self.lines.lock().unwrap().push(line.to_string());
     }
-    fn open_remote(&self, url: Url) {
+    fn open_remote(&self, url: Url, app: RemoteApp) {
         self.opened.lock().unwrap().push(url);
+        self.opened_apps.lock().unwrap().push(app);
     }
     fn close_remote(&self) {
         *self.closed.lock().unwrap() += 1;
@@ -1131,5 +1133,315 @@ async fn templates_and_workflows_carry_across_gpus() {
         .with_library(&secret2, |l| l.workflows.len())
         .unwrap();
     assert_eq!(flows, 1);
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+}
+
+// ----- ComfyUI backend (Identity Edit) ------------------------------------------
+
+fn comfy_model() -> Model {
+    catalog::bundled()
+        .into_iter()
+        .find(|m| m.id == "wulver-identity-edit")
+        .unwrap()
+}
+
+fn comfy_settings() -> Settings {
+    // The Identity Edit GPU costs more than the default price limit.
+    Settings {
+        max_dph: 0.70,
+        ..Settings::default()
+    }
+}
+
+async fn ready_comfy(h: &Harness) -> u64 {
+    h.mgr.start(comfy_model(), comfy_settings(), None).unwrap();
+    let SessionState::Ready { instance_id, .. } = wait_for(&h.mgr, is_ready).await else {
+        panic!()
+    };
+    instance_id
+}
+
+#[tokio::test(start_paused = true)]
+async fn comfyui_session_has_no_invoke_window_and_a_backend_record() {
+    let h = harness(vec![]);
+    let id = ready_comfy(&h).await;
+    let rec = RecordFile::new(h.dir.path()).load().unwrap();
+    assert_eq!(rec.instance_id, id);
+    assert_eq!(rec.backend, crate::catalog::Backend::Comfyui);
+    assert_eq!(rec.model_id, "wulver-identity-edit");
+    // The big-GPU offer was the only one that fits (32 GB, CUDA 12.9).
+    let SessionState::Ready { offer, .. } = h.mgr.state() else {
+        panic!()
+    };
+    assert_eq!(offer.offer_id, 105);
+    // Identity Edit is the app's own window: nothing opens, no Invoke library.
+    assert!(h.ui.opened.lock().unwrap().is_empty());
+    let err = h.mgr.open_invoke().await.unwrap_err();
+    assert!(err.contains("Identity Edit"), "{err}");
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+    assert!(h.mock.live_ids().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn open_comfyui_opens_the_raw_ui_only_on_identity_gpus() {
+    let h = harness(vec![]);
+    let _ = ready_comfy(&h).await;
+    h.mgr.open_comfyui().await.unwrap();
+    let opened = h.ui.opened.lock().unwrap().clone();
+    assert_eq!(opened.len(), 1);
+    assert!(opened[0].as_str().ends_with("/__auth?t=mock-ticket"));
+    assert_eq!(*h.ui.opened_apps.lock().unwrap(), vec![RemoteApp::ComfyUi]);
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+
+    let h = harness(vec![]);
+    let _ = ready_instance(&h).await;
+    let err = h.mgr.open_comfyui().await.unwrap_err();
+    assert!(err.contains("Identity Edit"), "{err}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn comfyui_outputs_are_saved_once_and_before_destroy() {
+    let h = harness(vec![]);
+    let id = ready_comfy(&h).await;
+    h.mock.with_comfy(id, |c| {
+        c.add_output("p-1", "ComfyUI_00001_.png");
+        c.add_output("p-2", "ComfyUI_00002_.png");
+    });
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    let out = out_dir(h.dir.path());
+    assert_eq!(pngs(&out).len(), 2, "{:?}", pngs(&out));
+    // A third appears right before Stop: only the last pass can save it.
+    h.mock
+        .with_comfy(id, |c| c.add_output("p-3", "ComfyUI_00003_.png"));
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+    let files = pngs(&out);
+    assert_eq!(files.len(), 3, "{files:?}");
+    assert!(
+        files.iter().all(|f| f.contains("_ComfyUI_0000")),
+        "{files:?}"
+    );
+    assert_eq!(
+        std::fs::read(out.join(&files[0])).unwrap(),
+        crate::provider::mock::MOCK_PNG
+    );
+    assert!(h.mock.live_ids().is_empty(), "still destroyed");
+    let r = h.mgr.sync_report().unwrap();
+    assert_eq!(
+        (r.phase, r.saved, r.canvas_saved, r.missing),
+        (Phase::Done, 3, 0, 0)
+    );
+    // No Canvas folder for ComfyUI.
+    assert!(!out.join(crate::sync::CANVAS_DIR).exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn comfyui_failed_downloads_are_retried() {
+    let h = harness(vec![]);
+    let id = ready_comfy(&h).await;
+    h.mock
+        .with_comfy(id, |c| c.add_output("p-1", "ComfyUI_00001_.png"));
+    h.mock.fail_image("ComfyUI_00001_.png", 2);
+    tokio::time::sleep(Duration::from_secs(40)).await;
+    assert_eq!(pngs(&out_dir(h.dir.path())).len(), 1);
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+    let r = h.mgr.sync_report().unwrap();
+    assert_eq!((r.phase, r.saved, r.missing), (Phase::Done, 1, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn comfyui_reattach_keeps_the_backend_and_the_ledger() {
+    let h = harness(vec![]);
+    let id = ready_comfy(&h).await;
+    h.mock
+        .with_comfy(id, |c| c.add_output("p-1", "ComfyUI_00001_.png"));
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    assert_eq!(pngs(&out_dir(h.dir.path())).len(), 1);
+    // The app restarts: a new manager over the same disk and instance.
+    let (mgr, ui) = rebuild(&h.mock, h.dir.path(), h.secrets.clone());
+    mgr.reattach(id).await.unwrap();
+    wait_for(&mgr, is_ready).await;
+    // Reattached: still no Invoke window, and nothing is fetched twice.
+    assert!(ui.opened.lock().unwrap().is_empty());
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    assert_eq!(pngs(&out_dir(h.dir.path())).len(), 1);
+    assert!(mgr.stop_and_wait(Duration::from_secs(300)).await);
+    assert!(h.mock.live_ids().is_empty());
+}
+
+// ----- Identity Edit against the fake ComfyUI --------------------------------------
+
+fn identity_target(h: &Harness) -> crate::identity::Target {
+    let (sidecar, base, secret, model_id) = h.mgr.comfy_endpoint().unwrap();
+    assert_eq!(model_id, "wulver-identity-edit");
+    crate::identity::Target {
+        sidecar,
+        base,
+        secret,
+        files: crate::identity::ModelFiles::of(&comfy_model()).unwrap(),
+    }
+}
+
+fn identity_service() -> Arc<crate::identity::IdentityService> {
+    Arc::new(crate::identity::IdentityService::new(Arc::new(|| {})))
+}
+
+#[tokio::test(start_paused = true)]
+async fn identity_edit_makes_an_image_and_it_is_saved() {
+    use crate::identity::{Aspect, Mode, Phase};
+    let h = harness(vec![]);
+    let id = ready_comfy(&h).await;
+    let target = identity_target(&h);
+    let svc = identity_service();
+    svc.set_ref(0, "fox.png", crate::provider::mock::MOCK_PNG.to_vec())
+        .unwrap();
+    svc.set_ref(1, "wolf.png", crate::provider::mock::MOCK_PNG.to_vec())
+        .unwrap();
+    svc.generate(
+        &target,
+        "  they share a coffee  ",
+        Mode::New,
+        Aspect::Portrait,
+        0xBEEF,
+    )
+    .await
+    .unwrap();
+
+    let v = svc.view();
+    assert_eq!(v.phase, Phase::Done, "{}", v.message);
+    assert_eq!(v.results.len(), 1);
+    assert!(v.results[0].data_url.starts_with("data:image/png;base64,"));
+    // Both sheets were uploaded, under run-unique names, and the graph that
+    // was queued uses those names and the user's words (trimmed).
+    let (uploads, prompts) = h
+        .mock
+        .with_comfy(id, |c| {
+            let mut u: Vec<_> = c.uploads.keys().cloned().collect();
+            u.sort();
+            (u, c.prompts.clone())
+        })
+        .unwrap();
+    assert_eq!(
+        uploads,
+        ["sloptweak_ref_beef_0.png", "sloptweak_ref_beef_1.png"]
+    );
+    assert_eq!(prompts.len(), 1);
+    let g = &prompts[0];
+    assert_eq!(g["20"]["inputs"]["image"], "sloptweak_ref_beef_0.png");
+    assert_eq!(g["21"]["inputs"]["image"], "sloptweak_ref_beef_1.png");
+    assert!(g["4"]["inputs"]["prompt"]
+        .as_str()
+        .unwrap()
+        .ends_with("applying this prompt: they share a coffee"));
+    assert_eq!(g["6"]["inputs"]["width"], 896);
+    // The output sync saves it like any other image, then destroys.
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+    assert_eq!(pngs(&out_dir(h.dir.path())).len(), 1);
+    assert!(h.mock.live_ids().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn identity_edit_mode_edits_the_picture_first() {
+    use crate::identity::{fit_size, image_size, Aspect, Mode, Phase, BASE_SLOT};
+    let h = harness(vec![]);
+    let id = ready_comfy(&h).await;
+    let target = identity_target(&h);
+    let svc = identity_service();
+    let png = crate::provider::mock::MOCK_PNG.to_vec();
+    svc.set_ref(BASE_SLOT, "base.png", png.clone()).unwrap();
+    svc.set_ref(0, "sheet.png", png.clone()).unwrap();
+    svc.generate(
+        &target,
+        "make it dusk",
+        Mode::Edit,
+        Aspect::Landscape,
+        0xED17,
+    )
+    .await
+    .unwrap();
+    let v = svc.view();
+    assert_eq!(v.phase, Phase::Done, "{}", v.message);
+    let (uploads, prompts) = h
+        .mock
+        .with_comfy(id, |c| {
+            let mut u: Vec<_> = c.uploads.keys().cloned().collect();
+            u.sort();
+            (u, c.prompts.clone())
+        })
+        .unwrap();
+    // The picture is uploaded first (reference 1), the sheet second.
+    assert_eq!(
+        uploads,
+        ["sloptweak_ref_ed17_0.png", "sloptweak_ref_ed17_1.png"]
+    );
+    let g = &prompts[0];
+    assert_eq!(g["20"]["inputs"]["image"], "sloptweak_ref_ed17_0.png");
+    assert_eq!(g["21"]["inputs"]["image"], "sloptweak_ref_ed17_1.png");
+    // The canvas follows the picture, not the Shape menu.
+    let (w, hh) = fit_size(image_size(&png).unwrap().0, image_size(&png).unwrap().1);
+    assert_eq!(g["6"]["inputs"]["width"], w);
+    assert_eq!(g["6"]["inputs"]["height"], hh);
+    assert_eq!(g["7"]["inputs"]["denoise"], 1.0);
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn identity_edit_can_be_cancelled() {
+    use crate::identity::{Aspect, Mode, Phase};
+    let h = harness(vec![]);
+    let id = ready_comfy(&h).await;
+    h.mock.with_comfy(id, |c| c.hold_prompts = true);
+    let target = Arc::new(identity_target(&h));
+    let svc = identity_service();
+    svc.set_ref(0, "fox.png", crate::provider::mock::MOCK_PNG.to_vec())
+        .unwrap();
+    let run = {
+        let (svc, target) = (svc.clone(), target.clone());
+        tokio::spawn(async move {
+            svc.generate(&target, "a walk", Mode::New, Aspect::Square, 1)
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(svc.view().phase, Phase::Running);
+    svc.cancel(&target).await;
+    run.await.unwrap().unwrap();
+    let v = svc.view();
+    assert_eq!((v.phase, v.results.len()), (Phase::Cancelled, 0));
+    assert_eq!(h.mock.with_comfy(id, |c| c.interrupted).unwrap(), 1);
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn identity_edit_reports_a_refused_request_plainly() {
+    use crate::identity::{Aspect, Mode, Phase};
+    let h = harness(vec![]);
+    let id = ready_comfy(&h).await;
+    h.mock.with_comfy(id, |c| c.reject_prompts = true);
+    let target = identity_target(&h);
+    let svc = identity_service();
+    svc.set_ref(0, "fox.png", crate::provider::mock::MOCK_PNG.to_vec())
+        .unwrap();
+    svc.generate(&target, "a walk", Mode::New, Aspect::Square, 1)
+        .await
+        .unwrap();
+    let v = svc.view();
+    assert_eq!(v.phase, Phase::Failed);
+    assert!(v.message.contains("didn't accept"), "{}", v.message);
+    // The sheets stay, so the user can just try again.
+    assert!(v.refs[0].is_some());
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn identity_edit_needs_an_identity_edit_gpu() {
+    let h = harness(vec![]);
+    assert!(h.mgr.comfy_endpoint().is_err(), "nothing running");
+    ready_instance(&h).await; // an Invoke model
+    let err = h.mgr.comfy_endpoint().err().unwrap();
+    assert!(err.contains("isn't running Identity Edit"), "{err}");
+    assert_eq!(
+        h.mgr.active_backend(),
+        Some(crate::catalog::Backend::Invoke)
+    );
     assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
 }

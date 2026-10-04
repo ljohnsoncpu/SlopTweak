@@ -375,3 +375,67 @@ button.link.primary-link {
 .notice-card p {
   margin: 0 0 8px;
 }
+
+/* ----- Identity Edit panel ----- */
+.refs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 220px));
+  justify-content: start;
+  gap: 16px;
+  margin: 12px 0;
+}
+
+.ref-img {
+  aspect-ratio: 3 / 4;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 13px;
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+
+.ref-img img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+#id-prompt {
+  width: 100%;
+  margin: 6px 0 10px;
+  padding: 8px 10px;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  resize: vertical;
+}
+
+.results {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.results figure {
+  margin: 0;
+}
+
+.results img {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  display: block;
+}
+
+.results figcaption {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}

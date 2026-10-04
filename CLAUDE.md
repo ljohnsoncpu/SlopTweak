@@ -37,18 +37,28 @@ See PLAN.md §3: `app/` (Tauri: Rust in `src-tauri/`, TS UI in `src/`),
   through the `GpuProvider` trait.
 - Python (instance/): ruff + mypy strict; pytest with an injectable clock and
   a mocked Vast API. The sidecar runs in its own venv
-  (`uv venv /opt/sidecar-venv`; `uv` ships in the Invoke image) with pinned
-  deps (aiohttp). Never import from or install into Invoke's `/opt/venv`.
+  (`uv venv /opt/sidecar-venv`; `uv` ships in the Invoke and ComfyUI images,
+  and `provision.sh` falls back to `python3 -m venv` + pip) with pinned deps
+  (aiohttp). Never import from or install into Invoke's `/opt/venv` or the
+  ComfyUI image's `/venv/main`.
 - Shell (provision.sh): `set -euo pipefail`, shellcheck-clean, LF line
   endings. `onstart` itself stays under 4048 chars.
 - TS: plain TS or Svelte, strict mode.
 - Pin versions: the InvokeAI image by `vX.Y.Z-cuda@sha256:…` (tags have a
-  `-cuda` suffix; ≥ v6.13.8), the cloudflared version, and instance-asset
-  SHA-256s. Check a tag exists in the registry before using it.
+  `-cuda` suffix; ≥ v6.13.8), the Identity Edit backend's `vastai/comfy` image
+  by `vX.Y.Z-cuda-N-pyNNN@sha256:…`, its ComfyUI custom node by commit SHA
+  (`provision.sh`), the cloudflared version, and instance-asset SHA-256s.
+  Check a tag exists in the registry before using it.
+- Two backends (PLAN §2): `backend: invoke` (default) and `backend: comfyui`
+  (Identity Edit, a SlopTweak panel; ComfyUI is never shown to the user).
 
 ## Security invariants (don't regress)
 - Invoke binds 127.0.0.1 (`INVOKEAI_HOST=127.0.0.1`); only the sidecar port
   is exposed.
+- ComfyUI binds 127.0.0.1:8188 (`--listen 127.0.0.1`) and is never exposed;
+  the app talks to it only through the sidecar with the launch secret (no
+  `Origin` header: ComfyUI answers 403 to one). ComfyUI-Manager is moved
+  aside at provision time.
 - cloudflared always runs with `--metrics 127.0.0.1:<port>`.
 - The remote webview window has no Tauri capabilities and a dedicated data
   directory.

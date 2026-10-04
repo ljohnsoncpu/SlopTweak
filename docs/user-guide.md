@@ -20,6 +20,7 @@ on your screen will differ.*
 6. [Settings](#6-settings)
 7. [Updates](#7-updates)
 8. [When something goes wrong](#8-when-something-goes-wrong)
+9. [Identity Edit: your own characters in new scenes](#9-identity-edit-your-own-characters-in-new-scenes)
 
 ## 1. Install
 
@@ -223,3 +224,56 @@ your Windows user name are removed, and nothing is sent unless you paste it.
 **Checking that nothing is billing:** open
 [Vast's instances page](https://cloud.vast.ai/instances/). Anything listed there
 is running and billing. You can destroy it there too.
+
+## 9. Identity Edit: your own characters in new scenes
+
+Pick **Wulver Identity Edit** instead of a regular model. It rents a bigger GPU
+(32 GB or more, about $0.55-0.70 an hour) and the setup downloads about 33 GB,
+so the first start can take 10 to 15 minutes. It doesn't open Invoke: SlopTweak
+shows its own **Identity Edit** panel under the status line.
+
+1. **Add a character.** Press *Character 1…* and choose a picture of your
+   character (a PNG, JPEG or WebP, up to 15 MB). A clean full-body picture on a
+   plain background works best. You can add a second character the same way.
+2. **Say what they're doing**, for example "they sit together at a sunny café
+   table, laughing". Describe the scene; the characters' looks come from the
+   pictures.
+3. Pick a **shape** (square, tall or wide) and press **Make image**. It takes
+   about 30 to 60 seconds once the model is loaded; the first image takes
+   longer.
+4. Every finished image is shown under the button **and** saved to your output
+   folder as it appears (and once more before the GPU shuts down), just like
+   Invoke's images. *Use as character 1/2* puts a result back in a slot so you
+   can keep going from it.
+
+### Editing a picture
+Set **I want to** to *Edit a picture* to change an image you already have instead
+of making a new one:
+
+1. Press *Picture to edit…* and choose the image (PNG, JPEG or WebP, up to 15 MB).
+2. Optionally add a *character sheet* too; the edit can pull the character's look
+   from it.
+3. Say what should change, for example "change the jacket into a red hoodie, keep
+   everything else the same", and press **Edit image**.
+
+The result keeps the picture's shape (there is no Shape menu in this mode) and
+usually its scene and characters. The whole image is redrawn, so small details can
+drift, and large changes such as turning day into night alter the lighting a lot.
+Your words win over a character sheet: if the sheet shows a green jacket and you
+ask for a red hoodie, you get the hoodie. *Edit this image* under a result sends
+it back in to be edited again.
+
+Notes: *Cancel* stops an image that's running. **Stop** works as always: it saves
+what's left and shuts the GPU down, so nothing keeps billing. The Invoke-only
+parts of SlopTweak (the tutorial, templates, workflows and your CivitAI LoRAs)
+don't apply to Identity Edit.
+
+### Advanced: ComfyUI's own interface
+While an Identity Edit GPU is ready, **Open ComfyUI (advanced)** opens ComfyUI's
+node editor in its own window, with the *SlopTweak Identity Edit* workflow in
+its Workflows list. No extra node packs and no ComfyUI-Manager are installed,
+so only what Identity Edit ships with is available. Images you save with a
+*Save Image* node are synced to your output folder like the panel's results
+(use plain folder names: letters, digits, `-`, `_`, `.`; *Preview Image* results
+aren't saved). The GPU keeps billing while a long job runs, and closing the
+window asks whether to stop it, as with Invoke.
