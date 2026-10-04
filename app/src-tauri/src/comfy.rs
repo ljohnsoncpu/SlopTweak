@@ -180,6 +180,25 @@ mod tests {
     }
 
     #[test]
+    fn raw_ui_prefixes_and_subfolders_are_synced_previews_are_not() {
+        // The raw ComfyUI UI saves under any SaveImage prefix, often in a folder.
+        let h = json!({
+            "r1": entry("success", 1_000, json!([
+                {"filename": "MyProject_00001_.png", "subfolder": "", "type": "output"},
+                {"filename": "render_00001_.png", "subfolder": "MyProject/day-2", "type": "output"},
+                {"filename": "PreviewImage_temp_abc.png", "subfolder": "", "type": "temp"},
+                {"filename": "Spaced name.png", "subfolder": "My Project", "type": "output"},
+            ])),
+        });
+        let got = parse_history(&h);
+        assert_eq!(
+            got.iter().map(ComfyImage::key).collect::<Vec<_>>(),
+            ["r1/MyProject_00001_.png", "r1/render_00001_.png"]
+        );
+        assert_eq!(got[1].subfolder, "MyProject/day-2");
+    }
+
+    #[test]
     fn subfolder_rules() {
         for ok in ["", "a", "a/b-c_d.e"] {
             assert!(valid_subfolder(ok), "{ok}");

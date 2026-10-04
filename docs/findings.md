@@ -1904,3 +1904,142 @@ client), the new `BACKEND=comfyui` provisioning from the published bundle, the
   and the idle shutdown (only the queue probe was exercised).
 - Debug-build hook: `SLOPTWEAK_DEV_PICK_REF=a.png;b.png` answers the file dialog;
   it doesn't exist in release builds.
+
+## Open ComfyUI (raw UI) — built, not yet live (2026-10-03)
+Built and unit-tested; **not run against a real GPU** (no rental). Spend: $0.
+
+- **Origin handling** (`sidecar.py::_rewrite_browser_origin`, `BACKEND=comfyui`
+  only): an `Origin` whose host isn't the tunnel host gets 403 from the sidecar;
+  a same-host `Origin` and `Referer` are rewritten to `http://127.0.0.1:8188`
+  (HTTP and `/ws`); a foreign `Referer` is dropped; requests with no `Origin`
+  (the app's Rust client, bearer calls) pass unchanged. ComfyUI's own CSRF check
+  is thus replaced by the sidecar's, with the `SameSite=Lax` cookie behind it.
+  Assumes cloudflared forwards the tunnel host as `Host`. 🧪 Verify live.
+- **Workflow preload:** `provision.sh` copies `workflows/krea2_identity_edit.json`
+  (exists at the pinned `comfyui-krea2edit` SHA, 24180 bytes) into
+  `ComfyUI/user/default/workflows/SlopTweak Identity Edit.json`. 🧪 Whether the
+  sidebar lists it and the graph loads cleanly is untested.
+- **Window:** `RemoteApp::ComfyUi` skips the Invoke tutorial and defaults scripts
+  and titles the window "SlopTweak — ComfyUI"; still no Tauri capability and the
+  same `remote-webview` data dir. The close prompt is backend-neutral.
+- **Output sync of raw-UI results:** any `SaveImage` prefix and nested plain
+  subfolders are synced (flat file name, subfolder dropped); `PreviewImage`
+  (`temp`) is ignored (unit-tested). ⚠️ Subfolders with spaces, non-ASCII or over
+  64 characters, and video/animated outputs, are skipped on purpose (hostile-name
+  hardening). The user guide says to use plain folder names.
+- **Idle limits:** raw-UI jobs POST `/prompt` (counts as activity) and show in the
+  `/queue` probe, so idle behaves as for the panel. 🧪 Not exercised live.
+- **Bundle:** `instance/` changed, so `ASSETS_SHA256` is now `efe17444…54c5`.
+  The dev pre-release is **not published yet**; a live run needs a new one.
+- ⚠️ `app/dev/identity-ui-check.mjs` timed out waiting for the page ("ui") on
+  repeated runs in this session, also with the frontend edits stashed, after a
+  single 18/19 pass (the 19th was the new "Open ComfyUI" check, expected to fail
+  before the HTML existed). Cause not found; not caused by the button.
+
+## Edit spike, first live run: Open ComfyUI ✅, spike runs ❌ on Blackwell (2026-10-03)
+Instance 54051515, RTX PRO 4500 **Blackwell** 32 GB, Belgium, $0.3689/hr (offer
+44160786), bundle `instance-v0.1.4`. Ready in 616 s. **Spend: credit $6.0495 →
+$5.9114 = $0.14.** Stop destroyed it; Vast showed none left. Script:
+`app/dev/edit-spike.mjs` (scratch outputs outside the repo).
+
+**Open ComfyUI, live (all passed):** the button was offered; ComfyUI's own UI
+loaded in the remote window; the window's IPC was denied; `SlopTweak Identity
+Edit.json` appeared in `/userdata?dir=workflows`; the ComfyUI websocket
+connected through the tunnel (so the Origin rewrite works with the real
+cloudflared `Host`); same-origin `/upload/image`, `/prompt`, `/history`,
+`/view` worked from the page. 🧪 Still untested: loading that workflow in the UI
+and running it by hand, and a foreign-Origin rejection through the tunnel
+(browsers won't let a page set `Origin`).
+
+**Spike: every run failed at the KSampler** with xformers'
+`No operator found for memory_efficient_attention_forward ... requires device
+with capability < ...` (bf16, 8-11k tokens), the same for all 11 graphs. The
+image's xformers has no kernel for compute capability 12.0 (Blackwell). The
+earlier acceptance ran on an RTX 4080S (Ada, 8.9) and a 6000 Ada, which work.
+- ⚠️ **This is an app bug, not a spike artefact:** the catalog's
+  `min_compute_cap: 800` lets the offer filter pick Blackwell cards, and the
+  Identity Edit panel would fail the same way on one. Fix candidates: start
+  ComfyUI with `--use-pytorch-cross-attention` (skips xformers; 🧪 untested on
+  this stack, needs a bundle change), and/or exclude `compute_cap >= 1200` for
+  `backend: comfyui` offers. Not done yet.
+- No image from routes 1-3 yet, so nothing is known about edit quality.
+
+**Fixes applied (2026-10-03):** (1) `provision.sh` starts ComfyUI with
+`--use-pytorch-cross-attention` (no xformers); (2) `OfferQuery.max_compute_cap`
+(Vast `compute_cap.lte`), set to 1199 for `backend: comfyui` models so Blackwell
+offers are never chosen (`config.rs::COMFY_MAX_COMPUTE_CAP`, unit-tested). New
+bundle SHA-256 `3751a40c…3625`, published as dev pre-release
+[`instance-v0.1.5`](https://github.com/ljohnsoncpu/SlopTweak/releases/tag/instance-v0.1.5).
+🧪 Not yet run on a real GPU; the second spike run will confirm the flag.
+
+## Edit spike, second live run: base-image editing works (2026-10-03) ✅
+`--use-pytorch-cross-attention` fixed the Blackwell failure (🧪 the filter and flag
+weren't separated: the cap kept Blackwell away, so the flag itself was only proven
+on Ada). `instance-v0.1.5`, run through the app's own Open ComfyUI window
+(`app/dev/edit-spike.mjs`; Open ComfyUI checks 7/7 again). Test set: a fox+wolf
+café image as the **base** (896×1152) and the fox's turnaround sheet as the
+**reference**; prompts P1 "change the fox's green jacket into a red hoodie, keep
+everything else" and P2 "night time with rain on the window, keep the characters
+and layout". Same seed (424242) everywhere. Images are in the session scratch
+folder, not the repo.
+
+**Spend:** credit $5.9038 → $5.2462 = **$0.66** (the spike total with the failed
+Blackwell run is about $0.80). More than the $0.20-0.40 estimate: the first
+offer (A100 PCIe, $0.49/hr) spent 29 min downloading and was abandoned at its
+timeout, then the app retried on an RTX 4080S ($0.60/hr, Minnesota), ready 640 s
+later. Two instances, both destroyed; Vast showed none left.
+
+| Route | Result |
+| --- | --- |
+| **1. Base as reference 1, sheet as reference 2, no new nodes** (empty latent at the base's size) | ✅ **Works.** P1: the red hoodie is drawn, layout, characters, wolf, café and framing kept. P2: night + rain through the window, characters unchanged. With the base alone as the only reference it works as well, even slightly cleaner. Outside the jacket the mean pixel change vs the base is 3.4 (base alone) and 4.5 (base + sheet) on a 0-255 scale (VAE round-trip noise). 50 s (36 s with one reference). |
+| **1b. Canvas not the base's size** (1024×1024 for a 896×1152 base) | ⚠️ Re-frames the scene: it keeps the content and the edit but changes the crop/zoom. Use the base's own size. |
+| **2. True img2img** (`VAEEncode(base)` → `KSampler` denoise < 1, same patch) | ✅ for local edits, ⚠️ for global ones. Denoise 0.5 barely changes the jacket (green with red trim), **0.7** gives a red zip jacket (not the asked hoodie), 0.85 similar. Outside the jacket 4.1 (0.7). P2 at 0.7 only adds rain streaks and stays daytime (10.5). Closest to the base's pixels, but weaker at following the prompt than route 1. |
+| **3. Masked edit** (`LoadImageMask` + `SetLatentNoiseMask`, jacket polygon) | ✅ **Best for pinning the change.** Denoise 1.0: red hoodie inside the mask; **outside it changes 0.8**, i.e. practically untouched. 0.85: red jacket. Needs a user-drawn mask. |
+
+**Takeaways**
+- Route 1 already delivers "edit this image per the prompt" with the existing
+  nodes and no mask/strength UI: base image first, character sheets after.
+  It is the simplest Edit mode. It re-renders the whole image (small drift
+  everywhere, e.g. 3-5 levels), and big global edits (night) change the lighting a lot.
+- Add img2img only if the user wants "stay closer to the original"; a denoise
+  slider (0.5-0.85) is the control, but it follows prompts less well.
+- Add masking only if exact preservation of the rest matters. It needs a brush
+  or mask-upload UI.
+- **Resolution:** output size follows the canvas we give the latent; set it to
+  the base's size (rounded to multiples of 64 near 1 MP, as `Aspect::size` does).
+  References are capped at about 1 MP by the node; the 1152×896 sheet worked.
+- **Timing/VRAM:** about 49-52 s per image with two references, 36 s with one,
+  on a 4080S 32 GB. After the 11 runs `vram_free` was 4.4 GB of 33.8 GB (the
+  model plus patch use most of the card; no OOM).
+- **Identity vs. prompt:** P1 asked for a red hoodie while the sheet shows a
+  green jacket, and the prompt won in every route, so the sheet doesn't pin clothing.
+- 🧪 Not tested: the Ostris-format LoRAs (route 4, not needed), several base
+  images, faces/anatomy edits, bigger masks, a base that isn't the model's own
+  output (the base here was an Identity Edit result).
+- Content policy (PLAN §9.3) and the Krea license §4.2: this spike used SFW images;
+  base-image editing lets users alter images they bring in, which is worth
+  deciding on explicitly before shipping it.
+
+## Edit mode built: route 1 only (2026-10-03)
+The panel has **I want to: Make a new image / Edit a picture**. Edit mode sends
+the picture as reference 1 and the optional character sheet (slot 0) as reference
+2, with the canvas at the picture's own shape: `identity::fit_size` (about 1 MP,
+multiples of 64, 512-1536) from `identity::image_size` (PNG/JPEG/WebP headers;
+unreadable falls back to square). Slots: 0 and 1 are sheets, 2 is the picture
+(`BASE_SLOT`). No img2img or mask yet (routes 2 and 3 of the spike). Unit tests:
+header sizes, canvas rounding, reference order, a mock end-to-end edit; the mock
+UI check covers the mode switch and a mock edit (26/26). 🧪 Not run on a real GPU
+since the spike (the graph is the spike's route 1, except `fit_size` rounds to
+the base's shape instead of passing its exact size). Content policy (PLAN §9.3)
+and Krea license §4.2 are still undecided; editing user-supplied images touches both.
+
+### Edit mode, live (2026-10-03) ✅
+`node dev/vast-acceptance.mjs r5` (new run: debug file dialog answers slot 2 =
+the café picture, slot 0 = the fox sheet; `instance-v0.1.5`; price limit
+$0.75/hr, 60-min caps). Instance 54067728, RTX A6000 48 GB at $0.5422/hr, ready
+in 580 s. Edit mode made the edit in **71 s** (first image, includes the model
+load): the fox's green jacket became a red hoodie, the wolf, café, layout and
+framing were kept, and the output was 896×1152, the picture's own size. Stop
+destroyed the instance; Vast showed none left. **Spend: credit $5.2462 →
+$5.0851 = $0.16.** 2/2 checks. 🧪 Still not tried: JPEG/WebP bases, non-square
+and non-Wulver-made pictures, and prompts with faces or anatomy edits.

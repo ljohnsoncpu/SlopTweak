@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-comfyui"
+description = "Enables the open_comfyui command without any pre-configured scope."
+commands.allow = ["open_comfyui"]
+
+[[permission]]
+identifier = "deny-open-comfyui"
+description = "Denies the open_comfyui command without any pre-configured scope."
+commands.deny = ["open_comfyui"]

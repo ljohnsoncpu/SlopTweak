@@ -517,6 +517,31 @@ async function r4() {
   crash();
 }
 
+// ----- R5: Identity Edit, Edit mode ------------------------------------------------
+
+/** Start, switch to Edit mode, edit the picture in slot 2 (+ the sheet in slot 0), Stop.
+ * SHEETS=sheet.png;unused.png;base.png (the debug file dialog's answers by slot). */
+async function r5() {
+  say("=== R5: Identity Edit, Edit mode ===");
+  if (SHEETS.split(";").length < 3) throw new Error("set SHEETS=sheet.png;x.png;base.png");
+  launch("r5");
+  const m = await mainWindow();
+  const s = await startAndWaitReady(m, "R5");
+  const id = s.instance_id;
+  await waitFor(() => m.eval("!document.getElementById('identity').hidden"), 30000, "identity panel");
+  await m.eval("(() => { const s = document.getElementById('id-mode'); s.value = 'edit'; s.dispatchEvent(new Event('change')); })()");
+  await m.eval("document.getElementById('ref-pick-2').click()");
+  await waitFor(() => m.eval("!!document.getElementById('ref-img-2').querySelector('img')"), 15000, "picture to edit");
+  await m.eval("document.getElementById('ref-pick-0').click()");
+  await waitFor(() => m.eval("!!document.getElementById('ref-img-0').querySelector('img')"), 15000, "sheet");
+  await idGenerate(m, "R5-edit", "Change the fox's green jacket into a red hoodie. Keep everything else exactly the same.", "square");
+  await m.eval("document.getElementById('stop').click()");
+  await follow(m, (x) => x.kind === "idle", 5 * 60000, "R5 idle");
+  check("R5: Stop destroys the instance", await instanceGone(id), `instance ${id}`);
+  m.ws.close();
+  crash();
+}
+
 // ----- main -----------------------------------------------------------------
 
 const before = new Set((await ourInstances()).map((i) => i.id));
@@ -560,7 +585,7 @@ writeFileSync(
       max_dph: MAX_DPH,
       ready_timeout_minutes: READY_TIMEOUT,
       // R4 saves to a scratch folder, not the user's Pictures.
-      ...(runs.includes("r4") ? { output_dir: join(OUT, "out") } : {}),
+      ...(runs.includes("r4") || runs.includes("r5") ? { output_dir: join(OUT, "out") } : {}),
     },
     null,
     2,
@@ -601,7 +626,7 @@ const tracker = setInterval(async () => {
 try {
   for (const r of runs) {
     try {
-      await { r1, r2, r3, r4 }[r]();
+      await { r1, r2, r3, r4, r5 }[r]();
     } catch (e) {
       check(`${r} completed`, false, String(e));
       if (app) crash();

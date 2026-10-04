@@ -246,7 +246,34 @@ shows its own **Identity Edit** panel under the status line.
    Invoke's images. *Use as character 1/2* puts a result back in a slot so you
    can keep going from it.
 
+### Editing a picture
+Set **I want to** to *Edit a picture* to change an image you already have instead
+of making a new one:
+
+1. Press *Picture to edit…* and choose the image (PNG, JPEG or WebP, up to 15 MB).
+2. Optionally add a *character sheet* too; the edit can pull the character's look
+   from it.
+3. Say what should change, for example "change the jacket into a red hoodie, keep
+   everything else the same", and press **Edit image**.
+
+The result keeps the picture's shape (there is no Shape menu in this mode) and
+usually its scene and characters. The whole image is redrawn, so small details can
+drift, and large changes such as turning day into night alter the lighting a lot.
+Your words win over a character sheet: if the sheet shows a green jacket and you
+ask for a red hoodie, you get the hoodie. *Edit this image* under a result sends
+it back in to be edited again.
+
 Notes: *Cancel* stops an image that's running. **Stop** works as always: it saves
 what's left and shuts the GPU down, so nothing keeps billing. The Invoke-only
 parts of SlopTweak (the tutorial, templates, workflows and your CivitAI LoRAs)
 don't apply to Identity Edit.
+
+### Advanced: ComfyUI's own interface
+While an Identity Edit GPU is ready, **Open ComfyUI (advanced)** opens ComfyUI's
+node editor in its own window, with the *SlopTweak Identity Edit* workflow in
+its Workflows list. No extra node packs and no ComfyUI-Manager are installed,
+so only what Identity Edit ships with is available. Images you save with a
+*Save Image* node are synced to your output folder like the panel's results
+(use plain folder names: letters, digits, `-`, `_`, `.`; *Preview Image* results
+aren't saved). The GPU keeps billing while a long job runs, and closing the
+window asks whether to stop it, as with Invoke.

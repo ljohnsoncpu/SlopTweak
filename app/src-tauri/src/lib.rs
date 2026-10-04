@@ -44,7 +44,7 @@ use crate::provider::mock::{parse_script, MockProvider, MockTimings};
 use crate::provider::offers;
 use crate::provider::vast::VastProvider;
 use crate::provider::GpuProvider;
-use crate::remote::{RemoteWindows, TutorialSignal, TutorialStart};
+use crate::remote::{RemoteApp, RemoteWindows, TutorialSignal, TutorialStart};
 use crate::secrets::{KeyringStore, SecretStore};
 use crate::session::{Deps, Orphan, SessionManager, SessionState, Timing, Ui};
 use crate::sidecar::HttpSidecar;
@@ -72,11 +72,11 @@ impl Ui for TauriUi {
         let _ = self.app.emit_to("main", "session-log", line);
     }
 
-    fn open_remote(&self, url: Url) {
+    fn open_remote(&self, url: Url, app: RemoteApp) {
         let st = self.app.state::<AppState>();
         let tutorial = tutorial_start(&st.settings(), &st.catalog.lock().unwrap());
-        if let Err(e) = self.remote.open(url, &tutorial) {
-            eprintln!("[sloptweak] couldn't open the Invoke window: {e}");
+        if let Err(e) = self.remote.open(url, app, &tutorial) {
+            eprintln!("[sloptweak] couldn't open the remote window: {e}");
         }
     }
 
@@ -575,6 +575,11 @@ async fn open_invoke(st: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn open_comfyui(st: State<'_, AppState>) -> Result<(), String> {
+    st.manager()?.open_comfyui().await
+}
+
+#[tauri::command]
 async fn dismiss(st: State<'_, AppState>) -> Result<(), String> {
     st.manager()?.dismiss();
     Ok(())
@@ -782,6 +787,7 @@ async fn identity_generate(
     st: State<'_, AppState>,
     prompt: String,
     aspect: identity::Aspect,
+    mode: Option<identity::Mode>,
 ) -> Result<(), String> {
     let target = identity_target(&st)?;
     let seed = std::time::SystemTime::now()
@@ -793,7 +799,9 @@ async fn identity_generate(
     // continues in the background.
     let (tx, rx) = tokio::sync::oneshot::channel();
     tauri::async_runtime::spawn(async move {
-        let r = svc.generate(&target, &prompt, aspect, seed).await;
+        let r = svc
+            .generate(&target, &prompt, mode.unwrap_or_default(), aspect, seed)
+            .await;
         let _ = tx.send(r);
     });
     // `generate` returns early with Err on a bad request, and otherwise only
@@ -1304,7 +1312,7 @@ fn ask_stop_on_invoke_close(window: &tauri::Window) {
         .message(
             "Do you want to stop renting the GPU too?\n\n\
              Yes: stop it now. Your images are saved to your PC first.\n\
-             No: keep it running. You can reopen Invoke from SlopTweak, \
+             No: keep it running. You can reopen the window from SlopTweak, \
              and you're still paying while it runs.",
         )
         .title("Stop renting the GPU?")
@@ -1464,7 +1472,7 @@ pub fn run() {
                 .and_then(|u| Url::parse(&u).ok())
             {
                 // Dev-only: open the remote window directly (local webview check).
-                ui.open_remote(u);
+                ui.open_remote(u, RemoteApp::Invoke);
             }
             // Fetch on launch; the cached or bundled list shows meanwhile.
             let h = handle.clone();
@@ -1525,6 +1533,7 @@ pub fn run() {
             start_session,
             stop_session,
             open_invoke,
+            open_comfyui,
             dismiss,
             set_secret,
             check_credit,

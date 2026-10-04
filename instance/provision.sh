@@ -290,9 +290,13 @@ finish_comfy() {
     mkdir -p /opt/sloptweak/disabled-nodes
     mv "$nodes/ComfyUI-Manager" /opt/sloptweak/disabled-nodes/
   fi
+  # Raw-UI users start from the working Identity Edit graph (Workflows sidebar).
+  mkdir -p "$COMFY_DIR/user/default/workflows"
+  cp "$nodes/comfyui-krea2edit/workflows/krea2_identity_edit.json" \
+    "$COMFY_DIR/user/default/workflows/SlopTweak Identity Edit.json"
 
   status starting "starting ComfyUI"
-  (cd "$COMFY_DIR" && nohup setsid "$COMFY_PYTHON" main.py --listen 127.0.0.1 --port 8188 \
+  (cd "$COMFY_DIR" && nohup setsid "$COMFY_PYTHON" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention \
     >"$LOG_DIR/comfyui.log" 2>&1 </dev/null &)
   local out=""
   for _ in $(seq 1 180); do
