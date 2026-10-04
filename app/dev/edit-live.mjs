@@ -198,7 +198,8 @@ async function paint(m, strokes, brush) {
   await m.eval(setValue("mask-size", brush));
   const geo = await m.eval(`(() => { const c = ${$("mask-canvas")}; const r = c.getBoundingClientRect();
     const i = ${$("mask-base")}; return { left: r.left, top: r.top, w: r.width, h: r.height, nw: i.naturalWidth, nh: i.naturalHeight }; })()`);
-  const at = ([x, y]) => ({ x: geo.left + (x / geo.nw) * geo.w, y: geo.top + (y / geo.nh) * geo.h });
+  // Points are given in a 896x1152 space whatever the picture's real size.
+  const at = ([x, y]) => ({ x: geo.left + (x / 896) * geo.w, y: geo.top + (y / 1152) * geo.h });
   for (const stroke of strokes) {
     const pts = stroke.map(at);
     const ev = (type, p, buttons) =>
@@ -223,8 +224,11 @@ async function scenario(m, name, { strength = 100, prompt, paintSpec = null, zoo
     await m.eval(`${$("ref-pick-2")}.click()`);
     await waitFor(() => m.eval(`${$("ref-img-2")}.querySelector('img') !== null`), 15000, "picture");
   }
-  // A fresh pick replaces the painted area (new picture id).
+  // A fresh pick replaces the painted area (new picture id). The panel's state
+  // carries every result at full size, so after big pictures the refresh is slow:
+  // wait until the old painted area is really gone before painting a new one.
   await m.eval(`${$("ref-pick-2")}.click()`);
+  await waitFor(() => m.eval(`${$("mask-clear")}.hidden`), 120000, "the old painted area to clear", 500);
   await sleep(1500);
   await m.eval(setValue("id-strength", strength));
   if (paintSpec) {
