@@ -2168,3 +2168,87 @@ models, ComfyUI offloads weights and the job crawls. The only limit was 15 MB of
 - **Mock UI check:** the harness's own cold vite start makes it time out waiting for the
   UI most runs; with a warm `vite --port 1420` already running it passes (38/38 now,
   including "a new picture drops the painted area").
+
+## Focus on a part of a character sheet (2026-10-04, built, not live)
+Request: mask a face in a reference so the model concentrates on it. The Krea 2 edit
+patch takes whole images only (no region input), so the only lever is which pixels it
+is shown. The painted area for edits (above) is output-side and is unchanged.
+- **Decision (user, 2026-10-04):** crop to the painted region, character sheets only
+  (slots 0 and 1; the picture to edit keeps its own painted-area tool).
+- **As built:** the window sends a box per sheet (`identity_generate` `focus`
+  `[{slot, bbox}]`, the paint's bounding box in the sheet's own pixels). Rust checks
+  it against the kept sheet and adds `focus_crop` context (a quarter of the box's long
+  side, at least 32 px). The graph cuts the sheet with `ImageCrop` (node `8N`) before the
+  existing scale step, so the VAE encode, the patch's `source_image` and the grounded
+  encode all see the cut. A cut under 0.25 MP is enlarged to 0.5 MP (`lanczos`); one over
+  1.5 MP is shrunk to 1 MP (`area`); in between it goes in as is. The sheet is still
+  uploaded whole (Rust has no image decoder; the cut happens on the GPU).
+- **Unit tests** (3 new): crop padding and clamping, graph wiring and the resize
+  choices, focus lined up with the right reference in New and Edit modes (and a bad box
+  refused). Mock UI check: 46/46 with the new focus steps.
+- ⚠️ **Not verified live.** Whether a face crop pulls identity better than the full
+  sheet, and whether the 0.5 MP enlargement of small crops helps or just softens, needs
+  a rental (A/B: whole sheet vs. face crop, same seed and prompt). `FOCUS_MIN_PAD`,
+  `FOCUS_MIN_PIXELS` and `FOCUS_ENLARGED_MEGAPIXELS` in `identity.rs` are the knobs.
+- **Harness built (2026-10-05, mock-tested, not live):** `app/dev/focus-live.mjs`
+  (run sheet: `docs/spikes/focus-ab-run-sheet.md`), plus a debug-only fixed seed
+  (`SLOPTWEAK_DEV_SEED_FILE`) and `[dev-focus]` app-log lines. Run against MockProvider:
+  14 images, 14/14 checks; the keep-the-GPU hand-off leaves the app, vite and a catalog
+  server running after the script exits. Found and fixed on the way: the Identity Edit
+  panel never showed a refused request (the refresh after an error cleared it).
+  A direct `identity_clear_ref` doesn't notify the window, so a script has to use the
+  panel's Clear button; a refresh already in flight can overwrite a later change.
+
+## Focus A/B, live (2026-10-05): helps on a crowded sheet, not on a clean one
+Run: `app/dev/focus-live.mjs`, run sheet `docs/spikes/focus-ab-run-sheet.md`. Instance
+54386712, A100 PCIE 40 GB, Idaho, $0.6015/hr, ready in 1013 s (about 17 min), bundle
+as before. Credit $13.1452 before; $12.8327 at hand-off ($0.31 for start-up and 14 images);
+the GPU was then **kept running at the user's request** (idle shutdown 60 min, session
+cap 180 min), so the final spend is not recorded here. 14 images, 14/14 checks, all
+about 20 to 40 s each (focus and whole took the same time). Images stay in
+`Documents\sloptweak-focus-ab\out-live` (not in the repo).
+
+Setup: 7 blind pairs, same seed, prompt, picture(s) and shape in both arms. Pictures: a
+clean single-view fox sheet (1024x1536), a five-view tiger sheet with a small head
+(1359x2000), a husky in a suit as the picture to edit. Every focus crop was under 0.25 MP
+and so was **enlarged to 0.5 MP** (fox head 407x409 cut, tiger head 308x275), so the
+enlargement is part of the "focus" arm and is not tested separately.
+
+| Pair | Case | Focus was | User's pick | Pick was | My blind pick |
+| --- | --- | --- | --- | --- | --- |
+| 1 | A fox, portrait | y | x | whole | tie on face |
+| 2 | A fox, portrait | y | x | whole | tie on face |
+| 3 | A fox, portrait | x | y | whole | tie on face |
+| 4 | B fox + tiger | y | y | **focus** | y (**focus**) |
+| 5 | B fox + tiger | y | y | **focus** | y (**focus**) |
+| 6 | C husky + tiger face swap | y | y | **focus** | y (**focus**) |
+| 7 | C husky + tiger face swap | x | y | whole ("both pretty rough") | y (whole, narrowly) |
+
+- **A (clean fox sheet):** the face is essentially identical in all six images, so the
+  whole sheet already holds identity. The user chose the whole-sheet image all three
+  times; what I saw was that the focus images show less of the outfit and body (no sash
+  or hands in two of three), consistent with a tighter reference giving a tighter
+  picture. No gain, a small loss.
+- **B (fox + tiger, portrait):** a clear focus win both times. With the whole tiger sheet
+  the tiger's hair comes out almost entirely blue with a whiter muzzle; with the head
+  crop it has the sheet's black hair with a blue side lock and grey muzzle. The fox is
+  the same either way.
+- **C (face swap onto the husky):** pair 6, focus gave a clean single full-body picture
+  with the tiger's face; the whole-sheet arm added a stray floating head in the corner
+  (it copies the sheet's multi-view layout). Pair 7 went the other way and both were
+  rough: the focus arm dropped the suit jacket and changed the arms; the whole-sheet arm
+  added the sheet's back view and headshot.
+- **Against the run sheet's bar** ("adopt as is" needed focus better or equal on at least
+  5 of 7 with 3 clear wins and no regression): by the user's overall picks focus won 3
+  of 7 and lost 4, with a small outfit regression on the clean sheet, so **not adopted
+  as the default**. It is also not a wash: it is input dependent. **Keep it optional**
+  (as built), and use it when the sheet is crowded (several views) or the head is
+  small, which is where it helped; a clean single-view sheet doesn't need it.
+- **Caveats:** 7 pairs, one seed each, two raters who agreed on 5 of 7 (the two
+  disagreements were all in case A, where I called the face a tie). Mode and seed
+  effects are not separated. This shows a clear effect on the busy sheet and cannot
+  show a small one.
+- **Idea, not built:** with one character sheet, send the head crop as a *second*
+  reference next to the whole sheet (keeps the outfit and body from the sheet, adds
+  detail on the face). New mode has a free reference slot for it; Edit mode already uses
+  both. Worth a pair run before building.
