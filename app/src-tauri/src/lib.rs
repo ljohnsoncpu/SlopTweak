@@ -835,6 +835,19 @@ fn identity_target(st: &AppState) -> Result<identity::Target, String> {
     })
 }
 
+/// The seed in a dev seed file: one number, read on every image so the
+/// harness can change it between images. Anything else (missing file, text,
+/// more than 52 bits) means "pick a random seed as usual".
+#[cfg(debug_assertions)]
+fn dev_seed(path: &std::path::Path) -> Option<u64> {
+    let seed = std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    (seed < 1 << 52).then_some(seed)
+}
+
 /// Start one image. Returns at once; progress and the result arrive through
 /// `identity-changed` and `identity_state`.
 #[tauri::command]
@@ -845,13 +858,45 @@ async fn identity_generate(
     mode: Option<identity::Mode>,
     strength: Option<u32>,
     mask: Option<identity::MaskInput>,
+    focus: Option<Vec<identity::FocusInput>>,
 ) -> Result<(), String> {
-    let target = identity_target(&st)?;
-    let opts = identity::EditOpts { strength, mask };
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[dev-focus] called: mode={mode:?} focus={}",
+        focus.as_ref().map_or(0, Vec::len)
+    );
+    let target = identity_target(&st).inspect_err(|e| {
+        #[cfg(debug_assertions)]
+        eprintln!("[dev-focus] refused: {e}");
+    })?;
+    let opts = identity::EditOpts {
+        strength,
+        mask,
+        focus: focus.unwrap_or_default(),
+    };
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64 & ((1 << 52) - 1))
         .unwrap_or(1);
+    // Debug builds only: A/B runs need the same seed for both arms of a pair.
+    #[cfg(debug_assertions)]
+    let seed = std::env::var("SLOPTWEAK_DEV_SEED_FILE")
+        .ok()
+        .and_then(|p| dev_seed(std::path::Path::new(&p)))
+        .unwrap_or(seed);
+    // Debug builds only: what the A/B harness reads from the app's log (it never
+    // prints this, so the person rating the images can't tell the arms apart).
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[dev-focus] {}",
+        serde_json::json!({
+            "seed": seed,
+            "focus": opts.focus.iter().map(|f| serde_json::json!({
+                "slot": f.slot,
+                "bbox": [f.bbox.x, f.bbox.y, f.bbox.w, f.bbox.h],
+            })).collect::<Vec<_>>(),
+        })
+    );
     let svc = st.identity.clone();
     // Checked here so a bad request comes back as an error; the run itself
     // continues in the background.
@@ -872,7 +917,11 @@ async fn identity_generate(
     // `generate` returns early with Err on a bad request, and otherwise only
     // when the image is done; give a bad request a moment to report itself.
     match tokio::time::timeout(Duration::from_millis(300), rx).await {
-        Ok(Ok(Err(e))) => Err(e),
+        Ok(Ok(Err(e))) => {
+            #[cfg(debug_assertions)]
+            eprintln!("[dev-focus] refused: {e}");
+            Err(e)
+        }
         _ => Ok(()),
     }
 }
@@ -1631,7 +1680,28 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{fixed_link, tutorial_start, Catalog, Settings};
+    use super::{dev_seed, fixed_link, tutorial_start, Catalog, Settings};
+
+    #[test]
+    fn the_dev_seed_file_gives_a_seed_or_nothing() {
+        let dir = std::env::temp_dir().join(format!("sloptweak-seed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("seed.txt");
+        assert_eq!(dev_seed(&file), None); // no file
+        for (text, want) in [
+            ("123456\n", Some(123_456)),
+            (" 7 ", Some(7)),
+            ("abc", None),
+            ("", None),
+            ("-5", None),
+            ("4503599627370496", None), // 2^52: too big for the sampler's seed
+            ("4503599627370495", Some((1 << 52) - 1)),
+        ] {
+            std::fs::write(&file, text).unwrap();
+            assert_eq!(dev_seed(&file), want, "{text:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn links_are_fixed_https_pages() {

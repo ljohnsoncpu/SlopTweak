@@ -246,6 +246,19 @@ shows its own **Identity Edit** panel under the status line.
    Invoke's images. *Use as character 1/2* puts a result back in a slot so you
    can keep going from it.
 
+**Use just one part of a character picture.** When a sheet shows more than you want
+the model to pay attention to (a full-body picture when only the face matters, or a
+group shot), press *Focus on a part…* under it and paint over the part to use, such
+as the face. Only that part, with a little around it, is sent as the reference; a
+small part is enlarged so it keeps its detail. The painted area shows on the
+thumbnail. *Use whole picture* goes back to the full sheet, and choosing another
+picture for the box drops it. In our tests it helped most when a sheet shows several
+views or the head is small; with a clean single-view sheet it made no difference to the
+face and tended to show less of the outfit, so you usually don't need it there. This
+works for both character boxes, and for the
+optional character sheet when editing a picture. It is separate from *Paint the
+area to change*, which says where an edit happens.
+
 ### Editing a picture
 Set **I want to** to *Edit a picture* to change an image you already have instead
 of making a new one:

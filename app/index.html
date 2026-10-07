@@ -91,12 +91,20 @@
                 <button id="ref-pick-0" type="button">Character 1…</button>
                 <button id="ref-clear-0" type="button" class="ghost" hidden>Clear</button>
               </div>
+              <div class="actions">
+                <button id="ref-focus-0" type="button" hidden>Focus on a part…</button>
+                <button id="ref-unfocus-0" type="button" class="ghost" hidden>Use whole picture</button>
+              </div>
             </div>
             <div id="ref-box-1" class="ref">
               <div id="ref-img-1" class="ref-img"></div>
               <div class="actions">
                 <button id="ref-pick-1" type="button">Character 2 (optional)…</button>
                 <button id="ref-clear-1" type="button" class="ghost" hidden>Clear</button>
+              </div>
+              <div class="actions">
+                <button id="ref-focus-1" type="button" hidden>Focus on a part…</button>
+                <button id="ref-unfocus-1" type="button" class="ghost" hidden>Use whole picture</button>
               </div>
             </div>
           </div>
@@ -256,7 +264,7 @@
         <button id="mask-done" type="button" class="primary">Done</button>
         <button id="mask-cancel" type="button" class="ghost">Cancel</button>
       </div>
-      <p class="muted small">Paint over what should change. The rest of the picture is kept exactly as it is.</p>
+      <p id="mask-help" class="muted small">Paint over what should change. The rest of the picture is kept exactly as it is.</p>
     </div>
 
     <div id="modal" class="modal" hidden>

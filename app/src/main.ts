@@ -1316,11 +1316,20 @@ function renderIdentity(): void {
   identity.refs.forEach((r, slot) => {
     const box = el(`ref-img-${slot}`);
     const empty = slot === BASE_SLOT ? "No picture yet" : editing ? "No sheet (optional)" : "No character yet";
+    if (focus[slot] && focus[slot]!.imageId !== r?.id) delete focus[slot];
+    const overlay = slot === BASE_SLOT ? painted?.overlay : focus[slot]?.overlay;
     box.replaceChildren(...(r ? [zoomable(h("img", { src: r.data_url, alt: r.name, title: `${r.name} (click to enlarge)` })),
-      ...(slot === BASE_SLOT && painted ? [h("img", { class: "mask-overlay", src: painted.overlay, alt: "" })] : []),
+      ...(overlay ? [h("img", { class: "mask-overlay", src: overlay, alt: "" })] : []),
     ] : [empty]));
     el<HTMLButtonElement>(`ref-clear-${slot}`).hidden = !r;
     el<HTMLButtonElement>(`ref-pick-${slot}`).disabled = busy;
+    if (slot !== BASE_SLOT) {
+      el<HTMLButtonElement>(`ref-focus-${slot}`).hidden = !r;
+      el<HTMLButtonElement>(`ref-focus-${slot}`).disabled = busy;
+      el<HTMLButtonElement>(`ref-focus-${slot}`).textContent = focus[slot] ? "Change the part…" : "Focus on a part…";
+      el<HTMLButtonElement>(`ref-unfocus-${slot}`).hidden = !focus[slot];
+      el<HTMLButtonElement>(`ref-unfocus-${slot}`).disabled = busy;
+    }
   });
   renderEditTools(editing, identity.refs[BASE_SLOT] ?? null);
   const haveInputs = editing ? !!identity.refs[BASE_SLOT] : !!identity.refs[0] || !!identity.refs[1];
@@ -1360,13 +1369,18 @@ function renderIdentity(): void {
 }
 
 async function identityAct(p: Promise<unknown>): Promise<void> {
+  let failure = "";
   try {
     await p;
-    identityError = "";
   } catch (e) {
-    identityError = String(e);
+    failure = String(e);
   }
+  // The refresh clears the last error, so show this one after it.
   await refreshIdentity();
+  if (failure) {
+    identityError = failure;
+    renderIdentity();
+  }
 }
 
 const identityUse = (id: string, slot: number) => identityAct(invoke("identity_use_result", { id, slot }));
@@ -1392,6 +1406,47 @@ interface PaintedArea {
 let painted: PaintedArea | null = null;
 const MASK_WORK = 1536;
 const MASK_UNDO = 10;
+
+/** A part of a character sheet (slot 0 or 1) to use instead of the whole picture. */
+interface FocusArea {
+  imageId: string;
+  work: HTMLCanvasElement;
+  /** Box around the painted part, in the picture's own pixels. */
+  bbox: { x: number; y: number; w: number; h: number };
+  overlay: string;
+}
+const focus: Record<number, FocusArea | undefined> = {};
+/** Which picture the painting window is open on. */
+let maskSlot = BASE_SLOT;
+
+/** Box around everything painted on a canvas, scaled to a picture of `w` x `h` pixels. */
+function paintedBox(c: HTMLCanvasElement, w: number, h: number): FocusArea["bbox"] | null {
+  const { width, height } = c;
+  const d = c.getContext("2d", { willReadFrequently: true })!.getImageData(0, 0, width, height).data;
+  let x0 = width;
+  let y0 = height;
+  let x1 = -1;
+  let y1 = -1;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (d[(y * width + x) * 4 + 3]! > 40) {
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+      }
+    }
+  }
+  if (x1 < 0) return null;
+  // Round outwards so the box never misses a painted pixel, and stay inside the picture.
+  const kx = w / width;
+  const ky = h / height;
+  const bx0 = Math.max(0, Math.floor(x0 * kx));
+  const by0 = Math.max(0, Math.floor(y0 * ky));
+  const bx1 = Math.min(w, Math.ceil((x1 + 1) * kx));
+  const by1 = Math.min(h, Math.ceil((y1 + 1) * ky));
+  return { x: bx0, y: by0, w: Math.max(1, bx1 - bx0), h: Math.max(1, by1 - by0) };
+}
 
 const idStrength = el<HTMLInputElement>("id-strength");
 
@@ -1432,21 +1487,36 @@ function setMaskTool(erase: boolean): void {
   el("mask-erase").classList.toggle("on", erase);
 }
 
-el("mask-open").onclick = async () => {
-  const base = identity.refs[BASE_SLOT];
-  if (!base) return;
-  maskBase.src = base.data_url;
+async function openMasker(slot: number): Promise<void> {
+  const pic = identity.refs[slot];
+  if (!pic) return;
+  maskSlot = slot;
+  el("mask-help").textContent =
+    slot === BASE_SLOT
+      ? "Paint over what should change. The rest of the picture is kept exactly as it is."
+      : "Paint over the part to use, such as the face. Only that part (with a little around it) is shown to the model.";
+  maskBase.src = pic.data_url;
   await maskBase.decode();
   maskNatural = { w: maskBase.naturalWidth, h: maskBase.naturalHeight };
   const k = Math.min(1, MASK_WORK / Math.max(maskNatural.w, maskNatural.h));
   maskCanvas.width = Math.max(1, Math.round(maskNatural.w * k));
   maskCanvas.height = Math.max(1, Math.round(maskNatural.h * k));
   maskCtx().clearRect(0, 0, maskCanvas.width, maskCanvas.height);
-  if (painted) maskCtx().drawImage(painted.work, 0, 0);
+  const prior = slot === BASE_SLOT ? painted?.work : focus[slot]?.work;
+  if (prior) maskCtx().drawImage(prior, 0, 0);
   maskUndo = [];
   setMaskTool(false);
   masker.hidden = false;
-};
+}
+
+el("mask-open").onclick = () => void openMasker(BASE_SLOT);
+for (const slot of [0, 1]) {
+  el(`ref-focus-${slot}`).onclick = () => void openMasker(slot);
+  el(`ref-unfocus-${slot}`).onclick = () => {
+    delete focus[slot];
+    renderIdentity();
+  };
+}
 
 const maskPoint = (e: PointerEvent) => {
   const r = maskCanvas.getBoundingClientRect();
@@ -1498,10 +1568,25 @@ el("mask-cancel").onclick = () => {
 };
 
 el("mask-done").onclick = async () => {
-  const base = identity.refs[BASE_SLOT];
+  const base = identity.refs[maskSlot];
   masker.hidden = true;
   if (!base) return;
   const { w, h } = maskNatural;
+  if (maskSlot !== BASE_SLOT) {
+    // A character sheet only needs the box around the paint.
+    const bbox = paintedBox(maskCanvas, w, h);
+    if (!bbox) {
+      delete focus[maskSlot]; // nothing painted: use the whole picture
+    } else {
+      const work = document.createElement("canvas");
+      work.width = maskCanvas.width;
+      work.height = maskCanvas.height;
+      work.getContext("2d")!.drawImage(maskCanvas, 0, 0);
+      focus[maskSlot] = { imageId: base.id, work, bbox, overlay: work.toDataURL("image/png") };
+    }
+    renderIdentity();
+    return;
+  }
   // The picture's own size: scale the painted layer up, keep what is painted.
   const full = document.createElement("canvas");
   full.width = w;
@@ -1708,6 +1793,11 @@ ui.idGo.onclick = () =>
               zoom: el<HTMLInputElement>("mask-zoom").checked,
             }
           : null,
+      focus: [0, 1].flatMap((slot) => {
+        const f = focus[slot];
+        // Edit mode only uses sheet 1 (slot 0); New mode uses both.
+        return f && (slot === 0 || !identityEditing()) ? [{ slot, bbox: f.bbox }] : [];
+      }),
     }),
   );
 ui.idCancel.onclick = () => void identityAct(invoke("identity_cancel"));

@@ -191,13 +191,72 @@ pub struct MaskInput {
     pub zoom: bool,
 }
 
-/// Optional extras for an edit: how far to go, and where.
+/// A part of a character sheet to use instead of the whole sheet (say, the
+/// face on a full-body picture).
+#[derive(Debug, Clone, Deserialize)]
+pub struct FocusInput {
+    /// The character sheet's slot: 0 or 1.
+    pub slot: usize,
+    /// Smallest rectangle around what the user painted, in the sheet's own pixels.
+    pub bbox: Rect,
+}
+
+/// Optional extras for a request: how far to go and where (edits only), and
+/// which part of each character sheet to look at (both modes).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct EditOpts {
     /// 50..=100: how much the picture may change. 100 re-draws it from the
     /// words alone (the default); lower stays closer to the original.
     pub strength: Option<u32>,
     pub mask: Option<MaskInput>,
+    #[serde(default)]
+    pub focus: Vec<FocusInput>,
+}
+
+/// Context kept around a focus area: a quarter of its size, at least this many pixels.
+const FOCUS_MIN_PAD: u32 = 32;
+/// A focus crop smaller than this (in pixels) is enlarged before it is encoded,
+/// so a small face still reaches the model with some detail.
+const FOCUS_MIN_PIXELS: u64 = 256 * 1024;
+const FOCUS_ENLARGED_MEGAPIXELS: f64 = 0.5;
+
+/// What is cut out of a sheet for a painted focus area: the area plus some
+/// context, kept inside the picture.
+pub fn focus_crop(image: (u32, u32), bbox: Rect) -> Rect {
+    let pad = (bbox.w.max(bbox.h) / 4).max(FOCUS_MIN_PAD);
+    let x0 = bbox.x.saturating_sub(pad);
+    let y0 = bbox.y.saturating_sub(pad);
+    let x1 = bbox
+        .x
+        .saturating_add(bbox.w)
+        .saturating_add(pad)
+        .min(image.0);
+    let y1 = bbox
+        .y
+        .saturating_add(bbox.h)
+        .saturating_add(pad)
+        .min(image.1);
+    Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    }
+}
+
+/// The crop for the sheet in `slot`, if the user chose a part of it. The box
+/// is checked against the sheet that is actually kept.
+fn focus_for(opts: &EditOpts, slot: usize, bytes: &[u8]) -> Result<Option<Rect>, String> {
+    let Some(f) = opts.focus.iter().find(|f| f.slot == slot) else {
+        return Ok(None);
+    };
+    let bad = || "The chosen part doesn't fit the picture. Choose it again.".to_string();
+    let (w, h) = image_size(bytes).ok_or_else(bad)?;
+    let fits = |a: u32, len: u32, max: u32| len > 0 && a.checked_add(len).is_some_and(|e| e <= max);
+    if !fits(f.bbox.x, f.bbox.w, w) || !fits(f.bbox.y, f.bbox.h, h) {
+        return Err(bad());
+    }
+    Ok(Some(focus_crop((w, h), f.bbox)))
 }
 
 /// What the graph needs beyond the plain edit.
@@ -351,7 +410,7 @@ pub fn build_graph(
     seed: u64,
     edit: Option<&EditGraph>,
 ) -> Value {
-    build_graph_with(files, refs, prompt, size, seed, edit, &[])
+    build_graph_with(files, refs, prompt, size, seed, edit, &[], &[])
 }
 
 /// True when a reference is big enough to be scaled down before it is encoded
@@ -362,7 +421,9 @@ pub fn needs_shrink(bytes: &[u8]) -> bool {
 
 /// [`build_graph`] plus `shrink`: which references to scale down to about 1 MP
 /// first, so a huge picture is never VAE-encoded at its own size (that can fill
-/// the GPU's memory and make a job crawl).
+/// the GPU's memory and make a job crawl). `focus`: which references to cut
+/// down to a part first (the cut is sized by its own pixels, not `shrink`).
+#[allow(clippy::too_many_arguments)]
 pub fn build_graph_with(
     files: &ModelFiles,
     refs: &[String],
@@ -371,6 +432,7 @@ pub fn build_graph_with(
     seed: u64,
     edit: Option<&EditGraph>,
     shrink: &[bool],
+    focus: &[Option<Rect>],
 ) -> Value {
     let (w, h) = size;
     let edit = edit.filter(|e| !e.is_plain());
@@ -400,14 +462,41 @@ pub fn build_graph_with(
         // A zoomed edit shows the model the zoomed area, not the whole picture.
         let pixels = if i == 0 && zoomed {
             json!(["40", 0])
-        } else if shrink.get(i).copied().unwrap_or(false) {
-            let small = format!("7{i}");
-            g[&small] = json!({"class_type": "ImageScaleToTotalPixels", "inputs": {
-                "image": [&load, 0], "upscale_method": "area",
-                "megapixels": SHRUNK_MEGAPIXELS, "resolution_steps": 8}});
-            json!([&small, 0])
         } else {
-            json!([&load, 0])
+            let part = focus.get(i).copied().flatten();
+            let mut source = json!([&load, 0]);
+            if let Some(c) = part {
+                let cut = format!("8{i}");
+                g[&cut] = crop_node(source, c);
+                source = json!([&cut, 0]);
+            }
+            let resize = match part {
+                Some(c) => {
+                    let area = u64::from(c.w) * u64::from(c.h);
+                    if area < FOCUS_MIN_PIXELS {
+                        Some(("lanczos", FOCUS_ENLARGED_MEGAPIXELS))
+                    } else if area > SHRINK_ABOVE_PIXELS {
+                        Some(("area", SHRUNK_MEGAPIXELS))
+                    } else {
+                        None
+                    }
+                }
+                None => shrink
+                    .get(i)
+                    .copied()
+                    .unwrap_or(false)
+                    .then_some(("area", SHRUNK_MEGAPIXELS)),
+            };
+            match resize {
+                Some((method, megapixels)) => {
+                    let small = format!("7{i}");
+                    g[&small] = json!({"class_type": "ImageScaleToTotalPixels", "inputs": {
+                        "image": source, "upscale_method": method,
+                        "megapixels": megapixels, "resolution_steps": 8}});
+                    json!([&small, 0])
+                }
+                None => source,
+            }
         };
         g[&latent]["inputs"]["pixels"] = pixels.clone();
         patch[format!("source_latent{suffix}")] = json!([&latent, 0]);
@@ -578,6 +667,15 @@ impl Kept {
             ),
         }
     }
+}
+
+/// A checked request, ready to run. `focus` lines up with `refs`.
+struct Begun {
+    refs: Vec<Kept>,
+    size: (u32, u32),
+    cancel: Arc<AtomicBool>,
+    plan: Option<EditPlan>,
+    focus: Vec<Option<Rect>>,
 }
 
 #[derive(Default)]
@@ -780,19 +878,17 @@ impl IdentityService {
         mode: Mode,
         aspect: Aspect,
     ) -> Result<(Vec<Kept>, (u32, u32), Arc<AtomicBool>), String> {
-        let (refs, size, cancel, _) =
-            self.begin_with(prompt, mode, aspect, &EditOpts::default())?;
-        Ok((refs, size, cancel))
+        let b = self.begin_with(prompt, mode, aspect, &EditOpts::default())?;
+        Ok((b.refs, b.size, b.cancel))
     }
 
-    #[allow(clippy::type_complexity)]
     fn begin_with(
         &self,
         prompt: &str,
         mode: Mode,
         aspect: Aspect,
         opts: &EditOpts,
-    ) -> Result<(Vec<Kept>, (u32, u32), Arc<AtomicBool>, Option<EditPlan>), String> {
+    ) -> Result<Begun, String> {
         let prompt = prompt.trim();
         if prompt.is_empty() {
             return Err(match mode {
@@ -816,9 +912,16 @@ impl IdentityService {
                 bytes: r.bytes.clone(),
             })
         };
+        let mut focus = Vec::new();
         let (refs, size, plan): (Vec<Kept>, _, _) = match mode {
             Mode::New => {
-                let refs: Vec<Kept> = i.refs[..2].iter().filter_map(take).collect();
+                let mut refs = Vec::new();
+                for slot in 0..2 {
+                    if let Some(k) = take(&i.refs[slot]) {
+                        focus.push(focus_for(opts, slot, &k.bytes)?);
+                        refs.push(k);
+                    }
+                }
                 if refs.is_empty() {
                     return Err("Add at least one character sheet.".into());
                 }
@@ -831,8 +934,13 @@ impl IdentityService {
                 let size =
                     image_size(&base.bytes).map_or(Aspect::Square.size(), |(w, h)| fit_size(w, h));
                 let (size, plan) = make_plan(opts, size)?;
+                // The picture to edit is always used whole.
+                focus.push(None);
                 let mut refs = vec![base];
-                refs.extend(take(&i.refs[0]));
+                if let Some(k) = take(&i.refs[0]) {
+                    focus.push(focus_for(opts, 0, &k.bytes)?);
+                    refs.push(k);
+                }
                 (refs, size, Some(plan))
             }
         };
@@ -842,7 +950,13 @@ impl IdentityService {
         i.message = "Sending your pictures…".into();
         drop(i);
         (self.notify)();
-        Ok((refs, size, cancel, plan))
+        Ok(Begun {
+            refs,
+            size,
+            cancel,
+            plan,
+            focus,
+        })
     }
 
     /// Make one image. Returns quickly with an error if the request is
@@ -871,9 +985,18 @@ impl IdentityService {
         seed: u64,
         opts: &EditOpts,
     ) -> Result<(), String> {
-        let (refs, size, cancel, plan) = self.begin_with(prompt, mode, aspect, opts)?;
+        let b = self.begin_with(prompt, mode, aspect, opts)?;
         let outcome = self
-            .run(target, &refs, prompt.trim(), size, seed, plan, &cancel)
+            .run(
+                target,
+                &b.refs,
+                prompt.trim(),
+                b.size,
+                seed,
+                b.plan,
+                &b.focus,
+                &b.cancel,
+            )
             .await;
         match outcome {
             Ok(Some(kept)) => {
@@ -904,6 +1027,7 @@ impl IdentityService {
         size: (u32, u32),
         seed: u64,
         plan: Option<EditPlan>,
+        focus: &[Option<Rect>],
         cancel: &AtomicBool,
     ) -> Result<Option<Kept>, String> {
         let unreachable = |e: SidecarError| match e {
@@ -969,7 +1093,16 @@ impl IdentityService {
             }
         }
         let shrink: Vec<bool> = refs.iter().map(|r| needs_shrink(&r.bytes)).collect();
-        let graph = build_graph_with(&t.files, &names, prompt, size, seed, edit.as_ref(), &shrink);
+        let graph = build_graph_with(
+            &t.files,
+            &names,
+            prompt,
+            size,
+            seed,
+            edit.as_ref(),
+            &shrink,
+            focus,
+        );
         let queued = t
             .sidecar
             .comfy_post_json(
@@ -1220,6 +1353,7 @@ mod tests {
             1,
             None,
             &[true, false],
+            &[],
         );
         assert_eq!(g["70"]["class_type"], "ImageScaleToTotalPixels");
         assert_eq!(g["70"]["inputs"]["image"], json!(["20", 0]));
@@ -1430,6 +1564,7 @@ mod tests {
                 bbox,
                 zoom,
             }),
+            ..Default::default()
         };
         let inside = Rect {
             x: 100,
@@ -1454,6 +1589,7 @@ mod tests {
                 bbox: inside,
                 zoom: false,
             }),
+            ..Default::default()
         };
         assert!(make_plan(&wrong, (704, 1024)).is_err());
         let out = Rect {
@@ -1468,6 +1604,7 @@ mod tests {
             &EditOpts {
                 strength: Some(5),
                 mask: None,
+                focus: Vec::new(),
             },
             (704, 1024),
         )
@@ -1550,6 +1687,110 @@ mod tests {
         assert!(new(&s, "again").unwrap_err().contains("already"));
         s.finished(Phase::Failed, "x");
         assert!(new(&s, "again").is_ok());
+    }
+
+    fn rect(x: u32, y: u32, w: u32, h: u32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn a_focus_crop_keeps_some_context_inside_the_picture() {
+        // A quarter of the area's size on each side...
+        assert_eq!(
+            focus_crop((2000, 3000), rect(800, 1000, 400, 400)),
+            rect(700, 900, 600, 600)
+        );
+        // ...at least 32 px, and never past the picture's edge.
+        assert_eq!(
+            focus_crop((2000, 3000), rect(10, 2950, 40, 50)),
+            rect(0, 2918, 82, 82)
+        );
+    }
+
+    #[test]
+    fn a_focus_part_replaces_the_whole_sheet_in_the_graph() {
+        let refs = ["a.png".to_string(), "b.png".to_string()];
+        let g = build_graph_with(
+            &files(),
+            &refs,
+            "x",
+            (896, 1152),
+            1,
+            None,
+            &[true, false],
+            &[None, Some(rect(100, 200, 300, 300))],
+        );
+        // The second sheet is cut first; a small cut is enlarged, not left tiny.
+        assert_eq!(g["81"]["class_type"], "ImageCrop");
+        assert_eq!(g["81"]["inputs"]["image"], json!(["21", 0]));
+        assert_eq!(g["81"]["inputs"]["x"], 100);
+        assert_eq!(g["81"]["inputs"]["height"], 300);
+        assert_eq!(g["71"]["inputs"]["image"], json!(["81", 0]));
+        assert_eq!(g["71"]["inputs"]["upscale_method"], "lanczos");
+        assert_eq!(g["71"]["inputs"]["megapixels"], FOCUS_ENLARGED_MEGAPIXELS);
+        assert_eq!(g["31"]["inputs"]["pixels"], json!(["71", 0]));
+        assert_eq!(g["12"]["inputs"]["source_image_b"], json!(["71", 0]));
+        assert_eq!(g["4"]["inputs"]["image_b"], json!(["71", 0]));
+        // The first sheet is untouched: shrunk as before, not cut.
+        assert!(g.get("80").is_none());
+        assert_eq!(g["70"]["inputs"]["image"], json!(["20", 0]));
+        assert_eq!(g["70"]["inputs"]["upscale_method"], "area");
+        // A cut that is already a good size goes in as it is; a big one is shrunk
+        // whatever `shrink` says.
+        let g = build_graph_with(
+            &files(),
+            &refs[..1],
+            "x",
+            (896, 1152),
+            1,
+            None,
+            &[true],
+            &[Some(rect(0, 0, 800, 800))],
+        );
+        assert_eq!(g["30"]["inputs"]["pixels"], json!(["80", 0]));
+        assert!(g.get("70").is_none());
+        let g = build_graph_with(
+            &files(),
+            &refs[..1],
+            "x",
+            (896, 1152),
+            1,
+            None,
+            &[false],
+            &[Some(rect(0, 0, 3000, 2000))],
+        );
+        assert_eq!(g["70"]["inputs"]["image"], json!(["80", 0]));
+        assert_eq!(g["70"]["inputs"]["megapixels"], 1.0);
+    }
+
+    #[test]
+    fn a_focus_part_follows_its_sheet_into_the_request() {
+        let focus = |slot, bbox| EditOpts {
+            focus: vec![FocusInput { slot, bbox }],
+            ..Default::default()
+        };
+        let s = svc();
+        s.set_ref(0, "a.png", png_header(2000, 3000)).unwrap();
+        s.set_ref(1, "b.png", png_header(1000, 1000)).unwrap();
+        s.set_ref(2, "base.png", png_header(1500, 1500)).unwrap();
+        let new = |s: &IdentityService, o: &EditOpts| {
+            s.begin_with("a cafe", Mode::New, Aspect::Square, o)
+        };
+        let b = new(&s, &focus(1, rect(400, 300, 200, 200))).unwrap();
+        assert_eq!(b.focus, vec![None, Some(rect(350, 250, 300, 300))]);
+        s.finished(Phase::Failed, "x");
+        // A box that doesn't fit the sheet that is kept is refused.
+        assert!(new(&s, &focus(1, rect(900, 0, 200, 200))).is_err());
+        assert!(new(&s, &focus(0, rect(0, 0, 0, 10))).is_err());
+        assert_eq!(s.view().phase, Phase::Failed);
+        // Edit: the picture to edit is never cut; the sheet may be. Slot 2 is ignored.
+        let edit =
+            |s: &IdentityService, o: &EditOpts| s.begin_with("dusk", Mode::Edit, Aspect::Square, o);
+        let b = edit(&s, &focus(0, rect(100, 100, 400, 400))).unwrap();
+        assert_eq!(b.focus, vec![None, Some(rect(0, 0, 600, 600))]);
+        s.finished(Phase::Failed, "x");
+        let b = edit(&s, &focus(2, rect(0, 0, 10, 10))).unwrap();
+        assert_eq!(b.focus, vec![None, None]);
     }
 
     /// A minimal PNG header with the given size (enough for `image_size`).

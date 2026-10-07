@@ -248,6 +248,39 @@ async function run() {
   check("Clear removes a sheet", await evaluate(`!${q("ref-img-1")}.querySelector('img')`));
   await shot("i4-two-results");
 
+  // Focus on a part of a sheet: paint it, send it, drop it.
+  check("a sheet offers Focus on a part", (await evaluate(visible("ref-focus-0"))) && !(await evaluate(visible("ref-unfocus-0"))));
+  check("an empty slot doesn't", !(await evaluate(visible("ref-focus-1"))));
+  await evaluate(click("ref-pick-1")); // a real-sized sheet (the mock's results are tiny)
+  await waitFor(async () => await evaluate(`!!${q("ref-img-1")}.querySelector('img')`), 10000, "sheet to focus");
+  await evaluate(click("ref-focus-1"));
+  await waitFor(async () => await evaluate(`!${q("masker")}.hidden && ${q("mask-base")}.naturalWidth > 0`), 10000, "focus editor");
+  check("the editor says what to paint", (await evaluate(text("mask-help"))).includes("part to use"));
+  await evaluate(`${q("mask-base")}.style.width = '400px'; ${q("mask-base")}.style.maxWidth = 'none'`);
+  await sleep(300);
+  const fbox = await evaluate(`(() => { const r = ${q("mask-canvas")}.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; })()`);
+  const fmouse = (type, fx, fy, buttons) =>
+    send("Input.dispatchMouseEvent", { type, x: fbox.x + fbox.w * fx, y: fbox.y + fbox.h * fy, button: "left", buttons, clickCount: 1 });
+  await evaluate(setValue("mask-size", "60"));
+  await fmouse("mouseMoved", 0.4, 0.2, 0);
+  await fmouse("mousePressed", 0.4, 0.2, 1);
+  await fmouse("mouseMoved", 0.6, 0.3, 1);
+  await fmouse("mouseReleased", 0.6, 0.3, 0);
+  await evaluate(click("mask-done"));
+  await waitFor(async () => await evaluate(visible("ref-unfocus-1")), 10000, "focus kept");
+  check("Done keeps the part and shows it on the sheet", await evaluate(`!!${q("ref-img-1")}.querySelector('img.mask-overlay')`));
+  check("the button now says Change the part", (await evaluate(text("ref-focus-1"))).startsWith("Change"));
+  check("the picture to edit has no overlay from it", !(await evaluate(visible("mask-clear"))));
+  await evaluate(click("id-go"));
+  await waitFor(async () => (await evaluate(`${q("id-results")}.querySelectorAll('img').length`)) === 3, 30000, "focused result");
+  check("an image made from the chosen part completes", !(await evaluate(text("id-msg"))).toLowerCase().includes("fit"), await evaluate(text("id-msg")));
+  await shot("i4b-focus");
+  await evaluate(click("ref-unfocus-1"));
+  check("Use whole picture drops the part", !(await evaluate(visible("ref-unfocus-1"))) && !(await evaluate(`!!${q("ref-img-1")}.querySelector('img.mask-overlay')`)));
+  await evaluate(click("ref-focus-1"));
+  await waitFor(async () => await evaluate(visible("masker")), 10000, "focus editor again");
+  await evaluate(click("mask-cancel"));
+
   // Edit mode: a picture to edit (plus the sheet), size follows the picture.
   await evaluate(setValue("id-mode", "edit"));
   await sleep(400);
@@ -260,7 +293,7 @@ async function run() {
   await waitFor(async () => await evaluate(`!!${q("ref-img-2")}.querySelector('img')`), 10000, "picture to edit");
   check("Edit image turns on", !(await evaluate(`${q("id-go")}.disabled`)));
   await evaluate(click("id-go"));
-  await waitFor(async () => (await evaluate(`${q("id-results")}.querySelectorAll('img').length`)) === 3, 30000, "edit result");
+  await waitFor(async () => (await evaluate(`${q("id-results")}.querySelectorAll('img').length`)) === 4, 30000, "edit result");
   check("an edited image appears", true);
   await evaluate(`${q("id-results")}.querySelectorAll('figure')[0].querySelectorAll('figcaption button')[2].click()`);
   await sleep(500);
@@ -301,7 +334,7 @@ async function run() {
   check("Done keeps the painted area and offers zoom", (await evaluate(visible("mask-zoom-row"))) && (await evaluate(`!!${q("ref-img-2")}.querySelector('img.mask-overlay')`)));
   check("the hint says only the painted area changes", (await evaluate(text("id-strength-hint"))).includes("painted area"));
   await evaluate(click("id-go"));
-  await waitFor(async () => (await evaluate(`${q("id-results")}.querySelectorAll('img').length`)) === 4, 30000, "painted-edit result");
+  await waitFor(async () => (await evaluate(`${q("id-results")}.querySelectorAll('img').length`)) === 5, 30000, "painted-edit result");
   check("a painted edit with zoom completes", !(await evaluate(text("id-msg"))).toLowerCase().includes("paint"));
   await evaluate(click("ref-pick-2")); // choosing a picture again starts without the old painted area
   await sleep(800);
@@ -325,8 +358,8 @@ async function run() {
   check("New image mode brings back character 2 and Shape", (await evaluate(visible("ref-box-1"))) && (await evaluate(visible("id-aspect-row"))) && !(await evaluate(visible("ref-box-2"))));
 
   // Saved while running; Stop saves the rest and destroys.
-  await waitFor(async () => filesIn(MOCK_OUT) >= before + 4, 30000, "files saved");
-  check("all images were saved to the output folder", filesIn(MOCK_OUT) >= before + 3, `${filesIn(MOCK_OUT) - before} new`);
+  await waitFor(async () => filesIn(MOCK_OUT) >= before + 5, 30000, "files saved");
+  check("all images were saved to the output folder", filesIn(MOCK_OUT) >= before + 4, `${filesIn(MOCK_OUT) - before} new`);
   await evaluate(click("stop"));
   await waitFor(async () => await evaluate(visible("start")), 60000, "stopped");
   check("Stop returns to idle and hides the panel", !(await evaluate(visible("identity"))) && !(await evaluate(visible("open-comfy"))));
