@@ -10,6 +10,11 @@
 //       Reconnect -> another image -> Stop. Needs SHEETS=a.png;b.png (the
 //       debug build's file-dialog stand-in) and writes to OUT/out.
 //
+//   R6  Identity Edit, "how closely to follow the sheets" sweep (TEST_MODEL=
+//       kroma-identity-edit or wulver-identity-edit): one fixed seed, prompts that
+//       ask for a different pose than the sheets, the slider at several values.
+//       Needs SHEETS=a.png;b.png. Writes S1-pullX / S2-pullX images to OUT.
+//
 // Safety: every instance created while this runs is destroyed in `finally`
 // (anything labelled sloptweak* that wasn't there before). Instance ids are
 // printed as soon as they're seen. Keys are read from HKCU\Environment and
@@ -49,7 +54,7 @@ const GENERATE = Number(process.env.GENERATE ?? 0);
 const MAX_DPH = Number(process.env.MAX_DPH ?? 0.5);
 const MAX_SESSION_MINUTES = Number(process.env.MAX_SESSION_MINUTES ?? 60);
 const LOCAL_CATALOG = process.env.LOCAL_CATALOG === "1";
-const CATALOG_PORT = 18557;
+const CATALOG_PORT = Number(process.env.CATALOG_PORT ?? 18557);
 const READY_TIMEOUT = Number(process.env.READY_TIMEOUT ?? 15);
 // R4: two character sheets, answered to the debug build's pick-a-file call.
 const SHEETS = process.env.SHEETS ?? "";
@@ -428,7 +433,8 @@ const idState = (m) => m.eval("window.__TAURI_INTERNALS__.invoke('identity_state
 
 /** Fill the prompt, press Make image, wait for one more result. Saves it. */
 async function idGenerate(m, tag, prompt, aspect) {
-  const before = (await idState(m)).results.length;
+  // New images are found by id: the app keeps only the last few results, so a count can stall.
+  const seen = new Set((await idState(m)).results.map((r) => r.id));
   await m.eval(`(() => {
     const p = document.getElementById('id-prompt');
     p.value = ${JSON.stringify(prompt)}; p.dispatchEvent(new Event('input'));
@@ -450,14 +456,14 @@ async function idGenerate(m, tag, prompt, aspect) {
       say(`${tag}: [${v.phase}] ${v.message}`);
     }
     if (v.phase === "failed") throw new Error(v.message);
-    return v.results.length > before ? v : false;
+    return v.results.some((r) => !seen.has(r.id)) ? v : false;
   }, 15 * 60000, `${tag} image`).catch((e) => {
     say(`${tag}: ${e}`);
     return null;
   });
   const secs = Math.round((Date.now() - started) / 1000);
   if (made) {
-    const url = made.results[0].data_url;
+    const url = made.results.find((r) => !seen.has(r.id)).data_url;
     const bytes = Buffer.from(url.slice(url.indexOf(",") + 1), "base64");
     writeFileSync(join(OUT, `${tag}-result.png`), bytes);
     say(`${tag}: saved ${tag}-result.png (${bytes.length} bytes)`);
@@ -542,6 +548,51 @@ async function r5() {
   crash();
 }
 
+// ----- R6: how closely to follow the sheets (the sweep) ----------------------------
+
+// PULLS_S1 / PULLS_S2: comma lists of slider values for the one-sheet and two-sheet cases.
+const pulls = (name, dflt) => (process.env[name] ?? dflt).split(",").map(Number).filter((n) => Number.isFinite(n));
+const PULLS_S1 = pulls("PULLS_S1", "1,0.5,0.25");
+const PULLS_S2 = pulls("PULLS_S2", "1,0.5,0.25");
+const setPull = (m, v) =>
+  m.eval(`(() => { const i = document.getElementById('id-pull'); i.value = ${JSON.stringify(String(v))}; i.dispatchEvent(new Event('input')); })()`);
+
+/** Start, then make the same pictures with the slider at different values (fixed seed). */
+async function r6() {
+  say("=== R6: follow-the-sheets sweep ===");
+  if (!SHEETS.includes(";")) throw new Error("set SHEETS=a.png;b.png");
+  const seedFile = join(OUT, "seed.txt");
+  writeFileSync(seedFile, "424242");
+  process.env.SLOPTWEAK_DEV_SEED_FILE = seedFile;
+  launch("r6");
+  const m = await mainWindow();
+  const s = await startAndWaitReady(m, "R6");
+  const id = s.instance_id;
+  await waitFor(() => m.eval("!document.getElementById('identity').hidden"), 30000, "identity panel");
+  check("R6: the slider is in the panel at its default", (await m.eval("document.getElementById('id-pull').value")) === "1");
+  await m.shot("R6-ready");
+
+  // S1: one sheet (slot 0), a different pose than the sheet.
+  await m.eval("document.getElementById('ref-pick-0').click()");
+  await waitFor(() => m.eval("!!document.getElementById('ref-img-0').querySelector('img')"), 15000, "sheet 1");
+  for (const v of PULLS_S1) {
+    await setPull(m, v);
+    await idGenerate(m, `S1-pull${v}`, "The fox leaps through the air on a sunny beach, arms raised, seen from the side.", "square");
+  }
+  // S2: two sheets, a different pose than either.
+  await m.eval("document.getElementById('ref-pick-1').click()");
+  await waitFor(() => m.eval("!!document.getElementById('ref-img-1').querySelector('img')"), 15000, "sheet 2");
+  for (const v of PULLS_S2) {
+    await setPull(m, v);
+    await idGenerate(m, `S2-pull${v}`, "The fox and the wolf dance together on a rooftop at night, mid-motion, seen from a low angle.", "portrait");
+  }
+  await m.eval("document.getElementById('stop').click()");
+  await follow(m, (x) => x.kind === "idle", 5 * 60000, "R6 idle");
+  check("R6: Stop destroys the instance", await instanceGone(id), `instance ${id}`);
+  m.ws.close();
+  crash();
+}
+
 // ----- main -----------------------------------------------------------------
 
 const before = new Set((await ourInstances()).map((i) => i.id));
@@ -585,7 +636,7 @@ writeFileSync(
       max_dph: MAX_DPH,
       ready_timeout_minutes: READY_TIMEOUT,
       // R4 saves to a scratch folder, not the user's Pictures.
-      ...(runs.includes("r4") || runs.includes("r5") ? { output_dir: join(OUT, "out") } : {}),
+      ...(runs.includes("r4") || runs.includes("r5") || runs.includes("r6") ? { output_dir: join(OUT, "out") } : {}),
     },
     null,
     2,
@@ -626,7 +677,7 @@ const tracker = setInterval(async () => {
 try {
   for (const r of runs) {
     try {
-      await { r1, r2, r3, r4, r5 }[r]();
+      await { r1, r2, r3, r4, r5, r6 }[r]();
     } catch (e) {
       check(`${r} completed`, false, String(e));
       if (app) crash();

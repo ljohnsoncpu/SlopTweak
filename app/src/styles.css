@@ -493,8 +493,20 @@ button.link.primary-link {
   flex-wrap: wrap;
 }
 
-#id-strength {
+#id-strength,
+#id-pull {
   width: 180px;
+}
+
+#id-pull-box {
+  margin: 8px 0 12px;
+}
+
+#id-pull-box .row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .ref-img {

@@ -171,7 +171,28 @@ async function run() {
     },
   });
   const { ws, evaluate, shot, send } = await connect();
-  await waitFor(async () => (await evaluate(`${q("model")}.options.length`)) > 0, 30000, "ui");
+  try {
+    await waitFor(async () => (await evaluate(`${q("model")}.options.length`)) > 0, 30000, "ui");
+  } catch (e) {
+    // Say what the page shows: a script error at start-up leaves the model list empty.
+    const body = await evaluate("document.body.innerText.slice(0, 400)");
+    console.log(`page text: ${JSON.stringify(body)}`);
+    const seen = [];
+    ws.addEventListener("message", (m) => {
+      const msg = JSON.parse(m.data);
+      if (msg.method === "Runtime.exceptionThrown") seen.push(msg.params.exceptionDetails?.exception?.description ?? msg.params.exceptionDetails?.text);
+      if (msg.method === "Runtime.consoleAPICalled" && msg.params.type === "error") seen.push(msg.params.args.map((a) => a.value ?? a.description).join(" "));
+    });
+    await send("Runtime.enable");
+    await send("Page.reload");
+    await sleep(4000);
+    console.log(`start-up errors: ${JSON.stringify(seen).slice(0, 1200)}`);
+    for (const cmd of ["get_snapshot", "get_catalog"]) {
+      const r = await evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(cmd)}).then((x) => 'ok ' + JSON.stringify(x).slice(0, 200)).catch((e) => 'ERR ' + String(e))`);
+      console.log(`${cmd}: ${r}`);
+    }
+    throw e;
+  }
   await sleep(800);
 
   // Wizard (keys are fake; the mock accepts them).
@@ -230,6 +251,16 @@ async function run() {
   check("the message says it was saved", (await evaluate(text("id-msg"))).includes("saved"));
   await shot("i3-one-result");
 
+  // How closely to follow the sheets: shown in New mode, 1 = the default.
+  check("the follow-the-sheets slider is shown", await evaluate(visible("id-pull-box")));
+  check("it starts at the default of 1", (await evaluate(`${q("id-pull")}.value`)) === "1" && (await evaluate(text("id-pull-val"))) === "Default");
+  await evaluate(setValue("id-pull", "0.25"));
+  check("moving it shows the number and a hint", (await evaluate(text("id-pull-val"))) === "0.25" && (await evaluate(text("id-pull-hint"))).includes("freedom"));
+  await evaluate(setValue("id-pull", "0"));
+  check("it can't go below 0.25", (await evaluate(`${q("id-pull")}.value`)) === "0.25");
+  await evaluate(setValue("id-pull", "0.5"));
+  // The next image (two sheets) is made at 0.5: a non-default value goes through the command.
+
   // Two sheets, tall, then keep going from the result.
   await evaluate(click("ref-pick-1"));
   await waitFor(async () => await evaluate(`!!${q("ref-img-1")}.querySelector('img')`), 10000, "sheet 2");
@@ -237,6 +268,9 @@ async function run() {
   await evaluate(click("id-go"));
   await waitFor(async () => (await evaluate(`${q("id-results")}.querySelectorAll('img').length`)) === 2, 30000, "second result");
   check("a second image with two sheets", true);
+  check("it was made with the slider moved", (await evaluate(text("id-msg"))).includes("saved"));
+  await evaluate(setValue("id-pull", "1"));
+  check("the slider can go back to the default", (await evaluate(text("id-pull-val"))) === "Default");
   await evaluate(`${q("id-results")}.querySelector('figcaption button').click()`);
   await sleep(500);
   check(

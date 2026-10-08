@@ -259,6 +259,16 @@ works for both character boxes, and for the
 optional character sheet when editing a picture. It is separate from *Paint the
 area to change*, which says where an edit happens.
 
+**How closely to follow the sheets.** The slider above the description goes from
+*More freedom* to *Exact look*. It starts at 1 (*Default*), where the pose and scene
+follow your words while the characters keep their look. Moving it up makes the picture
+stick closer to the sheets; around 4 and above it tends to copy the sheet's pose,
+layout and colour swatches instead of doing what you asked. Moving it down to 0.25 can
+give cleaner details such as hands, and is worth trying when a detail comes out messy;
+if the characters stop looking right, move it back up. It works in both modes. With
+two sheets it acts on the second one (and on the character sheet when editing a
+picture); the first keeps its usual pull.
+
 ### Editing a picture
 Set **I want to** to *Edit a picture* to change an image you already have instead
 of making a new one:

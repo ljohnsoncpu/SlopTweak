@@ -851,12 +851,14 @@ fn dev_seed(path: &std::path::Path) -> Option<u64> {
 /// Start one image. Returns at once; progress and the result arrive through
 /// `identity-changed` and `identity_state`.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn identity_generate(
     st: State<'_, AppState>,
     prompt: String,
     aspect: identity::Aspect,
     mode: Option<identity::Mode>,
     strength: Option<u32>,
+    pull: Option<f64>,
     mask: Option<identity::MaskInput>,
     focus: Option<Vec<identity::FocusInput>>,
 ) -> Result<(), String> {
@@ -871,6 +873,7 @@ async fn identity_generate(
     })?;
     let opts = identity::EditOpts {
         strength,
+        pull,
         mask,
         focus: focus.unwrap_or_default(),
     };

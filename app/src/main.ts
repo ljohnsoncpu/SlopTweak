@@ -1467,6 +1467,28 @@ function renderEditTools(editing: boolean, base: IdentityImage | null): void {
 }
 
 idStrength.oninput = () => renderIdentity();
+
+// How closely the picture follows the character sheets (the node's `ref_boost`).
+// 1 is the node's neutral. The pack recommends 4, but that copies the sheet's pose
+// (and its colour swatches); 1 and below follow the words and drew cleaner hands.
+const idPull = el<HTMLInputElement>("id-pull");
+const PULL_DEFAULT = 1;
+
+function renderPull(): void {
+  const v = Number(idPull.value);
+  el("id-pull-val").textContent = v === PULL_DEFAULT ? "Default" : Number.isInteger(v) ? v.toFixed(1) : v.toFixed(2);
+  el("id-pull-hint").textContent =
+    v >= 3
+      ? "Sticks closely to the sheets and can copy their pose, layout and colour swatches."
+      : v > PULL_DEFAULT
+        ? "Sticks closer to the sheets. The pose may follow the sheet more than your words."
+        : v === PULL_DEFAULT
+          ? "The pose and scene follow your words while the characters keep their look."
+          : "More freedom still. Often gives cleaner details such as hands; check the characters still look right.";
+}
+
+idPull.oninput = () => renderPull();
+renderPull();
 el("mask-clear").onclick = () => {
   painted = null;
   renderIdentity();
@@ -1783,6 +1805,7 @@ ui.idGo.onclick = () =>
       aspect: ui.idAspect.value,
       mode: ui.idMode.value,
       strength: identityEditing() ? Number(idStrength.value) : null,
+      pull: Number(idPull.value),
       mask:
         identityEditing() && painted
           ? {
