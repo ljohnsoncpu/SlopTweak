@@ -2252,3 +2252,59 @@ enlargement is part of the "focus" arm and is not tested separately.
   reference next to the whole sheet (keeps the outfit and body from the sheet, adds
   detail on the face). New mode has a free reference slot for it; Edit mode already uses
   both. Worth a pair run before building.
+
+## Kroma v0.3.1 OPD and ConvRot (2026-10-07, source only, not live)
+
+- `lodestones/Kroma` rev `c28f8ead…` (updated 2026-10-07) adds
+  `kroma-v0.3.1-turbo-opd.safetensors` (26,283,332,880 B, sha256 `3cfb5bc8…7d82`),
+  which the card marks as the recommended checkpoint. OPD = on-policy distillation:
+  Turbo speed that stays inside the base distribution; LoRAs trained the normal way
+  are said to carry over. Same Krea 2 encoder and VAE, same Turbo settings (8-12
+  steps, CFG 1-1.5). It is ~0.64 GB larger than v0.3 turbo (25.64 GB).
+- Catalog: added `kroma-identity-edit` (ComfyUI backend, same four-file layout as
+  `wulver-identity-edit` with the Kroma file in place of Wulver's). `ModelFiles::of`
+  is data-driven, so no Rust change beyond a catalog test. **Not run live.** The
+  r-series Kroma v0.3 results (see "Ostris LoRA transfer" above) say Kroma followed
+  "sitting" less well than Wulver and showed the wolf from behind with 2 refs; the
+  OPD build may differ, which only a live pair run can show.
+- **ConvRot** is a community INT8 quant of Kroma, not a lodestones release. Repos
+  seen: `cicalooo/kroma-v0.3.1-turbo-opd-int8-convrot-learned` (one file, 14.1 GB,
+  sha256 `2ecd795c…873e`), `Hiccup1234/Kroma-v0.3-INT8-ConvRot`,
+  `thedarkthrust/Krea2-Kroma-v0.3-Turbo-INT8-ConvRot`. The v0.2 card
+  (`ahmed22xa/Kroma-v0.2-INT8-ConvRot`) says it loads with ComfyUI's stock Load
+  Diffusion Model (0.27.0+; our image has 0.38.0), runs on RTX 30/40/50, and that
+  LoRAs lose 10-20% unless the `ComfyUI-INT8-Fast` node is used in Stochastic mode.
+  Unverified for v0.3.1 and for the Identity Edit LoRA plus `Krea2EditModelPatch`,
+  which is the risk. Would fit 24 GB cards (roughly half the price) if it works.
+
+### Kroma Identity Edit live (2026-10-07) ✅ R4, 11/11
+`TEST_MODEL=kroma-identity-edit LOCAL_CATALOG=1 node dev/vast-acceptance.mjs r4` (debug
+build, real Vast, price limit $0.70/hr, 60-min session cap). One instance, 54728710,
+a "CMP 170HX" that Vast lists with 64 GB, compute cap 8.0, 2.76 Gbps (machine 149879,
+Bulgaria) at $0.42/hr; Stop destroyed it and Vast showed none left.
+**Spend: credit $11.5377 → $11.3868 ≈ $0.15** (late charges may post).
+
+- **Ready in 627 s** (about 10.5 min) including the ~33 GB download; the file hashes
+  were accepted, so the `c28f8ead…` pin and sha256 are right. The app's computed
+  timeout for this model is ~27 min.
+- **Panel instead of Invoke** ✅. **1 sheet** (fox, square): 48 s with the model load.
+  **2 sheets** (fox + husky): 43 s. **After crash and Reconnect**: 23 s warm.
+- **Quality (one seed, one prompt per case, my own reading):** identity held in all
+  three. Fox: fur, red-tipped ears and tails, kimono and sash. Husky: face, green eyes,
+  suit and tie. With 2 references both characters appear, **facing the camera and
+  seated** at a cafe table, which is the case the Kroma v0.3 run got wrong (wolf from
+  behind). It still copies the sheet's palette swatches and pose into the picture
+  (also seen with Wulver), and the fox's kimono read navy in the 2-sheet image.
+- **Not shown:** this is not a head-to-head with Wulver on the same prompts and seeds
+  and a single seed cannot show a small difference, so v0.3.1 OPD is "works and looks
+  good", not "better than Wulver". The ConvRot (INT8) file was not tried by decision.
+- A stale `active_instance.json` (Oct 5, Wulver instance 54386712, already gone from
+  Vast) made the harness refuse to start; it was moved aside to
+  `.dev/kroma-edit/stale-active_instance.json`.
+
+- **`kroma-turbo` (Invoke) bumped to v0.3.1 OPD** on the same day, by the same file and
+  hash as the Identity Edit entry. **Not run live through Invoke**: only the ComfyUI path
+  above was. Invoke reads the variant from the file name, which still contains
+  "turbo". The file is 0.64 GB larger than v0.3 and the card says the tensor layout and
+  settings are unchanged, but whether Invoke loads it is unverified until a Kroma Turbo
+  run. The Identity Edit description no longer says "experimental".

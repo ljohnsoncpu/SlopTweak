@@ -791,11 +791,46 @@ mod tests {
         assert_eq!(wulver.backend, Backend::Invoke);
         assert_eq!(m.files[0].sha256, wulver.files[0].sha256);
         assert!(m.min_vram_gb >= 32.0);
-        // Every other bundled model stays on Invoke with no ComfyUI folders.
-        for o in models.iter().filter(|o| o.id != m.id) {
+        // Every other bundled model stays on Invoke with no ComfyUI folders,
+        // except the other Identity Edit entries.
+        let edit_ids = ["wulver-identity-edit", "kroma-identity-edit"];
+        for o in models.iter().filter(|o| !edit_ids.contains(&o.id.as_str())) {
             assert_eq!(o.backend, Backend::Invoke, "{}", o.id);
             assert!(o.files.iter().all(|f| f.dest.is_none()), "{}", o.id);
         }
+    }
+
+    #[test]
+    fn kroma_identity_edit_matches_the_wulver_layout() {
+        let models = bundled();
+        let k = models
+            .iter()
+            .find(|m| m.id == "kroma-identity-edit")
+            .unwrap();
+        let w = models
+            .iter()
+            .find(|m| m.id == "wulver-identity-edit")
+            .unwrap();
+        assert_eq!(k.backend, Backend::Comfyui);
+        assert!(!k.needs_civitai());
+        let layout = |m: &Model| {
+            m.files
+                .iter()
+                .map(|f| (f.kind.clone(), f.dest.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(layout(k), layout(w));
+        // Only the transformer differs: the encoder, VAE and LoRA are shared.
+        assert_ne!(k.files[0].sha256, w.files[0].sha256);
+        for i in 1..4 {
+            assert_eq!(k.files[i].sha256, w.files[i].sha256);
+        }
+        assert!(k.files[0]
+            .url
+            .contains("/c28f8eadb4938445051dee698db76d08d1d374a6/"));
+        assert!(k.min_vram_gb >= 32.0);
+        // The Identity Edit graph can be built from it.
+        assert!(crate::identity::ModelFiles::of(k).is_some());
     }
 
     #[test]
