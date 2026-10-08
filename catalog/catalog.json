@@ -241,22 +241,22 @@
     {
       "id": "kroma-turbo",
       "name": "Kroma Turbo",
-      "description": "Community fine-tune of Krea 2 (by lodestones) with its own look; prompts don't always carry over from Krea 2. SlopTweak sets 8 steps and CFG 1 when Invoke opens; up to 12 steps and CFG 1.5 also work. Largest download in the list (31 GB, so the GPU can take 15+ minutes to get ready) and needs a GPU with 32 GB or more, about $0.50-0.65/hr, so raise the price limit in Settings to about $0.70.",
+      "description": "Community fine-tune of Krea 2 (by lodestones) with its own look; prompts don't always carry over from Krea 2. SlopTweak sets 8 steps and CFG 1 when Invoke opens; up to 12 steps and CFG 1.5 also work. Largest download in the list (32 GB, so the GPU can take 15+ minutes to get ready) and needs a GPU with 32 GB or more, about $0.50-0.65/hr, so raise the price limit in Settings to about $0.70.",
       "good_for": "Krea 2 with a community-tuned style",
       "price_tier": 3,
       "base": "krea-2",
-      "base_variant": "kroma-v0.3-turbo",
+      "base_variant": "kroma-v0.3.1-turbo-opd",
       "source": {
         "huggingface_repo": "lodestones/Kroma",
-        "revision": "b921d45c0f2c33ab753a32e32a5fe34eb790344c",
+        "revision": "c28f8eadb4938445051dee698db76d08d1d374a6",
         "page": "https://huggingface.co/lodestones/Kroma"
       },
       "files": [
         {
-          "url": "https://huggingface.co/lodestones/Kroma/resolve/b921d45c0f2c33ab753a32e32a5fe34eb790344c/kroma-v0.3-turbo.safetensors",
-          "filename": "kroma-v0.3-turbo.safetensors",
-          "sha256": "1E58DBBF59BB2CDD8589256666DBC57F73102A06E97293A411E91493E2A675BD",
-          "size_bytes": 25640191096,
+          "url": "https://huggingface.co/lodestones/Kroma/resolve/c28f8eadb4938445051dee698db76d08d1d374a6/kroma-v0.3.1-turbo-opd.safetensors",
+          "filename": "kroma-v0.3.1-turbo-opd.safetensors",
+          "sha256": "3CFB5BC847C804EA8E8F894677F7E16EBE4C9FF0F978896CC5E7EB1E64FC7D82",
+          "size_bytes": 26283332880,
           "kind": "main",
           "requires_civitai_token": false
         },
@@ -441,6 +441,63 @@
       "min_ram_gb": 48,
       "nsfw": true,
       "license_note": "Krea 2 Community License plus Krea's Acceptable Use Policy (Wulver and the Identity Edit LoRA are both modified Krea 2 weights): free for personal use and for businesses under $1M/yr revenue. It asks you to take reasonable steps against generating prohibited or unlawful content."
+    },
+    {
+      "id": "kroma-identity-edit",
+      "name": "Kroma Identity Edit",
+      "description": "Edit and compose with your own characters, on Kroma instead of Wulver. Drop in one or two character sheets, describe the new scene, and Kroma (v0.3.1 OPD Turbo, lodestones' Krea 2 fine-tune) draws the same characters in it. Uses the Identity Edit LoRA by conrad_locke; runs in SlopTweak's own Identity Edit panel, not Invoke. A 33 GB download (the GPU can take 15+ minutes to get ready) and a GPU with 32 GB or more, about $0.50-0.65/hr, so raise the price limit in Settings to about $0.70.",
+      "good_for": "Your own characters in new scenes, Kroma style",
+      "price_tier": 3,
+      "backend": "comfyui",
+      "base": "krea-2",
+      "source": {
+        "huggingface_repo": "lodestones/Kroma",
+        "revision": "c28f8eadb4938445051dee698db76d08d1d374a6",
+        "page": "https://huggingface.co/lodestones/Kroma"
+      },
+      "files": [
+        {
+          "url": "https://huggingface.co/lodestones/Kroma/resolve/c28f8eadb4938445051dee698db76d08d1d374a6/kroma-v0.3.1-turbo-opd.safetensors",
+          "filename": "kroma-v0.3.1-turbo-opd.safetensors",
+          "sha256": "3CFB5BC847C804EA8E8F894677F7E16EBE4C9FF0F978896CC5E7EB1E64FC7D82",
+          "size_bytes": 26283332880,
+          "kind": "main",
+          "requires_civitai_token": false,
+          "dest": "diffusion_models"
+        },
+        {
+          "url": "https://huggingface.co/Comfy-Org/Krea-2/resolve/eb1eddd3983a54678545a9b2c178c5853b30f7be/text_encoders/qwen3vl_4b_fp8_scaled.safetensors",
+          "filename": "qwen3vl_4b_fp8_scaled.safetensors",
+          "sha256": "54BD5144DF0BBC25DD6CCADFCB826B521445A1B06AE5A42570BDD2974CA87094",
+          "size_bytes": 5242467968,
+          "kind": "text_encoder",
+          "requires_civitai_token": false,
+          "dest": "text_encoders"
+        },
+        {
+          "url": "https://huggingface.co/Comfy-Org/Krea-2/resolve/eb1eddd3983a54678545a9b2c178c5853b30f7be/vae/qwen_image_vae.safetensors",
+          "filename": "qwen_image_vae.safetensors",
+          "sha256": "A70580F0213E67967EE9C95F05BB400E8FB08307E017A924BF3441223E023D1F",
+          "size_bytes": 253806246,
+          "kind": "vae",
+          "requires_civitai_token": false,
+          "dest": "vae"
+        },
+        {
+          "url": "https://huggingface.co/conradlocke/krea2-identity-edit/resolve/89e9e7a09ee2e5c9331e952063d79b1b8a703280/krea2_identity_edit_v1_2.safetensors",
+          "filename": "krea2_identity_edit_v1_2.safetensors",
+          "sha256": "6ADF9A69CC9502D286DB7B69964D37DA7E9CFE4B05B4D004BC275F087D3FD3CF",
+          "size_bytes": 1828256432,
+          "kind": "lora",
+          "requires_civitai_token": false,
+          "dest": "loras"
+        }
+      ],
+      "min_vram_gb": 32,
+      "min_compute_cap": 800,
+      "min_ram_gb": 48,
+      "nsfw": true,
+      "license_note": "Krea 2 Community License plus Krea's Acceptable Use Policy (Kroma and the Identity Edit LoRA are both modified Krea 2 weights; the HF card lists the Krea 2 community license): free for personal use and for businesses under $1M/yr revenue. It asks you to take reasonable steps against generating prohibited or unlawful content."
     },
     {
       "id": "snofs-krea-2",
