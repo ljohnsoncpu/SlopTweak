@@ -43,6 +43,14 @@ const MAX_POLL_FAILURES: u32 = 8;
 pub const PROMPT_PREFIX: &str = "Generate a new image based on the reference. Preserve the subject identity and key visual characteristics while applying this prompt: ";
 /// The pack's recommended pull toward the reference (`ref_boost`).
 const REF_BOOST: f64 = 4.0;
+/// What the "how closely to follow the sheets" dial may set `ref_boost` to.
+/// 1.0 is the node's neutral; above it pulls harder toward the reference and
+/// below it loosens. The floor is 0.25: lower values were tried (down to 0) and
+/// the character started to drift, while 0.25 gave the cleanest hands.
+const REF_BOOST_MIN: f64 = 0.25;
+const REF_BOOST_MAX: f64 = 6.0;
+/// The pull a request gets when it doesn't ask for one (the window's default).
+const DEFAULT_PULL: f64 = 1.0;
 const STEPS: u32 = 10;
 
 /// What the panel is doing: a new image from character sheets, or an edit of
@@ -208,9 +216,25 @@ pub struct EditOpts {
     /// 50..=100: how much the picture may change. 100 re-draws it from the
     /// words alone (the default); lower stays closer to the original.
     pub strength: Option<u32>,
+    /// `ref_boost` for the character sheet (both modes): how hard the picture
+    /// is pulled toward the sheet's look. `None` means 1.0 (the pack itself
+    /// recommends 4.0, which copies the sheet's pose; see findings).
+    pub pull: Option<f64>,
     pub mask: Option<MaskInput>,
     #[serde(default)]
     pub focus: Vec<FocusInput>,
+}
+
+/// The `ref_boost` a request asks for, kept inside what the dial allows.
+fn ref_boost_for(opts: &EditOpts) -> f64 {
+    opts.pull
+        .filter(|p| p.is_finite())
+        .map_or(DEFAULT_PULL, |p| p.clamp(REF_BOOST_MIN, REF_BOOST_MAX))
+}
+
+/// Set the pull toward the reference on a built graph (the patch node is "12").
+fn set_ref_boost(graph: &mut Value, boost: f64) {
+    graph["12"]["inputs"]["ref_boost"] = json!(boost);
 }
 
 /// Context kept around a focus area: a quarter of its size, at least this many pixels.
@@ -676,6 +700,7 @@ struct Begun {
     cancel: Arc<AtomicBool>,
     plan: Option<EditPlan>,
     focus: Vec<Option<Rect>>,
+    ref_boost: f64,
 }
 
 #[derive(Default)]
@@ -956,6 +981,7 @@ impl IdentityService {
             cancel,
             plan,
             focus,
+            ref_boost: ref_boost_for(opts),
         })
     }
 
@@ -995,6 +1021,7 @@ impl IdentityService {
                 seed,
                 b.plan,
                 &b.focus,
+                b.ref_boost,
                 &b.cancel,
             )
             .await;
@@ -1028,6 +1055,7 @@ impl IdentityService {
         seed: u64,
         plan: Option<EditPlan>,
         focus: &[Option<Rect>],
+        ref_boost: f64,
         cancel: &AtomicBool,
     ) -> Result<Option<Kept>, String> {
         let unreachable = |e: SidecarError| match e {
@@ -1093,7 +1121,7 @@ impl IdentityService {
             }
         }
         let shrink: Vec<bool> = refs.iter().map(|r| needs_shrink(&r.bytes)).collect();
-        let graph = build_graph_with(
+        let mut graph = build_graph_with(
             &t.files,
             &names,
             prompt,
@@ -1103,6 +1131,7 @@ impl IdentityService {
             &shrink,
             focus,
         );
+        set_ref_boost(&mut graph, ref_boost);
         let queued = t
             .sidecar
             .comfy_post_json(
@@ -1603,13 +1632,45 @@ mod tests {
         let (canvas, plan) = make_plan(
             &EditOpts {
                 strength: Some(5),
-                mask: None,
-                focus: Vec::new(),
+                ..Default::default()
             },
             (704, 1024),
         )
         .unwrap();
         assert_eq!((canvas, plan.graph.denoise), ((704, 1024), 0.5));
+    }
+
+    #[test]
+    fn the_pull_toward_the_sheet_defaults_to_one_and_stays_in_range() {
+        let pull = |p| {
+            ref_boost_for(&EditOpts {
+                pull: p,
+                ..Default::default()
+            })
+        };
+        assert_eq!(pull(None), DEFAULT_PULL);
+        assert_eq!(pull(Some(2.5)), 2.5);
+        // 0.25 is reachable; anything lower is held at it.
+        assert_eq!(pull(Some(0.25)), 0.25);
+        assert_eq!(pull(Some(0.0)), REF_BOOST_MIN);
+        assert_eq!(pull(Some(-3.0)), REF_BOOST_MIN);
+        assert_eq!(pull(Some(1000.0)), REF_BOOST_MAX);
+        assert_eq!(pull(Some(f64::NAN)), DEFAULT_PULL);
+        assert_eq!(pull(Some(f64::INFINITY)), DEFAULT_PULL);
+    }
+
+    #[test]
+    fn the_pull_is_written_to_the_patch_node_only() {
+        let mut g = build_graph(&files(), &["a.png".into()], "x", (896, 1152), 1, None);
+        // Untouched, the graph keeps the tested value.
+        assert_eq!(g["12"]["inputs"]["ref_boost"], REF_BOOST);
+        let before = g.clone();
+        set_ref_boost(&mut g, 1.5);
+        assert_eq!(g["12"]["inputs"]["ref_boost"], 1.5);
+        // The scene reference's own dial and everything else are unchanged.
+        assert_eq!(g["12"]["inputs"]["ref_boost_a"], 1.0);
+        g["12"]["inputs"]["ref_boost"] = before["12"]["inputs"]["ref_boost"].clone();
+        assert_eq!(g, before);
     }
 
     #[test]

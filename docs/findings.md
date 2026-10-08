@@ -2308,3 +2308,94 @@ Bulgaria) at $0.42/hr; Stop destroyed it and Vast showed none left.
   "turbo". The file is 0.64 GB larger than v0.3 and the card says the tensor layout and
   settings are unchanged, but whether Invoke loads it is unverified until a Kroma Turbo
   run. The Identity Edit description no longer says "experimental".
+
+## "How closely to follow the sheets" slider (2026-10-07, built, not calibrated live)
+
+- **What it sets:** `ref_boost` on `Krea2EditModelPatch`, the node's own dial (README at
+  the pinned SHA: "multiplies target->reference attention; 1.0 = off, >1 pulls harder
+  toward the reference's appearance, <1 loosens; optimal value is model-specific";
+  range 0-1000). We have always run it at the pack's 4.0, so the UI's default (4,
+  labelled "Default") changes nothing until the slider is moved. UI range 1-6 in
+  steps of 0.5; the backend clamps to the same range.
+- **Which reference:** the node applies `ref_boost` to the **last** reference only
+  (the subject) and `ref_boost_a` (we keep 1.0) to the first. So with two sheets in
+  New mode the second sheet is pulled harder than the first, and in Edit mode the
+  dial acts on the character sheet, not on the picture being edited (that one is the
+  "How much to change" slider). This asymmetry is how the graph already behaved; the
+  new slider does not change it.
+- **Not known yet:** what range is actually useful, whether 1.0 loosens enough, whether
+  identity falls apart below some value, and whether Kroma and Wulver need different
+  ranges. The hint texts under the slider are therefore provisional. Needs a live
+  sweep (same sheets, prompt and seed at 1, 2 and 4, ideally with a prompt that asks
+  for a different pose than the sheet's).
+- Verified at $0: unit tests (default, clamp, only the patch node changes) and the
+  mock UI check (51/51), which makes an image with the slider moved.
+
+### Follow-the-sheets sweep, live (2026-10-07) ✅ the dial works
+`dev/vast-acceptance.mjs r6` (debug build, real Vast, Kroma v0.3.1 OPD Identity Edit,
+CMP 170HX "64 GB" at $0.42/hr, seed 424242 fixed). Instance 54887759, Ready in 633 s,
+destroyed by Stop. **Spend: credit $11.0811 → $10.8008 = $0.28**, about $0.10 of it
+idle while the harness waited (see the bug below). Images 21-48 s each.
+
+| Case | pull 4 (today's default) | pull 2 | pull 1 | pull 6 |
+| --- | --- | --- | --- | --- |
+| 1 sheet (fox), "leaps through the air on a beach, arms raised, side view" | stands in the sheet's pose, one raised arm, **sheet's colour swatches copied into the picture**; no leap | **leaps mid-air**, no swatches, identity intact | leaps, arms up, identity intact, slightly looser look | not run |
+| 2 sheets (fox + husky), "dance together on a rooftop, mid-motion, low angle" | both keep their sheet poses (fox hand on hip, husky arms crossed); a token raised arm | slightly more dance-like; husky still arms-crossed | **real dance hold**, husky's crossed arms gone, both recognisable | both locked in sheet poses, no dance; identity very precise |
+
+- ✅ **Confirms the complaint:** at the old fixed 4.0 the model repeats the sheet's pose
+  and even its swatches. Lower values give the prompt back its say without losing who
+  the characters are (one seed per cell, my own reading).
+- ✅ **Useful range is 1-2**, not the top of the slider. Values 4-6 only tighten.
+  Suggests moving the default to 2 and keeping 4 as "Exact look"; **not changed yet**
+  (the default is still 4 so nothing moves unasked).
+- 🧪 Not tested: below 1.0 (the node allows it), other seeds and prompts, Wulver, a
+  prompt where the sheet's pose is wanted, whether 1 weakens fine details such as the
+  fox's face markings over many seeds.
+- ⚠️ **Harness bug found and fixed:** the app keeps only the last 6 results
+  (`MAX_RESULTS`), so a run that makes a 7th image never saw "one more result" and sat
+  15 min waiting before it timed out and stopped normally. `idGenerate` now finds a new
+  image by id. Cost of the bug: about $0.10 of idle GPU time.
+- ⚠️ The `CATALOG_PORT` is now overridable (a stray `python -m http.server 18557`
+  already used the default).
+
+### Follow-the-sheets sweep below 1 (2026-10-08) ✅
+`r6` again (Kroma v0.3.1 OPD Identity Edit, same host class, seed 424242, same prompts
+and sheets), slider floor lowered to 0 in steps of 0.25. Instance 54892684, Ready in
+606 s, destroyed by Stop. **Spend: credit $10.7728 → $10.5777 = $0.20.**
+
+- ✅ **The seed is exactly reproducible:** the pull-1 image from this run is
+  byte-identical (same SHA-256) to the one from the earlier run on a different instance,
+  so differences between cells are the slider, not noise.
+- **One sheet (fox leap):** 0.75, 0.5 and 0.25 give essentially the same leap as 1, with
+  identity intact. **At 0 the character drifts:** the face turns more realistic (longer
+  snout, lighter muzzle), the chest goes white and the paw pads black; kimono, sash and
+  tails survive. So below ~1 buys no more pose freedom and only starts to cost identity
+  at the very bottom.
+- **Two sheets (fox + husky dance):** 1, 0.75, 0.5, 0.25 and 0 all give the same dance hold
+  with both characters recognisable; only small face shifts at 0 (milder than with one
+  sheet).
+- **So the useful range is about 1-2.** 2 already frees the pose and 1 frees it a bit
+  more; anything lower mainly risks drift. Suggests default 2 and a slider that doesn't
+  need to go much below 0.5 (still **not changed**: the default is 4).
+- ⚠️ **Slider rounding:** the `<input type=range>` snaps to its step (0.25), so the
+  run's "0.1" value was sent as 0. It therefore produced the same image as "0" (ComfyUI
+  answered the repeat from its cache in 4-7 s, and the files are byte-identical). Read
+  the "0.1" cells as 0.
+- 🧪 Not tested: other seeds and prompts, Wulver, whether the one-sheet drift at 0 shows
+  up with other characters, and prompts where the sheet's pose is wanted.
+
+### Decision after the sweeps: default 1, floor 0.25 (2026-10-08)
+- **Correction:** I first read the below-1 results as "nothing gained under ~1, useful
+  range 1-2". That was wrong about the hands. Zoomed in, the clasped hands of the
+  two-sheet dance (same seed) get steadily cleaner as the value drops: at 1 the fox's
+  hand is a clenched mass with unclear fingers, at 0.75 the fingers are tangled, at 0.5
+  the claws read but the clasp overlaps, and at **0.25 and 0 the fingers are distinct
+  and interlock properly**, glove fingers included. One seed, but the trend is clear.
+- **So the app now defaults to 1** (was the pack's 4.0, which copies the sheet's pose
+  and swatches) and the slider runs **0.25-6 in steps of 0.25**. 0.25 is the floor:
+  lower values (down to 0) were tried and the one-sheet fox's face drifted at 0, with
+  nothing gained over 0.25. The old top end is kept for anyone who wants the tight look.
+  The backend uses 1.0 when a request has no pull and clamps to the same range.
+- Not re-run live after this change (it only moves the default and the floor); the
+  `r6` defaults are now 1, 0.5 and 0.25. 🧪 Whether 0.25 draws cleaner hands on other
+  seeds, prompts and characters is untested.
