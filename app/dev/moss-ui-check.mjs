@@ -189,26 +189,60 @@ async function run() {
   check("Make image is off with no prompt", await evaluate(`${q("moss-go")}.disabled`));
   check("status says MOSS-Image is ready", (await evaluate(text("status-text"))).includes("MOSS-Image is ready"));
   check("steps start at 8", (await evaluate(text("moss-steps-val"))) === "8");
+  check("Fast mode allows 1 to 20 steps", (await evaluate(`${q("moss-steps")}.min`)) === "1" && (await evaluate(`${q("moss-steps")}.max`)) === "20");
+  check("CFG is hidden in Fast mode", !(await evaluate(visible("moss-cfg-row"))));
+  check("the sampler list starts at euler and has the others", (await evaluate(`${q("moss-sampler")}.value`)) === "euler" && (await evaluate(`${q("moss-sampler")}.options.length`)) >= 8);
+  check("the scheduler starts at simple", (await evaluate(`${q("moss-scheduler")}.value`)) === "simple");
+  check("the Fast size starts at 1536 x 1536", (await evaluate(`${q("moss-width")}.value + 'x' + ${q("moss-height")}.value`)) === "1536x1536");
   await shot("m1-ready");
 
-  await evaluate(setValue("moss-steps", "4"));
-  check("the steps slider shows its value", (await evaluate(text("moss-steps-val"))) === "4");
-  await evaluate(setValue("moss-steps", "8"));
+  // Steps, size, sampler, seed.
+  await evaluate(setValue("moss-steps", "20"));
+  check("the steps slider reaches 20", (await evaluate(text("moss-steps-val"))) === "20");
+  await evaluate(setValue("moss-steps", "13"));
+  check("and any number in between", (await evaluate(text("moss-steps-val"))) === "13");
+  await evaluate(click("moss-tall"));
+  check("Tall sets 1344 x 1728 in Fast", (await evaluate(`${q("moss-width")}.value + 'x' + ${q("moss-height")}.value`)) === "1344x1728");
+  await evaluate(setValue("moss-width", "1000"));
+  check("a typed size snaps to a multiple of 16", (await evaluate(`${q("moss-width")}.value`)) === "1008");
+  await evaluate(setValue("moss-width", "5000"));
+  check("and stays inside the range", (await evaluate(`${q("moss-width")}.value`)) === "2048");
+  await evaluate(click("moss-sq"));
+  await evaluate(setValue("moss-seed", "12x"));
+  check("a bad seed is refused", (await evaluate(`${q("moss-go")}.disabled`)) && (await evaluate(text("moss-msg"))).includes("seed"));
+  await evaluate(setValue("moss-seed", ""));
+
   await evaluate(setValue("moss-prompt", "A red fox in a snowy forest at dusk."));
   check("Make image turns on with a prompt", !(await evaluate(`${q("moss-go")}.disabled`)));
+  await evaluate(setValue("moss-steps", "8"));
+  await evaluate(setValue("moss-sampler", "dpmpp_2m"));
+  await evaluate(setValue("moss-seed", "12345"));
   await evaluate(click("moss-go"));
   await waitFor(async () => (await evaluate(`${q("moss-results")}.querySelectorAll('img').length`)) === 1, 30000, "first result");
   check("a result appears", true);
   check("the message says it was saved", (await evaluate(text("moss-msg"))).includes("saved"));
-  const graph = await evaluate("window.__TAURI_INTERNALS__.invoke('moss_state').then(() => 'ok')");
-  check("moss_state answers", graph === "ok");
+  const cap1 = await evaluate(`${q("moss-results")}.querySelector('figcaption').textContent`);
+  check("its caption says what made it", cap1.includes("1536×1536") && cap1.includes("Fast") && cap1.includes("8 steps") && cap1.includes("dpmpp_2m/simple") && cap1.includes("seed 12345"), cap1);
+  const sent = await evaluate("window.__TAURI_INTERNALS__.invoke('moss_state').then(() => 'ok')");
+  check("moss_state answers", sent === "ok");
 
-  await evaluate(setValue("moss-aspect", "portrait"));
-  await evaluate(setValue("moss-steps", "6"));
+  // Full quality: its own range and defaults, CFG shown.
+  await evaluate(setValue("moss-mode", "full"));
+  check("Full quality starts at 1024 x 1024", (await evaluate(`${q("moss-width")}.value + 'x' + ${q("moss-height")}.value`)) === "1024x1024");
+  check("Full quality allows up to 60 steps and starts at 40", (await evaluate(`${q("moss-steps")}.max`)) === "60" && (await evaluate(text("moss-steps-val"))) === "40");
+  check("CFG shows and starts at 3.0", (await evaluate(visible("moss-cfg-row"))) && (await evaluate(text("moss-cfg-val"))) === "3.0");
+  await evaluate(setValue("moss-steps", "30"));
+  await evaluate(setValue("moss-cfg", "4.5"));
+  await evaluate(click("moss-wide"));
+  await evaluate(setValue("moss-seed", ""));
   await evaluate(setValue("moss-prompt", "A woman in a yellow raincoat reading under a cafe awning."));
   await evaluate(click("moss-go"));
   await waitFor(async () => (await evaluate(`${q("moss-results")}.querySelectorAll('img').length`)) === 2, 30000, "second result");
-  check("a second image with other settings", true);
+  check("a Full quality image appears", true);
+  const cap2 = await evaluate(`${q("moss-results")}.querySelector('figcaption').textContent`);
+  check("its caption has the size, mode, CFG and steps", cap2.includes("1152×896") && cap2.includes("Full quality, CFG 4.5") && cap2.includes("30 steps"), cap2);
+  await evaluate(setValue("moss-mode", "fast"));
+  check("back in Fast the steps return to 8 and CFG hides", (await evaluate(text("moss-steps-val"))) === "8" && !(await evaluate(visible("moss-cfg-row"))));
   await shot("m2-two-results");
 
   await evaluate(`${q("moss-results")}.querySelector('img').click()`);

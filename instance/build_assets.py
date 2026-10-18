@@ -1,6 +1,7 @@
 """Build the instance asset bundle reproducibly and print its SHA-256.
 
-The bundle (provision.sh, sidecar.py, model_defaults.py, moss_time_delta.py, requirements.txt)
+The bundle (provision.sh, sidecar.py, model_defaults.py, moss_time_delta.py,
+moss_workflow.py, requirements.txt)
 is what onstart downloads and verifies. Same inputs always give the same bytes, so the
 pinned hash is stable.
 """
@@ -21,6 +22,7 @@ FILES = {
     "sidecar.py": 0o644,
     "model_defaults.py": 0o644,
     "moss_time_delta.py": 0o644,
+    "moss_workflow.py": 0o644,
     "requirements.txt": 0o644,
 }
 ONSTART_LIMIT = 4048

@@ -26,13 +26,13 @@ pub const ASSETS_URL: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "/instance-assets.tar.gz"
 );
-pub const ASSETS_SHA256: &str = "d2f31597067251692b745ffb856aa1ecea45eaf31389517afa58f0604dd86c6c";
+pub const ASSETS_SHA256: &str = "d081b3b15ac4dd22460a834e4ed7b9adf1f9201c687d1a0a3ad0239b864858d3";
 /// Debug builds of a version that has no release yet fetch the same bytes
-/// from the `instance-v0.1.8` dev pre-release; `SLOPTWEAK_DEV_ASSETS_URL` overrides it
+/// from the `instance-v0.1.9` dev pre-release; `SLOPTWEAK_DEV_ASSETS_URL` overrides it
 /// (the instance still checks [`ASSETS_SHA256`]).
 #[cfg(debug_assertions)]
 const DEV_ASSETS_URL: &str =
-    "https://github.com/ljohnsoncpu/SlopTweak/releases/download/instance-v0.1.8/instance-assets.tar.gz";
+    "https://github.com/ljohnsoncpu/SlopTweak/releases/download/instance-v0.1.9/instance-assets.tar.gz";
 
 /// Where instances fetch the bundle from.
 pub fn assets_url() -> String {

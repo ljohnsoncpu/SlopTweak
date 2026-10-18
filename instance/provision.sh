@@ -390,6 +390,9 @@ finish_comfy() {
   if ((moss)); then
     mkdir -p "$models/loras"
     ln -sfn "$MODELS_DIR/$MOSS_TIME_DELTA" "$models/loras/$MOSS_TIME_DELTA"
+    # Open ComfyUI starts empty otherwise: leave the MOSS workflows in its sidebar.
+    MODEL_LINES="$MODEL_LINES" "$SIDECAR_VENV/bin/python" "$ASSET_DIR/moss_workflow.py"       "$run_dir/user/default/workflows" "$MOSS_TIME_DELTA" "$MOSS_TIME_FILE"       >>"$LOG_DIR/moss-workflow.log" 2>&1 ||
+      log "WARNING: could not write the MOSS workflows (see moss-workflow.log)"
   else
     setup_identity_nodes
   fi

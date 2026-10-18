@@ -11,7 +11,7 @@
 //       debug build's file-dialog stand-in) and writes to OUT/out.
 //
 //   R7  MOSS-Image 8-step (TEST_MODEL=moss-image-dmd): Start -> images in the
-//       MOSS panel's engine (cold, warm, 4 steps, portrait) -> Stop. Saves to OUT.
+//       MOSS panel (Fast: cold, 4 and 20 steps, hands, 1536 px; Full quality: 40 steps, hands) -> Stop. Saves to OUT.
 //
 //   R6  Identity Edit, "how closely to follow the sheets" sweep (TEST_MODEL=
 //       kroma-identity-edit or wulver-identity-edit): one fixed seed, prompts that
@@ -596,7 +596,7 @@ async function r6() {
   crash();
 }
 
-// ----- R7: MOSS-Image 8-step ---------------------------------------------------------
+// ----- R7: MOSS-Image ---------------------------------------------------------
 
 /** Start TEST_MODEL=moss-image-dmd, make images through the moss_generate command (no
  * panel yet): a cold one, a warm one, a 4-step one. Saves them to OUT, then Stop. */
@@ -610,24 +610,34 @@ async function r7() {
   check("R7: the GPU is a ComfyUI GPU", b === "comfyui");
   const inst = (await vast("GET", `/instances/${id}/`)).body?.instances ?? {};
   say(`R7 host: machine ${inst.machine_id}, ${inst.geolocation}, ${inst.gpu_name}, ${inst.gpu_ram} MB, inet_down ${inst.inet_down}`);
+  // [tag, prompt, size, steps, mode, sampler, cfg, seed]. Fixed seeds so the modes compare.
+  const fox = "A red fox sitting in a snowy forest at dusk, soft light, detailed fur";
+  const hands = "A pianist's hands on the keys of a grand piano, close up, warm stage light, photo";
   const shots = [
-    ["R7-cold-8", "A red fox sitting in a snowy forest at dusk, soft light, detailed fur", "square", 8, 1234],
-    ["R7-warm-8", "A red fox sitting in a snowy forest at dusk, soft light, detailed fur", "square", 8, 1234],
-    ["R7-warm-4", "A red fox sitting in a snowy forest at dusk, soft light, detailed fur", "square", 4, 1234],
-    ["R7-portrait-8", "A woman in a yellow raincoat reading a book under a cafe awning, rain, film photo", "portrait", 8, 99],
+    ["R7-cold-8", fox, [1024, 1024], 8, "fast", "euler", 1, 1234],
+    ["R7-warm-4", fox, [1024, 1024], 4, "fast", "euler", 1, 1234],
+    ["R7-fast-20", fox, [1024, 1024], 20, "fast", "euler", 1, 1234],
+    ["R7-fast-hands", hands, [1024, 1024], 8, "fast", "euler", 1, 77],
+    ["R7-full-fox", fox, [1024, 1024], 40, "full", "euler", 3, 1234],
+    ["R7-full-hands", hands, [1024, 1024], 40, "full", "euler", 3, 77],
+    ["R7-large-1536", fox, [1536, 1536], 8, "fast", "euler", 1, 1234],
   ];
   check("R7: the MOSS panel is shown, Identity Edit is not", await m.eval("!document.getElementById('moss').hidden && document.getElementById('identity').hidden"));
   const mossState = () => m.eval("window.__TAURI_INTERNALS__.invoke('moss_state')");
-  for (const [tag, prompt, aspect, steps, seed] of shots) {
+  for (const [tag, prompt, size, steps, mode, sampler, cfg, seed] of shots) {
     const seen = new Set((await mossState()).results.map((r) => r.id));
     const t0 = Date.now();
-    // Through the panel itself: prompt, shape and steps, then the Make image button.
-    // (The seed isn't settable from the panel, so pictures differ between runs.)
+    // Through the panel itself: every control, then the Make image button.
     await m.eval(`(() => {
       const set = (id, v) => { const e = document.getElementById(id); e.value = v; e.dispatchEvent(new Event('input')); e.dispatchEvent(new Event('change')); };
+      set('moss-mode', ${JSON.stringify(mode)});
       set('moss-prompt', ${JSON.stringify(prompt)});
-      set('moss-aspect', ${JSON.stringify(aspect)});
+      set('moss-width', ${JSON.stringify(String(size[0]))});
+      set('moss-height', ${JSON.stringify(String(size[1]))});
       set('moss-steps', ${JSON.stringify(String(steps))});
+      set('moss-sampler', ${JSON.stringify(sampler)});
+      set('moss-cfg', ${JSON.stringify(String(cfg))});
+      set('moss-seed', ${JSON.stringify(String(seed))});
     })()`);
     await sleep(300);
     const clicked = await m.eval("(() => { const b = document.getElementById('moss-go'); if (b.disabled) return 'disabled'; b.click(); return 'ok'; })()");

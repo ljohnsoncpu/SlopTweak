@@ -556,3 +556,7 @@ button.link.primary-link {
 .mask-tools button.on {
   outline: 2px solid #3b6fd4;
 }
+
+#moss-more {
+  margin: 8px 0 12px;
+}

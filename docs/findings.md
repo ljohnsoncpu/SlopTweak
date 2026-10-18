@@ -2538,3 +2538,39 @@ little higher). Bundle `instance-v0.1.7` (3d61aee0…bc1e).
   before another live run.
   Published as `instance-v0.1.8` (hash verified after download); `DEV_ASSETS_URL`
   now points at it.
+
+### MOSS-Image quality A/B (2026-10-18)
+
+User report: Fast pictures look fuzzy, fingers garbled, "undercooked"; Open ComfyUI
+showed nothing. `vast-acceptance.mjs r7` (new matrix) on instance 56578182, RTX 3090
+24 GB, Spain, $0.427-0.432/hr, bundle `instance-v0.1.9` (d081b3b1…58d3). 17/17
+checks, spend ~$0.295 (credit $8.5041 → $8.2095). Pictures in `.dev/acceptance-moss3/`.
+
+- Ready in 337 s (a new instance on the same machine as the first run).
+- **Fast, 1024², seed 1234:** 8 steps 30 s cold; 4 steps 7 s; 20 steps 21 s. 20 steps
+  is a little *softer* than 8, not sharper. Same bytes as the earlier run at the same
+  seed and steps: the controls are deterministic.
+- **Fast on a hard subject (pianist's hands, 1024², seed 77, 8 steps):** smeared,
+  blurry hands and keyboard. This reproduces the complaint.
+- **Full quality (base model, 40 steps, CFG 3, layer 22 skipped in the negative),
+  same seeds:** the fox is much better (fur, falling snow, depth); the hands are
+  coherent photographic hands and arm (keyboard geometry still a bit odd). 67-68 s
+  each on the 3090.
+- **Fast at 1536² (seed 1234, 8 steps): 28 s and far sharper than Fast at 1024²**
+  (detailed fur, crisp branches). Odd stripes in the snow and tangled background
+  geometry, but nothing like the 1024² softness. Suggests the distillation wants
+  larger pictures (the base card's own examples use 1456²). One sample; not
+  proven.
+- Not tested: the new Open ComfyUI workflows (written by `moss_workflow.py`; the
+  tests check link consistency only, nothing here opened them in ComfyUI), bf16 text
+  encoder (the ostris example uses `qwen3.5_9b_bf16`; we use the INT8 ConvRot one),
+  an fp32 unet.
+- The ostris edit pack (`ostris/ComfyUI-MOSS-Image-Ostris-Edit`, MIT): edit LoRAs
+  with up to 3 reference images, kv-cache option; example workflow
+  `workflow/MOSS_Image_Ostris_Edit.json` (30 steps, CFG 3, euler/simple,
+  SkipLayerGuidanceDiTSimple `22`). Later feature.
+
+- Decision (user, 2026-10-18): Fast mode defaults to **1536×1536** (presets 1344×1728 and
+  1728×1344, about the same pixel count); Full quality stays at 1024². Switching mode resets
+  size, steps and CFG. The Fast workflow written for Open ComfyUI still defaults its latent
+  to 1024; change it with the next `instance/` change.
