@@ -10,6 +10,9 @@
 //       Reconnect -> another image -> Stop. Needs SHEETS=a.png;b.png (the
 //       debug build's file-dialog stand-in) and writes to OUT/out.
 //
+//   R7  MOSS-Image 8-step (TEST_MODEL=moss-image-dmd): Start -> images in the
+//       MOSS panel's engine (cold, warm, 4 steps, portrait) -> Stop. Saves to OUT.
+//
 //   R6  Identity Edit, "how closely to follow the sheets" sweep (TEST_MODEL=
 //       kroma-identity-edit or wulver-identity-edit): one fixed seed, prompts that
 //       ask for a different pose than the sheets, the slider at several values.
@@ -593,6 +596,58 @@ async function r6() {
   crash();
 }
 
+// ----- R7: MOSS-Image 8-step ---------------------------------------------------------
+
+/** Start TEST_MODEL=moss-image-dmd, make images through the moss_generate command (no
+ * panel yet): a cold one, a warm one, a 4-step one. Saves them to OUT, then Stop. */
+async function r7() {
+  say("=== R7: MOSS-Image 8-step ===");
+  launch("r7");
+  const m = await mainWindow();
+  const s = await startAndWaitReady(m, "R7");
+  const id = s.instance_id;
+  const b = await m.eval("window.__TAURI_INTERNALS__.invoke('get_snapshot').then(x => x.active_backend)");
+  check("R7: the GPU is a ComfyUI GPU", b === "comfyui");
+  const inst = (await vast("GET", `/instances/${id}/`)).body?.instances ?? {};
+  say(`R7 host: machine ${inst.machine_id}, ${inst.geolocation}, ${inst.gpu_name}, ${inst.gpu_ram} MB, inet_down ${inst.inet_down}`);
+  const shots = [
+    ["R7-cold-8", "A red fox sitting in a snowy forest at dusk, soft light, detailed fur", "square", 8, 1234],
+    ["R7-warm-8", "A red fox sitting in a snowy forest at dusk, soft light, detailed fur", "square", 8, 1234],
+    ["R7-warm-4", "A red fox sitting in a snowy forest at dusk, soft light, detailed fur", "square", 4, 1234],
+    ["R7-portrait-8", "A woman in a yellow raincoat reading a book under a cafe awning, rain, film photo", "portrait", 8, 99],
+  ];
+  check("R7: the MOSS panel is shown, Identity Edit is not", await m.eval("!document.getElementById('moss').hidden && document.getElementById('identity').hidden"));
+  const mossState = () => m.eval("window.__TAURI_INTERNALS__.invoke('moss_state')");
+  for (const [tag, prompt, aspect, steps, seed] of shots) {
+    const seen = new Set((await mossState()).results.map((r) => r.id));
+    const t0 = Date.now();
+    await m.eval(`window.__TAURI_INTERNALS__.invoke('moss_generate', ${JSON.stringify({ prompt, aspect, steps, seed })})`);
+    const made = await waitFor(async () => {
+      const v = await mossState();
+      if (v.phase === "failed") throw new Error(v.message);
+      return v.results.some((r) => !seen.has(r.id)) ? v : false;
+    }, 10 * 60000, `${tag} image`).catch((e) => {
+      say(`${tag}: ${e}`);
+      return null;
+    });
+    const secs = Math.round((Date.now() - t0) / 1000);
+    if (made) {
+      const url = made.results.find((r) => !seen.has(r.id)).data_url;
+      const bytes = Buffer.from(url.slice(url.indexOf(",") + 1), "base64");
+      writeFileSync(join(OUT, `${tag}.png`), bytes);
+      say(`${tag}: saved ${tag}.png (${bytes.length} bytes)`);
+      await m.shot(`${tag}-panel`);
+    }
+    check(`${tag}: image made`, !!made, `${secs}s`);
+    if (!made) break;
+  }
+  await m.eval("document.getElementById('stop').click()");
+  await follow(m, (x) => x.kind === "idle", 5 * 60000, "R7 idle");
+  check("R7: Stop destroys the instance", await instanceGone(id), `instance ${id}`);
+  m.ws.close();
+  crash();
+}
+
 // ----- main -----------------------------------------------------------------
 
 const before = new Set((await ourInstances()).map((i) => i.id));
@@ -636,7 +691,7 @@ writeFileSync(
       max_dph: MAX_DPH,
       ready_timeout_minutes: READY_TIMEOUT,
       // R4 saves to a scratch folder, not the user's Pictures.
-      ...(runs.includes("r4") || runs.includes("r5") || runs.includes("r6") ? { output_dir: join(OUT, "out") } : {}),
+      ...(runs.includes("r4") || runs.includes("r5") || runs.includes("r6") || runs.includes("r7") ? { output_dir: join(OUT, "out") } : {}),
     },
     null,
     2,
@@ -677,7 +732,7 @@ const tracker = setInterval(async () => {
 try {
   for (const r of runs) {
     try {
-      await { r1, r2, r3, r4, r5, r6 }[r]();
+      await { r1, r2, r3, r4, r5, r6, r7 }[r]();
     } catch (e) {
       check(`${r} completed`, false, String(e));
       if (app) crash();

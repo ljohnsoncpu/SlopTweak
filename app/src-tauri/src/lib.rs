@@ -9,6 +9,7 @@ mod cost;
 mod diagnostics;
 mod identity;
 mod library;
+mod moss;
 mod persist;
 mod provider;
 mod redact;
@@ -101,6 +102,7 @@ type Backends = (Arc<dyn GpuProvider>, Arc<dyn sidecar::SidecarApi>);
 
 struct AppState {
     identity: Arc<identity::IdentityService>,
+    moss: Arc<moss::MossService>,
     mode: Mode,
     secrets: Arc<dyn SecretStore>,
     data_dir: PathBuf,
@@ -558,6 +560,7 @@ async fn start_session(st: State<'_, AppState>, model_id: String) -> Result<(), 
         return Err(UPDATING.into());
     }
     st.identity.reset_run();
+    st.moss.reset_run();
     m.start(model, settings, civitai)
 }
 
@@ -833,6 +836,85 @@ fn identity_target(st: &AppState) -> Result<identity::Target, String> {
         secret,
         files,
     })
+}
+
+/// Where the running MOSS-Image GPU is, and which files to load on it.
+fn moss_target(st: &AppState) -> Result<moss::Target, String> {
+    let (sidecar, base, secret, model_id) = st.manager()?.comfy_endpoint()?;
+    let model = st
+        .catalog
+        .lock()
+        .unwrap()
+        .find(&model_id)
+        .cloned()
+        .ok_or("This GPU's model isn't in the model list any more.")?;
+    let files = moss::ModelFiles::of(&model).ok_or("That model isn't MOSS-Image.")?;
+    Ok(moss::Target {
+        sidecar,
+        base,
+        secret,
+        files,
+    })
+}
+
+#[tauri::command]
+async fn moss_state(st: State<'_, AppState>) -> Result<moss::MossView, String> {
+    Ok(st.moss.view())
+}
+
+/// Start one MOSS-Image picture. Returns at once; progress and the result
+/// arrive through `moss-changed` and `moss_state`.
+#[tauri::command]
+async fn moss_generate(
+    st: State<'_, AppState>,
+    prompt: String,
+    aspect: identity::Aspect,
+    steps: Option<u32>,
+    seed: Option<u64>,
+) -> Result<(), String> {
+    let target = moss_target(&st)?;
+    let begun = st.moss.begin(&prompt, aspect, steps)?;
+    // Debug builds only: a fixed seed lets the live checks compare runs.
+    #[cfg(debug_assertions)]
+    let seed = seed.map(|s| s & ((1 << 52) - 1));
+    #[cfg(not(debug_assertions))]
+    let seed = {
+        let _ = seed;
+        None::<u64>
+    };
+    let seed = seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64 & ((1 << 52) - 1))
+            .unwrap_or(1)
+    });
+    let svc = st.moss.clone();
+    tauri::async_runtime::spawn(async move {
+        svc.finish(&target, begun, seed).await;
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn moss_cancel(st: State<'_, AppState>) -> Result<(), String> {
+    let target = moss_target(&st)?;
+    st.moss.cancel(&target).await;
+    Ok(())
+}
+
+/// Copy a finished MOSS-Image picture into the Downloads folder.
+#[tauri::command]
+async fn moss_save_result(
+    app: AppHandle,
+    st: State<'_, AppState>,
+    id: String,
+) -> Result<String, String> {
+    let dir = app
+        .path()
+        .download_dir()
+        .map_err(|_| "Couldn't find your Downloads folder.".to_string())?;
+    let path = st.moss.save_result(&id, &dir)?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// The seed in a dev seed file: one number, read on every image so the
@@ -1560,6 +1642,12 @@ pub fn run() {
                         let _ = h.emit_to("main", "identity-changed", ());
                     })
                 })),
+                moss: Arc::new(moss::MossService::new({
+                    let h = handle.clone();
+                    Arc::new(move || {
+                        let _ = h.emit_to("main", "moss-changed", ());
+                    })
+                })),
             });
             eprintln!("[sloptweak] provider mode: {mode:?}");
             // Created here rather than from config so dev builds can attach a
@@ -1647,6 +1735,10 @@ pub fn run() {
             identity_use_result,
             identity_generate,
             identity_cancel,
+            moss_state,
+            moss_generate,
+            moss_cancel,
+            moss_save_result,
             get_snapshot,
             refresh_catalog,
             estimate,

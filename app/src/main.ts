@@ -238,6 +238,15 @@ const ui = {
   idCancel: el<HTMLButtonElement>("id-cancel"),
   idMsg: el("id-msg"),
   idResults: el("id-results"),
+  moss: el("moss"),
+  mossPrompt: el<HTMLTextAreaElement>("moss-prompt"),
+  mossAspect: el<HTMLSelectElement>("moss-aspect"),
+  mossSteps: el<HTMLInputElement>("moss-steps"),
+  mossStepsVal: el("moss-steps-val"),
+  mossGo: el<HTMLButtonElement>("moss-go"),
+  mossCancel: el<HTMLButtonElement>("moss-cancel"),
+  mossMsg: el("moss-msg"),
+  mossResults: el("moss-results"),
   stop: el<HTMLButtonElement>("stop"),
   dismiss: el<HTMLButtonElement>("dismiss"),
   catalogInfo: el("catalog-info"),
@@ -420,7 +429,7 @@ function render(): void {
   ui.start.hidden = active();
   ui.start.disabled = !keysOk || refused || !currentModel() || installing;
   ui.stop.hidden = !active() || s.kind === "stopping";
-  const identityGpu = isIdentity();
+  const identityGpu = isComfyGpu();
   ui.open.hidden = s.kind !== "ready" || identityGpu;
   ui.openComfy.hidden = s.kind !== "ready" || !identityGpu;
   ui.tutorial.hidden = s.kind !== "ready" || identityGpu;
@@ -454,9 +463,11 @@ function render(): void {
     case "ready": {
       const update = () => {
         if (s.kind !== "ready") return;
-        ui.statusText.textContent = identityGpu
-          ? "Identity Edit is ready."
-          : "Invoke is running in its own window.";
+        ui.statusText.textContent = isMoss()
+          ? "MOSS-Image is ready."
+          : identityGpu
+            ? "Identity Edit is ready."
+            : "Invoke is running in its own window.";
         ui.statusSub.textContent = `${describeOffer(s.offer)} · ready for ${elapsed(s.ready_unix)}`;
       };
       update();
@@ -475,6 +486,7 @@ function render(): void {
   renderSync();
   renderCostBar();
   renderIdentity();
+  renderMoss();
 }
 
 function images(n: number): string {
@@ -1283,7 +1295,20 @@ const identityEditing = () => ui.idMode.value === "edit";
 /** An error from the last click (a bad request), shown until the next state change. */
 let identityError = "";
 
-const isIdentity = () => state.kind === "ready" && snapshot?.active_backend === "comfyui";
+interface MossView {
+  results: IdentityImage[];
+  phase: IdentityView["phase"];
+  message: string;
+}
+
+let moss: MossView = { results: [], phase: "idle", message: "" };
+/** An error from the last click (a bad request), shown until the next state change. */
+let mossError = "";
+
+const isComfyGpu = () => state.kind === "ready" && snapshot?.active_backend === "comfyui";
+/** The MOSS-Image panel is for that model; every other ComfyUI GPU is Identity Edit. */
+const isMoss = () => isComfyGpu() && currentModel()?.base === "moss-image";
+const isIdentity = () => isComfyGpu() && !isMoss();
 const identityBusy = () => identity.phase === "uploading" || identity.phase === "running";
 
 async function refreshIdentity(): Promise<void> {
@@ -1730,7 +1755,9 @@ lightbox.onclick = (e) => {
 };
 lightboxSave.onclick = async () => {
   try {
-    const path = await invoke<string>("identity_save_result", { id: lightboxResult });
+    const path = await invoke<string>(isMoss() ? "moss_save_result" : "identity_save_result", {
+      id: lightboxResult,
+    });
     lightboxMsg.textContent = `Saved to ${path}`;
   } catch (e) {
     lightboxMsg.textContent = String(e);
@@ -1826,8 +1853,66 @@ ui.idGo.onclick = () =>
 ui.idCancel.onclick = () => void identityAct(invoke("identity_cancel"));
 await listen("identity-changed", () => void refreshIdentity());
 
+// ----- MOSS-Image panel -----
+const mossBusy = () => moss.phase === "running";
+
+async function refreshMoss(): Promise<void> {
+  try {
+    moss = await invoke<MossView>("moss_state");
+    mossError = "";
+  } catch (e) {
+    console.error(e);
+  }
+  renderMoss();
+}
+
+function renderMoss(): void {
+  ui.moss.hidden = !isMoss();
+  const busy = mossBusy();
+  ui.mossStepsVal.textContent = ui.mossSteps.value;
+  ui.mossGo.disabled = busy || ui.mossPrompt.value.trim() === "";
+  ui.mossGo.hidden = busy;
+  ui.mossCancel.hidden = !busy;
+  ui.mossMsg.textContent = mossError || moss.message;
+  ui.mossMsg.className = moss.phase === "failed" || mossError ? "notice" : "muted";
+  ui.mossResults.replaceChildren(
+    ...moss.results.map((r) =>
+      h("figure", {}, zoomable(h("img", { src: r.data_url, alt: "Result", title: "Click to enlarge" }), r.id)),
+    ),
+  );
+}
+
+async function mossAct(p: Promise<unknown>): Promise<void> {
+  let failure = "";
+  try {
+    await p;
+  } catch (e) {
+    failure = String(e);
+  }
+  // The refresh clears the last error, so show this one after it.
+  await refreshMoss();
+  if (failure) {
+    mossError = failure;
+    renderMoss();
+  }
+}
+
+ui.mossPrompt.oninput = () => renderMoss();
+ui.mossSteps.oninput = () => renderMoss();
+ui.mossGo.onclick = () =>
+  void mossAct(
+    invoke("moss_generate", {
+      prompt: ui.mossPrompt.value,
+      aspect: ui.mossAspect.value,
+      steps: Number(ui.mossSteps.value),
+    }),
+  );
+ui.mossCancel.onclick = () => void mossAct(invoke("moss_cancel"));
+await listen("moss-changed", () => void refreshMoss());
+
 await load();
 void refreshIdentity();
+void refreshMoss();
 if (needsSetup()) {
   startWizard();
 } else {

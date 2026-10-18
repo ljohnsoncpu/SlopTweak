@@ -32,11 +32,11 @@ const SHRUNK_MEGAPIXELS: f64 = 1.0;
 /// Finished images kept in the panel (they are also saved to the output folder).
 pub const MAX_RESULTS: usize = 6;
 const MAX_PROMPT_CHARS: usize = 2000;
-const POLL: Duration = Duration::from_secs(1);
+pub(crate) const POLL: Duration = Duration::from_secs(1);
 /// A generation takes ~30-60 s; far longer means something is wrong.
-const RUN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+pub(crate) const RUN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// Consecutive "can't reach the GPU" answers tolerated while waiting.
-const MAX_POLL_FAILURES: u32 = 8;
+pub(crate) const MAX_POLL_FAILURES: u32 = 8;
 
 /// What the identity LoRA's training prompt wraps around the user's words
 /// (the pack's own default; findings, "Krea 2 edit spike").
@@ -666,15 +666,68 @@ pub struct IdentityView {
     pub message: String,
 }
 
+/// Write `bytes` into `dir` under a plain name taken from `name` that doesn't
+/// overwrite anything; returns the path written.
+pub(crate) fn write_image(
+    name: &str,
+    bytes: &[u8],
+    dir: &std::path::Path,
+) -> Result<PathBuf, String> {
+    let ext = if bytes.starts_with(b"\x89PNG") {
+        "png"
+    } else if bytes.starts_with(b"RIFF") {
+        "webp"
+    } else {
+        "jpg"
+    };
+    // The name came from the GPU: keep only plain characters.
+    let stem: String = std::path::Path::new(name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' '))
+        .take(60)
+        .collect();
+    let stem = if stem.trim().is_empty() {
+        "SlopTweak".to_string()
+    } else {
+        stem
+    };
+    std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't open the folder: {e}"))?;
+    for n in 0..1000 {
+        let file = if n == 0 {
+            format!("{stem}.{ext}")
+        } else {
+            format!("{stem} ({n}).{ext}")
+        };
+        let path = dir.join(file);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                std::io::Write::write_all(&mut f, bytes)
+                    .map_err(|e| format!("Couldn't save the image: {e}"))?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("Couldn't save the image: {e}")),
+        }
+    }
+    Err("Couldn't find a free file name in that folder.".into())
+}
+
 #[derive(Debug)]
-struct Kept {
-    id: String,
-    name: String,
-    bytes: Vec<u8>,
+pub(crate) struct Kept {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) bytes: Vec<u8>,
 }
 
 impl Kept {
-    fn view(&self) -> ImageView {
+    pub(crate) fn view(&self) -> ImageView {
         let mime = if self.bytes.starts_with(b"\x89PNG") {
             "image/png"
         } else if self.bytes.starts_with(b"RIFF") {
@@ -827,50 +880,7 @@ impl IdentityService {
                 .ok_or("That image is no longer in the panel.")?;
             (r.name.clone(), r.bytes.clone())
         };
-        let ext = if bytes.starts_with(b"\x89PNG") {
-            "png"
-        } else if bytes.starts_with(b"RIFF") {
-            "webp"
-        } else {
-            "jpg"
-        };
-        // The name came from the GPU: keep only plain characters.
-        let stem: String = std::path::Path::new(&name)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default()
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' '))
-            .take(60)
-            .collect();
-        let stem = if stem.trim().is_empty() {
-            "SlopTweak".to_string()
-        } else {
-            stem
-        };
-        std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't open the folder: {e}"))?;
-        for n in 0..1000 {
-            let file = if n == 0 {
-                format!("{stem}.{ext}")
-            } else {
-                format!("{stem} ({n}).{ext}")
-            };
-            let path = dir.join(file);
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut f) => {
-                    std::io::Write::write_all(&mut f, &bytes)
-                        .map_err(|e| format!("Couldn't save the image: {e}"))?;
-                    return Ok(path);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(format!("Couldn't save the image: {e}")),
-            }
-        }
-        Err("Couldn't find a free file name in that folder.".into())
+        write_image(&name, &bytes, dir)
     }
 
     fn set_phase(&self, phase: Phase, message: impl Into<String>) {
@@ -1242,7 +1252,7 @@ impl IdentityService {
 }
 
 /// A short, plain version of ComfyUI's error for the user.
-fn error_text(entry: &Value) -> String {
+pub(crate) fn error_text(entry: &Value) -> String {
     let msg = entry["status"]["messages"]
         .as_array()
         .into_iter()

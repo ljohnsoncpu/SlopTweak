@@ -40,6 +40,10 @@ fn main() {
             "identity_use_result",
             "identity_generate",
             "identity_cancel",
+            "moss_state",
+            "moss_generate",
+            "moss_cancel",
+            "moss_save_result",
         ]),
     ))
     .expect("tauri build");

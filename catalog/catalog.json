@@ -500,6 +500,72 @@
       "license_note": "Krea 2 Community License plus Krea's Acceptable Use Policy (Kroma and the Identity Edit LoRA are both modified Krea 2 weights; the HF card lists the Krea 2 community license): free for personal use and for businesses under $1M/yr revenue. It asks you to take reasonable steps against generating prohibited or unlawful content."
     },
     {
+      "id": "moss-image-dmd",
+      "name": "MOSS-Image 8-step",
+      "description": "MOSS-Image (OpenMOSS, 5B) distilled by lodestones to draw in 8 steps with no CFG. Plain-text prompts. Early work in progress: the distillation is still being trained, so expect rough edges. Runs in SlopTweak's own MOSS panel, not Invoke. A 21 GB download (the GPU can take 20 minutes to get ready) and a GPU with 24 GB, about $0.20-0.35/hr.",
+      "good_for": "Fast text-to-image from a new model family",
+      "price_tier": 2,
+      "backend": "comfyui",
+      "base": "moss-image",
+      "source": {
+        "huggingface_repo": "lodestones/MOSS-Image-Base-8-steps-dmd",
+        "revision": "3929810bf71a6f15b84408c154c86abb1eec5ae6",
+        "page": "https://huggingface.co/lodestones/MOSS-Image-Base-8-steps-dmd"
+      },
+      "files": [
+        {
+          "url": "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/f28da8f93449c16cfa7efa07dcd1303a1c0c44d1/diffusion_models/moss_image_base_bf16.safetensors",
+          "filename": "moss_image_base_bf16.safetensors",
+          "sha256": "CACD158728A1FB9E57C408A922B54752EC71FCEB566B3821269927964E62B41F",
+          "size_bytes": 10164655808,
+          "kind": "main",
+          "requires_civitai_token": false,
+          "dest": "diffusion_models"
+        },
+        {
+          "url": "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/f28da8f93449c16cfa7efa07dcd1303a1c0c44d1/text_encoders/qwen3.5_9b_int8_convrot.safetensors",
+          "filename": "qwen3.5_9b_int8_convrot.safetensors",
+          "sha256": "32E3787472F708FA5F83624ACBF5EF23F7FC89C439E05065EA57CFE5A97F025A",
+          "size_bytes": 9748121532,
+          "kind": "text_encoder",
+          "requires_civitai_token": false,
+          "dest": "text_encoders"
+        },
+        {
+          "url": "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/f28da8f93449c16cfa7efa07dcd1303a1c0c44d1/vae/flux2-vae.safetensors",
+          "filename": "flux2-vae.safetensors",
+          "sha256": "868FE7B343CC8F3A19DBCFCAFBC3D5F888802BE3F89BD81B65B3621A066CE8F3",
+          "size_bytes": 336211292,
+          "kind": "vae",
+          "requires_civitai_token": false,
+          "dest": "vae"
+        },
+        {
+          "url": "https://huggingface.co/lodestones/MOSS-Image-Base-8-steps-dmd/resolve/3929810bf71a6f15b84408c154c86abb1eec5ae6/lora.safetensors",
+          "filename": "moss-image-8-step-dmd-lora.safetensors",
+          "sha256": "C65190F1A94A65B49A0BAB3BFA6A333B2F1810BC000A4350B01A77A02BFDEF37",
+          "size_bytes": 1189176800,
+          "kind": "lora",
+          "requires_civitai_token": false,
+          "dest": "loras"
+        },
+        {
+          "url": "https://huggingface.co/lodestones/MOSS-Image-Base-8-steps-dmd/resolve/3929810bf71a6f15b84408c154c86abb1eec5ae6/time_embedding.safetensors",
+          "filename": "moss-image-8-step-dmd-time-embedding.safetensors",
+          "sha256": "CAFCB885C0456BFDCA921B8C89612FA6CDD2BD8C7EAC18F13A3F8797EA108D77",
+          "size_bytes": 41017896,
+          "kind": "time_embedding",
+          "requires_civitai_token": false,
+          "dest": "loras"
+        }
+      ],
+      "min_vram_gb": 24,
+      "min_compute_cap": 800,
+      "min_ram_gb": 32,
+      "nsfw": false,
+      "license_note": "Apache-2.0 (MOSS-Image-Base by OpenMOSS-Team, and lodestones' distillation). Free for personal and commercial use."
+    },
+    {
       "id": "snofs-krea-2",
       "name": "SNOFS Krea 2",
       "description": "Krea 2 Raw with the SNOFS adult-content LoKR (by Ashen3, v1.4) merged in, so it doesn't depend on Invoke's LoKR support. Photoreal nudes and explicit scenes. This is the undistilled model: SlopTweak sets 52 steps and CFG 3.5 when Invoke opens. For about 8 steps, switch on the 8-step Turbo Distill LoRA in the LoRA panel at weight 1 and set 8 steps, CFG 1. A 27 GB download (the GPU can take 15+ minutes to get ready) and a GPU with 32 GB or more, about $0.50-0.65/hr, so raise the price limit in Settings to about $0.70. Needs a CivitAI key.",

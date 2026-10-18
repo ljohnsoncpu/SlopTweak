@@ -1,7 +1,8 @@
 """Build the instance asset bundle reproducibly and print its SHA-256.
 
-The bundle (provision.sh, sidecar.py, model_defaults.py, requirements.txt) is what onstart downloads
-and verifies. Same inputs always give the same bytes, so the pinned hash is stable.
+The bundle (provision.sh, sidecar.py, model_defaults.py, moss_time_delta.py, requirements.txt)
+is what onstart downloads and verifies. Same inputs always give the same bytes, so the
+pinned hash is stable.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ FILES = {
     "provision.sh": 0o755,
     "sidecar.py": 0o644,
     "model_defaults.py": 0o644,
+    "moss_time_delta.py": 0o644,
     "requirements.txt": 0o644,
 }
 ONSTART_LIMIT = 4048

@@ -155,6 +155,38 @@
           <div id="id-results" class="results"></div>
         </section>
 
+        <section id="moss" class="card" hidden>
+          <h2>MOSS-Image</h2>
+          <p class="muted small">
+            Describe the picture you want. This is an early 8-step version of the model, so
+            expect rough edges, and small text in pictures often comes out garbled.
+          </p>
+          <label for="moss-prompt">What should it draw?</label>
+          <textarea id="moss-prompt" rows="3" maxlength="4000" spellcheck="true"
+            placeholder="A red fox sitting in a snowy forest at dusk, soft light."></textarea>
+          <div class="row">
+            <label for="moss-aspect">Shape</label>
+            <select id="moss-aspect">
+              <option value="square">Square</option>
+              <option value="portrait">Tall</option>
+              <option value="landscape">Wide</option>
+            </select>
+          </div>
+          <div class="row">
+            <label for="moss-steps">Steps</label>
+            <span class="muted small">Faster</span>
+            <input id="moss-steps" type="range" min="4" max="8" step="1" value="8" />
+            <span class="muted small">Best</span>
+            <strong id="moss-steps-val"></strong>
+          </div>
+          <div class="actions">
+            <button id="moss-go" class="primary" type="button">Make image</button>
+            <button id="moss-cancel" class="danger" type="button" hidden>Cancel</button>
+          </div>
+          <p id="moss-msg" class="muted"></p>
+          <div id="moss-results" class="results"></div>
+        </section>
+
         <details class="card">
           <summary>Details</summary>
           <p id="catalog-info" class="muted small"></p>

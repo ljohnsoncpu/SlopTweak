@@ -404,7 +404,8 @@ button.link.primary-link {
   object-fit: contain;
 }
 
-#id-prompt {
+#id-prompt,
+#moss-prompt {
   width: 100%;
   margin: 6px 0 10px;
   padding: 8px 10px;

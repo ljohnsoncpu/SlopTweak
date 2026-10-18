@@ -792,12 +792,54 @@ mod tests {
         assert_eq!(m.files[0].sha256, wulver.files[0].sha256);
         assert!(m.min_vram_gb >= 32.0);
         // Every other bundled model stays on Invoke with no ComfyUI folders,
-        // except the other Identity Edit entries.
-        let edit_ids = ["wulver-identity-edit", "kroma-identity-edit"];
+        // except the other ComfyUI entries.
+        let edit_ids = [
+            "wulver-identity-edit",
+            "kroma-identity-edit",
+            "moss-image-dmd",
+        ];
         for o in models.iter().filter(|o| !edit_ids.contains(&o.id.as_str())) {
             assert_eq!(o.backend, Backend::Invoke, "{}", o.id);
             assert!(o.files.iter().all(|f| f.dest.is_none()), "{}", o.id);
         }
+    }
+
+    #[test]
+    fn bundled_moss_image_is_a_complete_comfyui_entry() {
+        let models = bundled();
+        let m = models.iter().find(|m| m.id == "moss-image-dmd").unwrap();
+        assert_eq!(m.backend, Backend::Comfyui);
+        assert_eq!(m.base, "moss-image");
+        assert!(!m.needs_civitai());
+        assert!(m.invoke_min_version.is_none() && m.default_settings.is_none());
+        let placed: Vec<(&str, &str)> = m
+            .files
+            .iter()
+            .map(|f| (f.kind.as_str(), f.dest.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            placed,
+            [
+                ("main", "diffusion_models"),
+                ("text_encoder", "text_encoders"),
+                ("vae", "vae"),
+                ("lora", "loras"),
+                ("time_embedding", "loras"),
+            ]
+        );
+        // Every file is pinned to a commit, never a branch.
+        for f in &m.files {
+            let rev = f
+                .url
+                .split("/resolve/")
+                .nth(1)
+                .unwrap()
+                .split('/')
+                .next()
+                .unwrap();
+            assert_eq!(rev.len(), 40, "{}", f.filename);
+        }
+        assert!(crate::moss::ModelFiles::of(m).is_some());
     }
 
     #[test]

@@ -42,6 +42,10 @@
     "allow-identity-save-result",
     "allow-identity-use-result",
     "allow-identity-generate",
-    "allow-identity-cancel"
+    "allow-identity-cancel",
+    "allow-moss-state",
+    "allow-moss-generate",
+    "allow-moss-cancel",
+    "allow-moss-save-result"
   ]
 }
