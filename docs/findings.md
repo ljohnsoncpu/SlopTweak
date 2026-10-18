@@ -2399,3 +2399,142 @@ and sheets), slider floor lowered to 0 in steps of 0.25. Instance 54892684, Read
 - Not re-run live after this change (it only moves the default and the floor); the
   `r6` defaults are now 1, 0.5 and 0.25. 🧪 Whether 0.25 draws cleaner hands on other
   seeds, prompts and characters is untested.
+
+## Catalog research: MOSS-Image 8-step DMD (2026-10-17, source only, not live)
+
+Request: add `lodestones/MOSS-Image-Base-8-steps-dmd`.
+
+- **What it is:** a work-in-progress data-space DMD distillation of
+  `OpenMOSS-Team/MOSS-Image-Base` (5B, Apache-2.0). 4–8 steps, CFG 1, shift 5,
+  flow-matching Euler. Shipped as a rank-128 kohya-style `lora.safetensors`
+  plus `time_embedding.safetensors` (fp32 time-embedder replacement), applied
+  to the stock base transformer at strength 1. `generator.safetensors` and the
+  data-space sampler need fp32 and custom code, so they're not the plan.
+- **Base model:** the text encoder, tokenizer and VAE (FLUX.2 small decoder,
+  fp32) come from the base repo. Diffusers use needs
+  `custom_pipeline="pipeline_moss_image"` with `trust_remote_code=True`.
+  ComfyUI has a native "MOSS-Image" plugin (via ComfyUI-Manager; official
+  integration still in progress).
+- **Invoke 6.14.1 cannot load it.** `BaseModelType` in the v6.14.1 tag has no
+  MOSS entry (sd-1/2/3, sdxl, flux, flux2, cogview4, z-image, ernie-image,
+  ideogram-4, qwen-image, anima, krea-2, wan). Same outcome as Chroma.
+- **Decision (user, 2026-10-17):** no catalog entry yet. Revisit if a later
+  Invoke adds MOSS, or if we add a ComfyUI text-to-image panel (the plugin
+  would need pinning by commit, and ComfyUI-Manager is moved aside at
+  provision time, so it would be installed from source).
+- Not checked: file sizes or SHA-256s (the card lists none), and whether the
+  LoRA is applied to a bf16 base or an fp32 one for the quality shown.
+
+### MOSS-Image step 0 verification (2026-10-17, free, no rental)
+
+- **ComfyUI core has MOSS-Image natively.** PR 17095 merged 2026-10-16
+  (merge commit `e087d8f6cb7c6cdb11b59dc7c9bf17c79f8d877d`: model, text encoder,
+  model detection, LoRA key map, `MOSSImageLayoutPrompt` node); PR 17099 merged
+  2026-10-17 (`a639f187a9f6abfecbda9673034f2045148b6d85`, fused INT8 path). The
+  latest release is v0.41.0 (2026-10-15), which **predates both**, and the
+  newest `vastai/comfy` image is v0.41.0 too. The pinned image is v0.38.0. So
+  MOSS needs ComfyUI pinned to a master SHA, or a future tagged release.
+- **Comfy-Org/MOSS-Image** (rev `f28da8f93449c16cfa7efa07dcd1303a1c0c44d1`,
+  ungated): `diffusion_models/moss_image_base_bf16.safetensors` 10,164,655,808 B
+  (sha256 `cacd1587…2b41f`), `…_base_int8_convrot` 5.41 GB,
+  `text_encoders/qwen3.5_9b_int8_convrot.safetensors` 9,748,121,532 B,
+  `…w4a8_gptq` 7.34 GB, `vae/flux2-vae.safetensors` 336,211,292 B. Full hashes
+  are in the HF API (LFS oid); copy them when writing the catalog entry.
+- **DMD repo** (rev `3929810bf71a6f15b84408c154c86abb1eec5ae6`, ungated):
+  `lora.safetensors` 1,189,176,800 B (sha256 `c65190f1…ef37`),
+  `time_embedding.safetensors` 41,017,896 B (sha256 `cafcb885…8d77`).
+- **LoRA keys match ComfyUI.** The LoRA has 756 tensors, all
+  `diffusion_model.layers.N.proj.{q,k,v,o,ffn_up_gate,ffn_down}.{lora_down,lora_up,alpha}`.
+  The Comfy base has fused `layers.N.proj.qkv.weight`; PR 17095 adds the
+  q/k/v slice mapping in `comfy/lora.py`, so the stock LoRA loader should
+  accept it (42 layers).
+- ⚠️ **`time_embedding.safetensors` is NOT a LoRA.** It holds full replacement
+  weights for `time_embedding.{0,2}.{weight,bias}` plus
+  `shared_block_modulation.bias` and `video_head_modulation.bias`, and the card
+  says the embedder "only works together with" those biases. The stock LoRA
+  loader can't apply them. The card's "LoRA alone is enough" line therefore
+  conflicts with its own adapter notes. All those keys exist in the Comfy
+  model, so the fix is a small LoRA-format file of `.diff` / `.diff_b` deltas
+  (new minus base), computed once from a ranged read of the base tensors
+  (~20 MB). Unproven.
+- ⚠️ **Precision risk.** The card says the distillation delta is below bf16's
+  rounding step. If ComfyUI merges the LoRA into the bf16 weights, most of it
+  may be rounded away. Needs a live A/B (merged vs patched-on-the-fly).
+- `MOSSImageLayoutPrompt` is only for layout/bbox prompts; v1 doesn't need it.
+
+### MOSS-Image provisioning (2026-10-17, written, not run on an instance)
+
+- `provision.sh` (BACKEND=comfyui) now branches on whether the model list holds
+  the MOSS time-embedding file. **MOSS:** clone ComfyUI at the pinned commit
+  `a639f187a9f6abfecbda9673034f2045148b6d85` into `/opt/sloptweak/ComfyUI-moss`,
+  run it with an **overlay venv** (`/opt/sloptweak/comfy-moss-venv`, a `.pth`
+  to `/venv/main`'s site-packages) with ComfyUI's `requirements.txt` installed
+  on top (needs comfy-kitchen 0.2.38). The image's ComfyUI and `/venv/main` are
+  untouched. Readiness probe: `MOSSImageLayoutPrompt`. **Identity Edit:**
+  unchanged (custom nodes, workflow, probe `Krea2EditModelPatch`).
+- **Time-embedding patch:** `instance/moss_time_delta.py` writes
+  `moss-image-8-step-dmd-time-delta.safetensors` (6 tensors:
+  `diffusion_model.time_embedding.{0,2}.set_weight`, and `.diff_b` for those
+  two biases plus `shared_block_modulation` and `video_head_modulation`).
+  Verified in ComfyUI's `comfy/lora.py` at the pinned commit that `.set_weight`
+  and `.diff_b` are read by the stock loader. The graph loads it as a second
+  `LoraLoaderModelOnly` after the distillation LoRA.
+- ⚠️ **Unverified on a real instance:** that the overlay venv resolves torch via
+  the `.pth`; that the clone, pip install and delta build fit the ready
+  timeout; the image's python has `safetensors`/`torch` (it must, ComfyUI needs
+  them); that the 8-step output is good (the bf16-merge risk above).
+- ⚠️ ComfyUI's `requirements.txt` is unhashed (`torch`, `transformers>=…`), so
+  the MOSS path is not fully pinned the way the sidecar is. Only
+  `comfy-kitchen`, the frontend and a few others are exact.
+- Instance bundle now 3d61aee0…bc1e (adds `moss_time_delta.py`). `ASSETS_SHA256`
+  in `config.rs` is updated; **not published**: release builds and the
+  `instance-v0.1.6` dev default will fail the hash check until a new
+  pre-release is published and `DEV_ASSETS_URL` points at it.
+
+### MOSS-Image 8-step live (2026-10-17) ✅ works
+
+`TEST_MODEL=moss-image-dmd LOCAL_CATALOG=1 node dev/vast-acceptance.mjs r7`
+(new R7 run; images go through the new `moss_generate` command, no panel yet).
+Instance 56486553, RTX 3090 24 GB, Spain, 6.9 Gbps, $0.4269-0.4315/hr
+(the app's $0.40 cap applies to the compute price; the instance total ran a
+little higher). Bundle `instance-v0.1.7` (3d61aee0…bc1e).
+
+- **Provisioning works first time on the real `vastai/comfy:v0.38.0` image:**
+  Ready in **531 s** (about 9 min for 21.5 GB). The pinned ComfyUI clone,
+  overlay venv with ComfyUI's requirements, the time-embedding patch build and
+  the `MOSSImageLayoutPrompt` probe all passed. The `.pth` overlay found torch.
+- **Generation:** 1024² fox, 8 steps, CFG 1: **27 s cold** (includes the model
+  load), **3 s warm**. 4 steps: 6 s. 896×1152 portrait, 8 steps: 9 s. The same
+  seed twice gave byte-identical PNGs.
+- **Quality:** clean and coherent at 4 and 8 steps (fur, lighting, a believable
+  café scene). Small text on signs is garbled. The bf16-merge worry did not show
+  as noise or washed-out images. Not done: an A/B against the base model at
+  50 steps or against an unpatched run, so how much of the distillation survives
+  is still unmeasured.
+- 6/6 checks passed. Stop destroyed the instance; none left. Spend ~$0.275 (credit $9.1913 → $8.9161; late charges may post).
+
+### MOSS-Image panel live (2026-10-17) ✅ works
+
+`TEST_MODEL=moss-image-dmd LOCAL_CATALOG=1 MAX_DPH=0.45 node dev/vast-acceptance.mjs r7`
+(R7 now drives the real panel: prompt, Shape, Steps, Make image). Instance
+56493188, A40 48 GB, Belgium, 6.3 Gbps, $0.417-0.419/hr, same bundle
+`instance-v0.1.7`.
+
+- Ready in **520 s**. The MOSS panel showed, Identity Edit's stayed hidden.
+- 1024² at 8 steps: **29 s cold**, **8 s warm**; 4 steps 7 s; 896×1152 portrait
+  at 8 steps 10 s. All four clean (fox, café scene; signage text garbled).
+  Seeds are random from the panel, so pictures differ from the first run.
+- Stop destroyed the instance; none left. Spend **~$0.126** (credit $8.8925 →
+  $8.7663; late charges may post). Two rentals in all for MOSS: ~$0.40.
+- Not covered: Cancel mid-run, Save from the big view, the A/B against the
+  base model's 50 steps.
+
+- CI follow-up (2026-10-18): shellcheck flagged SC2100 on the unquoted MOSS file
+  names in `provision.sh` (names like `moss-image-8-step-…` read as arithmetic).
+  Quoting them changes the bundle, now **d2f31597…6c6c**; `ASSETS_SHA256` is
+  updated. The published `instance-v0.1.7` holds the earlier bundle (3d61aee0…,
+  the one both live runs used), so it no longer matches the pin: a new dev
+  pre-release (v0.1.8) must be published and `DEV_ASSETS_URL` pointed at it
+  before another live run.
+  Published as `instance-v0.1.8` (hash verified after download); `DEV_ASSETS_URL`
+  now points at it.

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-moss-save-result"
+description = "Enables the moss_save_result command without any pre-configured scope."
+commands.allow = ["moss_save_result"]
+
+[[permission]]
+identifier = "deny-moss-save-result"
+description = "Denies the moss_save_result command without any pre-configured scope."
+commands.deny = ["moss_save_result"]

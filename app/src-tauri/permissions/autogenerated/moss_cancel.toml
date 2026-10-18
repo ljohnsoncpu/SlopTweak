@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-moss-cancel"
+description = "Enables the moss_cancel command without any pre-configured scope."
+commands.allow = ["moss_cancel"]
+
+[[permission]]
+identifier = "deny-moss-cancel"
+description = "Denies the moss_cancel command without any pre-configured scope."
+commands.deny = ["moss_cancel"]

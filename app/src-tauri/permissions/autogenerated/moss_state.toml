@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-moss-state"
+description = "Enables the moss_state command without any pre-configured scope."
+commands.allow = ["moss_state"]
+
+[[permission]]
+identifier = "deny-moss-state"
+description = "Denies the moss_state command without any pre-configured scope."
+commands.deny = ["moss_state"]

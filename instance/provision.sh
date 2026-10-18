@@ -27,6 +27,18 @@ COMFY_PYTHON=/venv/main/bin/python
 # Identity Edit's ComfyUI nodes, pinned by commit (reviewed in the 2026-10-02 spike).
 KREA2EDIT_REPO=https://github.com/lbouaraba/comfyui-krea2edit.git
 KREA2EDIT_SHA=86f886dac23013d88996e3a2e99093ba44d322fb
+# MOSS-Image runs on ComfyUI's native support (PRs 17095 + 17099), which is newer than
+# any release or vastai/comfy image. Only a MOSS model gets this copy, pinned by commit
+# and run with the image's python plus an overlay venv; the image's own ComfyUI and
+# /venv/main stay untouched.
+COMFY_MOSS_REPO=https://github.com/comfyanonymous/ComfyUI.git
+COMFY_MOSS_SHA=a639f187a9f6abfecbda9673034f2045148b6d85
+COMFY_MOSS_DIR=/opt/sloptweak/ComfyUI-moss
+COMFY_MOSS_VENV=/opt/sloptweak/comfy-moss-venv
+# Catalog file names of the MOSS-Image entry (must match catalog.json and moss.rs).
+MOSS_BASE_FILE="moss_image_base_bf16.safetensors"
+MOSS_TIME_FILE="moss-image-8-step-dmd-time-embedding.safetensors"
+MOSS_TIME_DELTA="moss-image-8-step-dmd-time-delta.safetensors"
 CLOUDFLARED_VERSION=2026.9.3
 CLOUDFLARED_SHA256=77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2
 CLOUDFLARED_METRICS=127.0.0.1:20241
@@ -262,34 +274,60 @@ finish_invoke() {
     log "WARNING: some recommended settings were not applied (see model-defaults.log)"
 }
 
-# ---- ComfyUI (Identity Edit) --------------------------------------------------
+# ---- ComfyUI (Identity Edit, MOSS-Image) -------------------------------------
 # Models stay in $MODELS_DIR (so a re-run skips finished downloads) and are
 # symlinked into ComfyUI's model folders.
-finish_comfy() {
-  local models="$COMFY_DIR/models" name dest
-  status registering "placing models"
-  while IFS=$'\t' read -r _ _ _ name _ dest; do
-    case "$dest" in
-      diffusion_models | text_encoders | vae | loras) ;;
-      *) fail "bad model folder for $name" ;;
-    esac
-    mkdir -p "$models/$dest"
-    ln -sfn "$MODELS_DIR/$name" "$models/$dest/$name"
-  done <<<"$MODEL_LINES"
 
-  status registering "installing the Identity Edit nodes"
+# MOSS-Image: a pinned ComfyUI checkout, run by an overlay venv that sees /venv/main's
+# packages (torch and friends) but installs ComfyUI's newer requirements on top.
+setup_moss_comfy() {
+  status registering "installing ComfyUI for MOSS-Image"
+  if [[ ! -d "$COMFY_MOSS_DIR/.git" ]]; then
+    git clone -q --filter=blob:none "$COMFY_MOSS_REPO" "$COMFY_MOSS_DIR"
+  fi
+  git -C "$COMFY_MOSS_DIR" checkout -q "$COMFY_MOSS_SHA"
+  [[ "$(git -C "$COMFY_MOSS_DIR" rev-parse HEAD)" == "$COMFY_MOSS_SHA" ]] ||
+    fail "ComfyUI is not at the pinned commit"
+  if [[ ! -x "$COMFY_MOSS_VENV/bin/python" ]]; then
+    if command -v uv >/dev/null 2>&1; then
+      uv venv -q --python "$COMFY_PYTHON" "$COMFY_MOSS_VENV"
+    else
+      "$COMFY_PYTHON" -m venv "$COMFY_MOSS_VENV"
+    fi
+    local main_site moss_site
+    main_site="$("$COMFY_PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+    moss_site="$("$COMFY_MOSS_VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+    # A .pth path is searched after the venv's own packages, so upgrades win.
+    printf '%s\n' "$main_site" >"$moss_site/sloptweak-main-venv.pth"
+  fi
+  if command -v uv >/dev/null 2>&1; then
+    uv pip install -q --python "$COMFY_MOSS_VENV/bin/python" -r "$COMFY_MOSS_DIR/requirements.txt"
+  else
+    "$COMFY_MOSS_VENV/bin/python" -m pip install -q -r "$COMFY_MOSS_DIR/requirements.txt"
+  fi
+}
+
+# The distillation's time-embedding file is not a LoRA: turn it into a patch file
+# the stock LoRA loader accepts (see moss_time_delta.py), next to the other models.
+build_moss_delta() {
+  status registering "preparing the MOSS-Image patch"
+  [[ -f "$MODELS_DIR/$MOSS_BASE_FILE" && -f "$MODELS_DIR/$MOSS_TIME_FILE" ]] ||
+    fail "MOSS-Image files are missing"
+  "$COMFY_MOSS_VENV/bin/python" "$ASSET_DIR/moss_time_delta.py" \
+    "$MODELS_DIR/$MOSS_BASE_FILE" "$MODELS_DIR/$MOSS_TIME_FILE" "$MODELS_DIR/$MOSS_TIME_DELTA" \
+    >>"$LOG_DIR/moss-delta.log" 2>&1 || fail "could not build the MOSS-Image patch"
+}
+
+# Identity Edit: its custom nodes (pinned) and the preloaded workflow.
+setup_identity_nodes() {
   local nodes="$COMFY_DIR/custom_nodes"
+  status registering "installing the Identity Edit nodes"
   if [[ ! -d "$nodes/comfyui-krea2edit" ]]; then
     git clone -q "$KREA2EDIT_REPO" "$nodes/comfyui-krea2edit"
   fi
   git -C "$nodes/comfyui-krea2edit" checkout -q "$KREA2EDIT_SHA"
   [[ "$(git -C "$nodes/comfyui-krea2edit" rev-parse HEAD)" == "$KREA2EDIT_SHA" ]] ||
     fail "Identity Edit nodes are not at the pinned commit"
-  # ComfyUI-Manager can install code at runtime; keep it out of the instance.
-  if [[ -d "$nodes/ComfyUI-Manager" ]]; then
-    mkdir -p /opt/sloptweak/disabled-nodes
-    mv "$nodes/ComfyUI-Manager" /opt/sloptweak/disabled-nodes/
-  fi
   # Raw-UI users start from the working Identity Edit graph (Workflows sidebar).
   mkdir -p "$COMFY_DIR/user/default/workflows"
   # The pack's file names differ from ours, so point its loaders at the files
@@ -324,17 +362,55 @@ PY
   [[ -s "$COMFY_DIR/user/default/workflows/SlopTweak Identity Edit.json" ]] ||
     cp "$nodes/comfyui-krea2edit/workflows/krea2_identity_edit.json" \
       "$COMFY_DIR/user/default/workflows/SlopTweak Identity Edit.json"
+}
+
+finish_comfy() {
+  local moss=0 run_dir="$COMFY_DIR" run_python="$COMFY_PYTHON" probe=Krea2EditModelPatch
+  if grep -qF "$MOSS_TIME_FILE" <<<"$MODEL_LINES"; then
+    moss=1
+    run_dir="$COMFY_MOSS_DIR"
+    run_python="$COMFY_MOSS_VENV/bin/python"
+    probe=MOSSImageLayoutPrompt
+    setup_moss_comfy
+    build_moss_delta
+  fi
+
+  local models="$run_dir/models" name dest
+  status registering "placing models"
+  while IFS=$'\t' read -r _ _ _ name _ dest; do
+    case "$dest" in
+      diffusion_models | text_encoders | vae | loras) ;;
+      *) fail "bad model folder for $name" ;;
+    esac
+    # The raw time-embedding file is only the delta's source, not a LoRA.
+    [[ "$name" == "$MOSS_TIME_FILE" ]] && continue
+    mkdir -p "$models/$dest"
+    ln -sfn "$MODELS_DIR/$name" "$models/$dest/$name"
+  done <<<"$MODEL_LINES"
+  if ((moss)); then
+    mkdir -p "$models/loras"
+    ln -sfn "$MODELS_DIR/$MOSS_TIME_DELTA" "$models/loras/$MOSS_TIME_DELTA"
+  else
+    setup_identity_nodes
+  fi
+
+  # ComfyUI-Manager can install code at runtime; keep it out of the instance.
+  local nodes="$run_dir/custom_nodes"
+  if [[ -d "$nodes/ComfyUI-Manager" ]]; then
+    mkdir -p /opt/sloptweak/disabled-nodes
+    mv "$nodes/ComfyUI-Manager" /opt/sloptweak/disabled-nodes/
+  fi
 
   status starting "starting ComfyUI"
-  (cd "$COMFY_DIR" && nohup setsid "$COMFY_PYTHON" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention \
+  (cd "$run_dir" && nohup setsid "$run_python" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention \
     >"$LOG_DIR/comfyui.log" 2>&1 </dev/null &)
   local out=""
   for _ in $(seq 1 180); do
-    out="$(curl -fsS "$COMFY_URL/object_info/Krea2EditModelPatch" 2>/dev/null || true)"
-    [[ "$out" == *Krea2EditModelPatch* ]] && break
+    out="$(curl -fsS "$COMFY_URL/object_info/$probe" 2>/dev/null || true)"
+    [[ "$out" == *"$probe"* ]] && break
     sleep 2
   done
-  [[ "$out" == *Krea2EditModelPatch* ]] || fail "ComfyUI did not start with the Identity Edit nodes"
+  [[ "$out" == *"$probe"* ]] || fail "ComfyUI did not start with the expected nodes"
 }
 
 if [[ "$BACKEND" == comfyui ]]; then
