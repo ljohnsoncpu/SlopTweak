@@ -865,32 +865,16 @@ async fn moss_state(st: State<'_, AppState>) -> Result<moss::MossView, String> {
 /// Start one MOSS-Image picture. Returns at once; progress and the result
 /// arrive through `moss-changed` and `moss_state`.
 #[tauri::command]
-async fn moss_generate(
-    st: State<'_, AppState>,
-    prompt: String,
-    aspect: identity::Aspect,
-    steps: Option<u32>,
-    seed: Option<u64>,
-) -> Result<(), String> {
+async fn moss_generate(st: State<'_, AppState>, request: moss::Request) -> Result<(), String> {
     let target = moss_target(&st)?;
-    let begun = st.moss.begin(&prompt, aspect, steps)?;
-    // Debug builds only: a fixed seed lets the live checks compare runs.
-    #[cfg(debug_assertions)]
-    let seed = seed.map(|s| s & ((1 << 52) - 1));
-    #[cfg(not(debug_assertions))]
-    let seed = {
-        let _ = seed;
-        None::<u64>
-    };
-    let seed = seed.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64 & ((1 << 52) - 1))
-            .unwrap_or(1)
-    });
+    let random_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    let begun = st.moss.begin(&request, random_seed)?;
     let svc = st.moss.clone();
     tauri::async_runtime::spawn(async move {
-        svc.finish(&target, begun, seed).await;
+        svc.finish(&target, begun).await;
     });
     Ok(())
 }

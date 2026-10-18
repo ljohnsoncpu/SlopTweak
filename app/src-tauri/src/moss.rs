@@ -1,21 +1,26 @@
-//! MOSS-Image 8-step: the ComfyUI graph for one text-to-image run.
+//! MOSS-Image: the ComfyUI graph for one text-to-image run, and the panel's engine.
 //!
 //! Uses ComfyUI's native MOSS-Image support (PR 17095, not in a tagged release
 //! yet; see docs/findings.md, "MOSS-Image step 0 verification"). The panel in
 //! the window talks to [`MossService`] through the `moss_*` Tauri commands.
+//!
+//! Two modes share the same weights. **Fast** applies lodestones' 8-step
+//! distillation (a LoRA plus a time-embedding patch) at CFG 1. **Full quality**
+//! is the plain base model, which the card samples at 50 steps and CFG 3 with
+//! layer 22 skipped in the negative branch (ComfyUI's SkipLayerGuidanceDiTSimple,
+//! as in the official and ostris workflows).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use url::Url;
 
 use crate::catalog::{is_image, Model};
 use crate::comfy::parse_history;
 use crate::identity::{
-    error_text, write_image, Aspect, ImageView, Kept, Phase, MAX_POLL_FAILURES, MAX_RESULTS, POLL,
-    RUN_TIMEOUT,
+    error_text, write_image, Kept, Phase, MAX_POLL_FAILURES, MAX_RESULTS, POLL, RUN_TIMEOUT,
 };
 use crate::sidecar::{SidecarApi, SidecarError, MAX_IMAGE_BYTES};
 
@@ -25,11 +30,38 @@ use crate::sidecar::{SidecarApi, SidecarError, MAX_IMAGE_BYTES};
 /// `time_embedding` file is not a LoRA, so the stock loader can't take it.
 pub const TIME_DELTA_NAME: &str = "moss-image-8-step-dmd-time-delta.safetensors";
 
-pub const MIN_STEPS: u32 = 4;
-pub const MAX_STEPS: u32 = 8;
-pub const DEFAULT_STEPS: u32 = 8;
+pub const MIN_STEPS: u32 = 1;
+/// The distillation was trained for 4 to 8 steps; more are allowed to experiment.
+pub const MAX_STEPS_FAST: u32 = 20;
+pub const MAX_STEPS_FULL: u32 = 60;
+pub const MIN_SIDE: u32 = 256;
+pub const MAX_SIDE: u32 = 2048;
 pub const MAX_PROMPT_CHARS: usize = 4000;
-const CFG: f64 = 1.0;
+pub const MIN_CFG: f64 = 1.0;
+pub const MAX_CFG: f64 = 10.0;
+/// What the base model card samples with.
+pub const FULL_DEFAULT_CFG: f64 = 3.0;
+/// The layer the card skips in the negative branch.
+pub const SKIP_LAYER: &str = "22";
+
+/// Samplers offered in the panel (ComfyUI's own names). Euler is what the
+/// distillation was made for; the others are there to try.
+pub const SAMPLERS: &[&str] = &[
+    "euler",
+    "euler_ancestral",
+    "heun",
+    "dpm_2",
+    "dpmpp_2m",
+    "dpmpp_2m_sde",
+    "dpmpp_3m_sde",
+    "res_multistep",
+    "ipndm",
+    "uni_pc",
+    "lcm",
+];
+
+/// Schedulers offered in the panel. `simple` follows the model's own sigmas.
+pub const SCHEDULERS: &[&str] = &["simple", "normal", "sgm_uniform", "karras", "beta"];
 
 /// The ComfyUI file names the instance placed (the catalog's `filename`s).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,9 +95,115 @@ impl ModelFiles {
     }
 }
 
-/// Steps the sampler may take: the distillation is trained for 4 to 8.
-pub fn clamp_steps(steps: u32) -> u32 {
-    steps.clamp(MIN_STEPS, MAX_STEPS)
+fn yes() -> bool {
+    true
+}
+
+fn default_sampler() -> String {
+    "euler".into()
+}
+
+fn default_scheduler() -> String {
+    "simple".into()
+}
+
+/// What the panel sends for one picture.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Request {
+    pub prompt: String,
+    pub width: u32,
+    pub height: u32,
+    pub steps: u32,
+    #[serde(default = "default_sampler")]
+    pub sampler: String,
+    #[serde(default = "default_scheduler")]
+    pub scheduler: String,
+    /// Full quality only; Fast always runs at CFG 1.
+    #[serde(default)]
+    pub cfg: Option<f64>,
+    /// `true` = Fast (the 8-step distillation), `false` = Full quality (base model).
+    #[serde(default = "yes")]
+    pub fast: bool,
+    /// Blank = a random one.
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+/// A checked [`Request`]: every value is one the graph can use.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Params {
+    pub prompt: String,
+    pub size: (u32, u32),
+    pub steps: u32,
+    pub sampler: String,
+    pub scheduler: String,
+    pub cfg: f64,
+    pub fast: bool,
+    pub seed: u64,
+}
+
+/// ComfyUI takes 64-bit seeds; keep them in what a JS number holds exactly.
+const SEED_MASK: u64 = (1 << 52) - 1;
+
+impl Params {
+    /// Check a request. `random_seed` is used when the request has none.
+    pub fn check(r: &Request, random_seed: u64) -> Result<Self, String> {
+        let prompt = clean_prompt(&r.prompt)?;
+        let size = (r.width, r.height);
+        if !valid_size(size) {
+            return Err(format!(
+                "The size must be a multiple of 16 between {MIN_SIDE} and {MAX_SIDE} on each side."
+            ));
+        }
+        let max_steps = if r.fast {
+            MAX_STEPS_FAST
+        } else {
+            MAX_STEPS_FULL
+        };
+        if !(MIN_STEPS..=max_steps).contains(&r.steps) {
+            return Err(format!(
+                "Steps must be between {MIN_STEPS} and {max_steps} in this mode."
+            ));
+        }
+        if !SAMPLERS.contains(&r.sampler.as_str()) {
+            return Err("That sampler isn't available.".into());
+        }
+        if !SCHEDULERS.contains(&r.scheduler.as_str()) {
+            return Err("That scheduler isn't available.".into());
+        }
+        let cfg = if r.fast {
+            1.0
+        } else {
+            let cfg = r.cfg.unwrap_or(FULL_DEFAULT_CFG);
+            if !(MIN_CFG..=MAX_CFG).contains(&cfg) {
+                return Err(format!("CFG must be between {MIN_CFG} and {MAX_CFG}."));
+            }
+            cfg
+        };
+        Ok(Self {
+            prompt,
+            size,
+            steps: r.steps,
+            sampler: r.sampler.clone(),
+            scheduler: r.scheduler.clone(),
+            cfg,
+            fast: r.fast,
+            seed: r.seed.unwrap_or(random_seed) & SEED_MASK,
+        })
+    }
+
+    /// One line for the picture's caption: what made it.
+    pub fn summary(&self) -> String {
+        let mode = if self.fast {
+            "Fast".to_string()
+        } else {
+            format!("Full quality, CFG {}", self.cfg)
+        };
+        format!(
+            "{}×{} · {} · {} steps · {}/{} · seed {}",
+            self.size.0, self.size.1, mode, self.steps, self.sampler, self.scheduler, self.seed
+        )
+    }
 }
 
 /// The prompt as sent: trimmed, never empty, never longer than the limit.
@@ -84,44 +222,52 @@ pub fn clean_prompt(prompt: &str) -> Result<String, String> {
 
 /// MOSS-Image's latent is 1/16 of the picture, so sizes are multiples of 16.
 pub fn valid_size((w, h): (u32, u32)) -> bool {
-    (256..=2048).contains(&w) && (256..=2048).contains(&h) && w % 16 == 0 && h % 16 == 0
+    (MIN_SIDE..=MAX_SIDE).contains(&w)
+        && (MIN_SIDE..=MAX_SIDE).contains(&h)
+        && w % 16 == 0
+        && h % 16 == 0
 }
 
 /// The ComfyUI "API format" graph for one image. Shift 5 is the model's own
-/// default in ComfyUI, so there is no ModelSamplingSD3 node. CFG 1 makes the
-/// negative prompt unused, but KSampler still needs one wired.
-pub fn build_graph(
-    files: &ModelFiles,
-    prompt: &str,
-    size: (u32, u32),
-    steps: u32,
-    seed: u64,
-) -> Value {
-    let (w, h) = size;
-    json!({
+/// default in ComfyUI, so there is no ModelSamplingSD3 node. In Fast mode CFG 1
+/// makes the negative prompt unused, but KSampler still needs one wired.
+pub fn build_graph(files: &ModelFiles, p: &Params) -> Value {
+    let (w, h) = p.size;
+    let mut g = json!({
         "1": {"class_type": "UNETLoader",
               "inputs": {"unet_name": files.unet, "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader",
               "inputs": {"clip_name": files.clip, "type": "moss_image", "device": "default"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": files.vae}},
-        "10": {"class_type": "LoraLoaderModelOnly",
-               "inputs": {"model": ["1", 0], "lora_name": files.lora, "strength_model": 1.0}},
-        "11": {"class_type": "LoraLoaderModelOnly",
-               "inputs": {"model": ["10", 0], "lora_name": TIME_DELTA_NAME, "strength_model": 1.0}},
-        "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": prompt}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": p.prompt}},
         "5": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": ""}},
         "6": {"class_type": "EmptyFlux2LatentImage",
               "inputs": {"width": w, "height": h, "batch_size": 1}},
-        "7": {"class_type": "KSampler", "inputs": {
-            "seed": seed, "steps": clamp_steps(steps), "cfg": CFG,
-            "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0,
-            "model": ["11", 0], "positive": ["4", 0], "negative": ["5", 0],
-            "latent_image": ["6", 0]}},
         "8": {"class_type": "VAEDecode",
               "inputs": {"samples": ["7", 0], "vae": ["3", 0]}},
         "9": {"class_type": "SaveImage",
               "inputs": {"filename_prefix": "SlopTweak", "images": ["8", 0]}},
-    })
+    });
+    // Fast: base -> distillation LoRA -> time-embedding delta. Full: the base, with
+    // layer 22 skipped in the negative branch (only matters above CFG 1).
+    let model = if p.fast {
+        g["10"] = json!({"class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": ["1", 0], "lora_name": files.lora, "strength_model": 1.0}});
+        g["11"] = json!({"class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": ["10", 0], "lora_name": TIME_DELTA_NAME, "strength_model": 1.0}});
+        json!(["11", 0])
+    } else {
+        g["12"] = json!({"class_type": "SkipLayerGuidanceDiTSimple", "inputs": {
+            "model": ["1", 0], "double_layers": "", "single_layers": SKIP_LAYER,
+            "start_percent": 0.0, "end_percent": 1.0}});
+        json!(["12", 0])
+    };
+    g["7"] = json!({"class_type": "KSampler", "inputs": {
+        "seed": p.seed, "steps": p.steps, "cfg": p.cfg,
+        "sampler_name": p.sampler, "scheduler": p.scheduler, "denoise": 1.0,
+        "model": model, "positive": ["4", 0], "negative": ["5", 0],
+        "latent_image": ["6", 0]}});
+    g
 }
 
 /// Queue one graph on the instance, wait for it, and fetch the picture. The
@@ -150,7 +296,8 @@ pub async fn run(
         )
         .await
         .map_err(|e| match e {
-            SidecarError::Http(400) => "The GPU didn't accept the request. If the model files                 are still loading, wait a minute and try again."
+            SidecarError::Http(400) => "The GPU didn't accept the request. If the model files \
+                are still loading, wait a minute and try again."
                 .to_string(),
             e => unreachable(e),
         })?;
@@ -211,16 +358,27 @@ pub async fn run(
 
 // ----- what the panel shows ----------------------------------------------------------
 
+/// One finished picture as the window shows it.
+#[derive(Debug, Clone, Serialize)]
+pub struct MossImage {
+    pub id: String,
+    pub name: String,
+    pub data_url: String,
+    /// What made it (size, mode, steps, sampler, seed).
+    pub info: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MossView {
-    pub results: Vec<ImageView>,
+    pub results: Vec<MossImage>,
     pub phase: Phase,
     pub message: String,
 }
 
 #[derive(Default)]
 struct Inner {
-    results: Vec<Kept>,
+    /// Each picture with its caption.
+    results: Vec<(Kept, String)>,
     phase: Phase,
     message: String,
     cancel: Option<Arc<AtomicBool>>,
@@ -238,9 +396,7 @@ pub struct Target {
 
 /// A checked request, ready to run.
 pub struct Begun {
-    prompt: String,
-    size: (u32, u32),
-    steps: u32,
+    params: Params,
     cancel: Arc<AtomicBool>,
 }
 
@@ -261,7 +417,20 @@ impl MossService {
     pub fn view(&self) -> MossView {
         let i = self.inner.lock().unwrap();
         MossView {
-            results: i.results.iter().rev().map(Kept::view).collect(),
+            results: i
+                .results
+                .iter()
+                .rev()
+                .map(|(k, info)| {
+                    let v = k.view();
+                    MossImage {
+                        id: v.id,
+                        name: v.name,
+                        data_url: v.data_url,
+                        info: info.clone(),
+                    }
+                })
+                .collect(),
             phase: i.phase,
             message: i.message.clone(),
         }
@@ -281,12 +450,8 @@ impl MossService {
 
     /// Check a request and mark the panel busy. Refuses a second one while a
     /// picture is being made.
-    pub fn begin(&self, prompt: &str, aspect: Aspect, steps: Option<u32>) -> Result<Begun, String> {
-        let prompt = clean_prompt(prompt)?;
-        let size = aspect.size();
-        if !valid_size(size) {
-            return Err("That shape isn't supported.".into());
-        }
+    pub fn begin(&self, request: &Request, random_seed: u64) -> Result<Begun, String> {
+        let params = Params::check(request, random_seed)?;
         let cancel = Arc::new(AtomicBool::new(false));
         {
             let mut i = self.inner.lock().unwrap();
@@ -300,17 +465,12 @@ impl MossService {
             i.prompt_id = None;
         }
         (self.notify)();
-        Ok(Begun {
-            prompt,
-            size,
-            steps: clamp_steps(steps.unwrap_or(DEFAULT_STEPS)),
-            cancel,
-        })
+        Ok(Begun { params, cancel })
     }
 
     /// Run a request [`begin`](Self::begin) accepted, and record how it ended.
-    pub async fn finish(self: &Arc<Self>, t: &Target, b: Begun, seed: u64) {
-        let graph = build_graph(&t.files, &b.prompt, b.size, b.steps, seed);
+    pub async fn finish(self: &Arc<Self>, t: &Target, b: Begun) {
+        let graph = build_graph(&t.files, &b.params);
         let me = self.clone();
         let on_queued = move |id: &str| {
             me.inner.lock().unwrap().prompt_id = Some(id.to_string());
@@ -328,7 +488,8 @@ impl MossService {
             Ok(Some((id, name, bytes))) => {
                 {
                     let mut i = self.inner.lock().unwrap();
-                    i.results.push(Kept { id, name, bytes });
+                    i.results
+                        .push((Kept { id, name, bytes }, b.params.summary()));
                     let extra = i.results.len().saturating_sub(MAX_RESULTS);
                     i.results.drain(..extra);
                 }
@@ -368,10 +529,10 @@ impl MossService {
     ) -> Result<std::path::PathBuf, String> {
         let (name, bytes) = {
             let i = self.inner.lock().unwrap();
-            let r = i
+            let (r, _) = i
                 .results
                 .iter()
-                .find(|r| r.id == result_id)
+                .find(|(r, _)| r.id == result_id)
                 .ok_or("That image is no longer in the panel.")?;
             (r.name.clone(), r.bytes.clone())
         };
@@ -408,6 +569,24 @@ mod tests {
             .unwrap()
     }
 
+    fn request() -> Request {
+        Request {
+            prompt: "a red fox".into(),
+            width: 1024,
+            height: 896,
+            steps: 8,
+            sampler: "euler".into(),
+            scheduler: "simple".into(),
+            cfg: None,
+            fast: true,
+            seed: Some(42),
+        }
+    }
+
+    fn params(r: &Request) -> Params {
+        Params::check(r, 7).unwrap()
+    }
+
     #[test]
     fn model_files_come_from_the_catalog_entry() {
         assert_eq!(ModelFiles::of(&bundled_moss()), Some(files()));
@@ -426,8 +605,8 @@ mod tests {
     }
 
     #[test]
-    fn graph_matches_the_native_comfyui_nodes() {
-        let g = build_graph(&files(), "a red fox", (1024, 896), 8, 42);
+    fn fast_graph_matches_the_native_comfyui_nodes() {
+        let g = build_graph(&files(), &params(&request()));
         assert_eq!(g["2"]["inputs"]["type"], "moss_image");
         assert_eq!(g["6"]["class_type"], "EmptyFlux2LatentImage");
         assert_eq!(g["6"]["inputs"]["width"], 1024);
@@ -441,34 +620,103 @@ mod tests {
         );
         assert_eq!(k["seed"], 42);
         assert_eq!(k["sampler_name"], "euler");
+        assert_eq!(k["scheduler"], "simple");
         // Base -> distillation LoRA -> time-embedding delta -> sampler.
         assert_eq!(g["10"]["inputs"]["model"], json!(["1", 0]));
         assert_eq!(g["11"]["inputs"]["model"], json!(["10", 0]));
         assert_eq!(g["11"]["inputs"]["lora_name"], TIME_DELTA_NAME);
         assert_eq!(k["model"], json!(["11", 0]));
+        assert!(g.get("12").is_none());
         assert_eq!(g["9"]["inputs"]["images"], json!(["8", 0]));
     }
 
     #[test]
+    fn full_quality_graph_skips_the_distillation_and_layer_22_in_the_negative() {
+        let mut r = request();
+        r.fast = false;
+        r.steps = 50;
+        r.cfg = Some(3.5);
+        r.sampler = "dpmpp_2m".into();
+        r.scheduler = "karras".into();
+        let g = build_graph(&files(), &params(&r));
+        assert!(g.get("10").is_none() && g.get("11").is_none());
+        let slg = &g["12"];
+        assert_eq!(slg["class_type"], "SkipLayerGuidanceDiTSimple");
+        assert_eq!(slg["inputs"]["model"], json!(["1", 0]));
+        assert_eq!(slg["inputs"]["single_layers"], "22");
+        assert_eq!(slg["inputs"]["double_layers"], "");
+        let k = &g["7"]["inputs"];
+        assert_eq!(k["model"], json!(["12", 0]));
+        assert_eq!(
+            (k["steps"].as_u64(), k["cfg"].as_f64()),
+            (Some(50), Some(3.5))
+        );
+        assert_eq!(
+            (&k["sampler_name"], &k["scheduler"]),
+            (&json!("dpmpp_2m"), &json!("karras"))
+        );
+    }
+
+    #[test]
     fn every_link_points_at_a_node_in_the_graph() {
-        let g = build_graph(&files(), "x", (1024, 1024), 8, 1);
-        for (id, node) in g.as_object().unwrap() {
-            for (name, v) in node["inputs"].as_object().unwrap() {
-                if let Some([src, _]) = v.as_array().map(Vec::as_slice) {
-                    let src = src.as_str().unwrap();
-                    assert!(g.get(src).is_some(), "node {id}.{name} -> missing {src}");
+        for fast in [true, false] {
+            let mut r = request();
+            r.fast = fast;
+            let g = build_graph(&files(), &params(&r));
+            for (id, node) in g.as_object().unwrap() {
+                for (name, v) in node["inputs"].as_object().unwrap() {
+                    if let Some([src, _]) = v.as_array().map(Vec::as_slice) {
+                        let src = src.as_str().unwrap();
+                        assert!(g.get(src).is_some(), "node {id}.{name} -> missing {src}");
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn steps_stay_inside_the_trained_range() {
-        assert_eq!(clamp_steps(1), 4);
-        assert_eq!(clamp_steps(6), 6);
-        assert_eq!(clamp_steps(50), 8);
-        let g = build_graph(&files(), "x", (1024, 1024), 50, 1);
-        assert_eq!(g["7"]["inputs"]["steps"], 8);
+    fn steps_are_checked_per_mode() {
+        let mut r = request();
+        for (fast, steps, ok) in [
+            (true, 1, true),
+            (true, 20, true),
+            (true, 21, false),
+            (true, 0, false),
+            (false, 60, true),
+            (false, 61, false),
+        ] {
+            r.fast = fast;
+            r.steps = steps;
+            assert_eq!(
+                Params::check(&r, 1).is_ok(),
+                ok,
+                "fast={fast} steps={steps}"
+            );
+        }
+    }
+
+    #[test]
+    fn sampler_scheduler_and_cfg_are_checked() {
+        let mut r = request();
+        r.sampler = "evil; rm -rf".into();
+        assert!(Params::check(&r, 1).is_err());
+        let mut r = request();
+        r.scheduler = "nope".into();
+        assert!(Params::check(&r, 1).is_err());
+        // Fast mode ignores any CFG and always runs at 1.
+        let mut r = request();
+        r.cfg = Some(7.0);
+        assert_eq!(params(&r).cfg, 1.0);
+        // Full quality defaults to the card's CFG and rejects wild values.
+        r.fast = false;
+        r.steps = 30;
+        r.cfg = None;
+        assert_eq!(params(&r).cfg, FULL_DEFAULT_CFG);
+        for bad in [0.5, 10.5, f64::NAN] {
+            r.cfg = Some(bad);
+            assert!(Params::check(&r, 1).is_err(), "{bad}");
+        }
+        assert!(SAMPLERS.contains(&"euler") && SCHEDULERS.contains(&"simple"));
     }
 
     #[test]
@@ -483,11 +731,48 @@ mod tests {
 
     #[test]
     fn sizes_are_multiples_of_16_in_range() {
-        assert!(valid_size((1024, 1024)));
-        assert!(valid_size((896, 1152)));
-        assert!(!valid_size((1000, 1024)));
-        assert!(!valid_size((128, 1024)));
-        assert!(!valid_size((4096, 1024)));
+        for ok in [(1024, 1024), (896, 1152), (256, 2048), (1536, 1536)] {
+            assert!(valid_size(ok), "{ok:?}");
+        }
+        for bad in [
+            (1000, 1024),
+            (128, 1024),
+            (4096, 1024),
+            (1024, 0),
+            (2064, 1024),
+        ] {
+            assert!(!valid_size(bad), "{bad:?}");
+        }
+        let mut r = request();
+        r.width = 1000;
+        assert!(Params::check(&r, 1).is_err());
+    }
+
+    #[test]
+    fn seeds_are_kept_exactly_or_made_up() {
+        let mut r = request();
+        assert_eq!(params(&r).seed, 42);
+        r.seed = None;
+        assert_eq!(params(&r).seed, 7);
+        // A seed too big for a JS number is folded into 52 bits.
+        r.seed = Some(u64::MAX);
+        assert_eq!(params(&r).seed, (1 << 52) - 1);
+    }
+
+    #[test]
+    fn the_caption_says_what_made_the_picture() {
+        assert_eq!(
+            params(&request()).summary(),
+            "1024×896 · Fast · 8 steps · euler/simple · seed 42"
+        );
+        let mut r = request();
+        r.fast = false;
+        r.steps = 50;
+        r.cfg = Some(3.0);
+        assert_eq!(
+            params(&r).summary(),
+            "1024×896 · Full quality, CFG 3 · 50 steps · euler/simple · seed 42"
+        );
     }
 
     fn service() -> (Arc<MossService>, Arc<std::sync::atomic::AtomicU32>) {
@@ -510,43 +795,49 @@ mod tests {
     #[test]
     fn begin_marks_the_panel_busy_and_refuses_a_second_request() {
         let (svc, notified) = service();
-        let b = svc.begin("  a fox ", Aspect::Portrait, Some(50)).unwrap();
-        assert_eq!(
-            (b.prompt.as_str(), b.size, b.steps),
-            ("a fox", (896, 1152), 8)
-        );
+        let mut r = request();
+        r.prompt = "  a fox ".into();
+        let b = svc.begin(&r, 1).unwrap();
+        assert_eq!(b.params.prompt, "a fox");
         assert_eq!(svc.view().phase, Phase::Running);
         assert!(notified.load(Ordering::SeqCst) >= 1);
-        let again = svc.begin("another", Aspect::Square, None);
+        let again = svc.begin(&request(), 1);
         assert_eq!(
             again.err().as_deref(),
             Some("An image is already being made.")
         );
         // A finished run frees the panel again.
         svc.set_phase(Phase::Done, "ok");
-        assert!(svc.begin("another", Aspect::Square, None).is_ok());
+        assert!(svc.begin(&request(), 1).is_ok());
     }
 
     #[test]
-    fn a_bad_prompt_never_marks_the_panel_busy() {
+    fn a_bad_request_never_marks_the_panel_busy() {
         let (svc, _) = service();
-        assert!(svc.begin("   ", Aspect::Square, None).is_err());
-        assert!(svc
-            .begin(&"x".repeat(MAX_PROMPT_CHARS + 1), Aspect::Square, None)
-            .is_err());
+        let mut r = request();
+        r.prompt = "   ".into();
+        assert!(svc.begin(&r, 1).is_err());
+        r = request();
+        r.steps = 99;
+        assert!(svc.begin(&r, 1).is_err());
         assert_eq!(svc.view().phase, Phase::Idle);
     }
 
     #[test]
-    fn results_show_newest_first_and_reset_keeps_them() {
+    fn results_show_newest_first_with_captions_and_reset_keeps_them() {
         let (svc, _) = service();
         {
             let mut i = svc.inner.lock().unwrap();
-            i.results.push(kept("a"));
-            i.results.push(kept("b"));
+            i.results.push((kept("a"), "first".into()));
+            i.results.push((kept("b"), "second".into()));
         }
-        let ids: Vec<String> = svc.view().results.into_iter().map(|r| r.id).collect();
-        assert_eq!(ids, ["b", "a"]);
+        let v = svc.view();
+        let got: Vec<(&str, &str)> = v
+            .results
+            .iter()
+            .map(|r| (r.id.as_str(), r.info.as_str()))
+            .collect();
+        assert_eq!(got, [("b", "second"), ("a", "first")]);
         svc.set_phase(Phase::Failed, "boom");
         svc.reset_run();
         let v = svc.view();
@@ -559,7 +850,11 @@ mod tests {
     #[test]
     fn save_writes_a_plain_name_and_never_overwrites() {
         let (svc, _) = service();
-        svc.inner.lock().unwrap().results.push(kept("a"));
+        svc.inner
+            .lock()
+            .unwrap()
+            .results
+            .push((kept("a"), String::new()));
         let dir = std::env::temp_dir().join(format!("sloptweak-moss-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let first = svc.save_result("a", &dir).unwrap();

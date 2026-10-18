@@ -240,9 +240,20 @@ const ui = {
   idResults: el("id-results"),
   moss: el("moss"),
   mossPrompt: el<HTMLTextAreaElement>("moss-prompt"),
-  mossAspect: el<HTMLSelectElement>("moss-aspect"),
+  mossMode: el<HTMLSelectElement>("moss-mode"),
+  mossModeHint: el("moss-mode-hint"),
+  mossWidth: el<HTMLInputElement>("moss-width"),
+  mossHeight: el<HTMLInputElement>("moss-height"),
+  mossSizeHint: el("moss-size-hint"),
   mossSteps: el<HTMLInputElement>("moss-steps"),
   mossStepsVal: el("moss-steps-val"),
+  mossStepsHint: el("moss-steps-hint"),
+  mossSampler: el<HTMLSelectElement>("moss-sampler"),
+  mossScheduler: el<HTMLSelectElement>("moss-scheduler"),
+  mossCfgRow: el("moss-cfg-row"),
+  mossCfg: el<HTMLInputElement>("moss-cfg"),
+  mossCfgVal: el("moss-cfg-val"),
+  mossSeed: el<HTMLInputElement>("moss-seed"),
   mossGo: el<HTMLButtonElement>("moss-go"),
   mossCancel: el<HTMLButtonElement>("moss-cancel"),
   mossMsg: el("moss-msg"),
@@ -1295,11 +1306,44 @@ const identityEditing = () => ui.idMode.value === "edit";
 /** An error from the last click (a bad request), shown until the next state change. */
 let identityError = "";
 
+interface MossImage {
+  id: string;
+  name: string;
+  data_url: string;
+  /** What made it: size, mode, steps, sampler, seed. */
+  info: string;
+}
+
 interface MossView {
-  results: IdentityImage[];
+  results: MossImage[];
   phase: IdentityView["phase"];
   message: string;
 }
+
+/** Samplers and schedulers the panel offers (ComfyUI's names; the backend checks them too). */
+const MOSS_SAMPLERS = ["euler", "euler_ancestral", "heun", "dpm_2", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_3m_sde", "res_multistep", "ipndm", "uni_pc", "lcm"];
+const MOSS_SCHEDULERS = ["simple", "normal", "sgm_uniform", "karras", "beta"];
+const MOSS_MIN_SIDE = 256;
+const MOSS_MAX_SIDE = 2048;
+/** Fast = the 8-step distillation; Full = the base model at the card's settings. */
+const MOSS_MODES = {
+  fast: {
+    max: 20,
+    steps: 8,
+    // The distillation looked far sharper at 1536 px than at 1024 in the 2026-10-18 A/B.
+    sizes: { sq: [1536, 1536], tall: [1344, 1728], wide: [1728, 1344] },
+    hint: "lodestones' 8-step distillation, still a work in progress. Trained for 4 to 8 steps at CFG 1; more steps are allowed but may not help. It looks much sharper at 1536 px than at 1024.",
+    stepsHint: "4 to 8 is what it was trained for.",
+  },
+  full: {
+    max: 60,
+    steps: 40,
+    sizes: { sq: [1024, 1024], tall: [896, 1152], wide: [1152, 896] },
+    hint: "The undistilled base model: slower (roughly 5 to 10 times a Fast picture) but the way the model was meant to be sampled.",
+    stepsHint: "The model card uses 50 steps at CFG 3; community workflows use about 30.",
+  },
+} as const;
+const MOSS_CFG_DEFAULT = 3;
 
 let moss: MossView = { results: [], phase: "idle", message: "" };
 /** An error from the last click (a bad request), shown until the next state change. */
@@ -1866,18 +1910,45 @@ async function refreshMoss(): Promise<void> {
   renderMoss();
 }
 
+const mossFast = () => ui.mossMode.value === "fast";
+const mossMode = () => MOSS_MODES[mossFast() ? "fast" : "full"];
+
+/** A side as typed: whole, a multiple of 16, inside the allowed range. */
+function snapSide(v: string, fallback: number): number {
+  const n = Math.round(Number(v) / 16) * 16;
+  if (!Number.isFinite(n) || n === 0) return fallback;
+  return Math.min(MOSS_MAX_SIDE, Math.max(MOSS_MIN_SIDE, n));
+}
+
+/** The typed seed: blank = random (null); otherwise a whole number, or NaN when it isn't one. */
+function mossSeedValue(): number | null {
+  const t = ui.mossSeed.value.trim();
+  if (t === "") return null;
+  const n = Number(t);
+  return /^\d+$/.test(t) && Number.isSafeInteger(n) ? n : Number.NaN;
+}
+
 function renderMoss(): void {
   ui.moss.hidden = !isMoss();
   const busy = mossBusy();
+  const mode = MOSS_MODES[mossFast() ? "fast" : "full"];
+  ui.mossModeHint.textContent = mode.hint;
   ui.mossStepsVal.textContent = ui.mossSteps.value;
-  ui.mossGo.disabled = busy || ui.mossPrompt.value.trim() === "";
+  ui.mossStepsHint.textContent = mode.stepsHint;
+  ui.mossCfgRow.hidden = mossFast();
+  ui.mossCfgVal.textContent = Number(ui.mossCfg.value).toFixed(1);
+  const wpx = Number(ui.mossWidth.value);
+  const hpx = Number(ui.mossHeight.value);
+  ui.mossSizeHint.textContent = `${((wpx * hpx) / 1e6).toFixed(2)} megapixels. Sizes snap to a multiple of 16 (${MOSS_MIN_SIDE} to ${MOSS_MAX_SIDE}); bigger pictures take longer and need more GPU memory.`;
+  const seedBad = Number.isNaN(mossSeedValue());
+  ui.mossGo.disabled = busy || ui.mossPrompt.value.trim() === "" || seedBad;
   ui.mossGo.hidden = busy;
   ui.mossCancel.hidden = !busy;
-  ui.mossMsg.textContent = mossError || moss.message;
-  ui.mossMsg.className = moss.phase === "failed" || mossError ? "notice" : "muted";
+  ui.mossMsg.textContent = mossError || (seedBad ? "The seed must be a whole number, or blank for a random one." : moss.message);
+  ui.mossMsg.className = moss.phase === "failed" || mossError || seedBad ? "notice" : "muted";
   ui.mossResults.replaceChildren(
     ...moss.results.map((r) =>
-      h("figure", {}, zoomable(h("img", { src: r.data_url, alt: "Result", title: "Click to enlarge" }), r.id)),
+      h("figure", {}, zoomable(h("img", { src: r.data_url, alt: "Result", title: "Click to enlarge" }), r.id), h("figcaption", { class: "muted small" }, r.info)),
     ),
   );
 }
@@ -1897,14 +1968,62 @@ async function mossAct(p: Promise<unknown>): Promise<void> {
   }
 }
 
-ui.mossPrompt.oninput = () => renderMoss();
-ui.mossSteps.oninput = () => renderMoss();
+/** Switching mode resets the steps, CFG and size to that mode's own defaults. */
+function applyMossMode(): void {
+  const mode = mossMode();
+  ui.mossSteps.max = String(mode.max);
+  ui.mossSteps.value = String(mode.steps);
+  ui.mossCfg.value = String(MOSS_CFG_DEFAULT);
+  const [w, h] = mode.sizes.sq;
+  ui.mossWidth.value = String(w);
+  ui.mossHeight.value = String(h);
+  for (const key of ["sq", "tall", "wide"] as const) {
+    const [pw, ph] = mode.sizes[key];
+    el<HTMLButtonElement>(`moss-${key}`).title = `${pw} × ${ph}`;
+  }
+  renderMoss();
+}
+
+for (const name of MOSS_SAMPLERS) ui.mossSampler.append(new Option(name, name));
+for (const name of MOSS_SCHEDULERS) ui.mossScheduler.append(new Option(name, name));
+ui.mossSampler.value = "euler";
+ui.mossScheduler.value = "simple";
+applyMossMode();
+
+ui.mossMode.onchange = applyMossMode;
+for (const [id, key] of [["moss-sq", "sq"], ["moss-tall", "tall"], ["moss-wide", "wide"]] as const) {
+  el<HTMLButtonElement>(id).onclick = () => {
+    const [w0, h0] = mossMode().sizes[key];
+    ui.mossWidth.value = String(w0);
+    ui.mossHeight.value = String(h0);
+    renderMoss();
+  };
+}
+ui.mossWidth.onchange = () => {
+  ui.mossWidth.value = String(snapSide(ui.mossWidth.value, 1024));
+  renderMoss();
+};
+ui.mossHeight.onchange = () => {
+  ui.mossHeight.value = String(snapSide(ui.mossHeight.value, 1024));
+  renderMoss();
+};
+for (const input of [ui.mossPrompt, ui.mossSteps, ui.mossCfg, ui.mossSeed, ui.mossWidth, ui.mossHeight]) {
+  input.oninput = () => renderMoss();
+}
 ui.mossGo.onclick = () =>
   void mossAct(
     invoke("moss_generate", {
-      prompt: ui.mossPrompt.value,
-      aspect: ui.mossAspect.value,
-      steps: Number(ui.mossSteps.value),
+      request: {
+        prompt: ui.mossPrompt.value,
+        width: snapSide(ui.mossWidth.value, 1024),
+        height: snapSide(ui.mossHeight.value, 1024),
+        steps: Number(ui.mossSteps.value),
+        sampler: ui.mossSampler.value,
+        scheduler: ui.mossScheduler.value,
+        cfg: mossFast() ? null : Number(ui.mossCfg.value),
+        fast: mossFast(),
+        seed: mossSeedValue(),
+      },
     }),
   );
 ui.mossCancel.onclick = () => void mossAct(invoke("moss_cancel"));

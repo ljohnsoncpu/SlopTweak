@@ -158,27 +158,60 @@
         <section id="moss" class="card" hidden>
           <h2>MOSS-Image</h2>
           <p class="muted small">
-            Describe the picture you want. This is an early 8-step version of the model, so
-            expect rough edges, and small text in pictures often comes out garbled.
+            Describe the picture you want. Fast mode is an early 8-step version of the model, so it
+            can look rough; Full quality uses the base model and takes longer. Small text in
+            pictures often comes out garbled.
           </p>
           <label for="moss-prompt">What should it draw?</label>
           <textarea id="moss-prompt" rows="3" maxlength="4000" spellcheck="true"
             placeholder="A red fox sitting in a snowy forest at dusk, soft light."></textarea>
           <div class="row">
-            <label for="moss-aspect">Shape</label>
-            <select id="moss-aspect">
-              <option value="square">Square</option>
-              <option value="portrait">Tall</option>
-              <option value="landscape">Wide</option>
+            <label for="moss-mode">Mode</label>
+            <select id="moss-mode">
+              <option value="fast">Fast (8-step distillation)</option>
+              <option value="full">Full quality (base model, slower)</option>
             </select>
           </div>
+          <p id="moss-mode-hint" class="muted small"></p>
+          <div class="row">
+            <label for="moss-width">Size</label>
+            <input id="moss-width" type="number" min="256" max="2048" step="16" value="1024" aria-label="Width" />
+            <span>×</span>
+            <input id="moss-height" type="number" min="256" max="2048" step="16" value="1024" aria-label="Height" />
+            <button id="moss-sq" class="ghost" type="button" title="1024 × 1024">Square</button>
+            <button id="moss-tall" class="ghost" type="button" title="896 × 1152">Tall</button>
+            <button id="moss-wide" class="ghost" type="button" title="1152 × 896">Wide</button>
+          </div>
+          <p id="moss-size-hint" class="muted small"></p>
           <div class="row">
             <label for="moss-steps">Steps</label>
-            <span class="muted small">Faster</span>
-            <input id="moss-steps" type="range" min="4" max="8" step="1" value="8" />
-            <span class="muted small">Best</span>
+            <input id="moss-steps" type="range" min="1" max="20" step="1" value="8" />
             <strong id="moss-steps-val"></strong>
           </div>
+          <p id="moss-steps-hint" class="muted small"></p>
+          <details id="moss-more">
+            <summary>Sampler, CFG and seed</summary>
+            <div class="row">
+              <label for="moss-sampler">Sampler</label>
+              <select id="moss-sampler"></select>
+            </div>
+            <div class="row">
+              <label for="moss-scheduler">Scheduler</label>
+              <select id="moss-scheduler"></select>
+            </div>
+            <div class="row" id="moss-cfg-row">
+              <label for="moss-cfg">CFG</label>
+              <input id="moss-cfg" type="range" min="1" max="10" step="0.5" value="3" />
+              <strong id="moss-cfg-val"></strong>
+            </div>
+            <div class="row">
+              <label for="moss-seed">Seed</label>
+              <input id="moss-seed" type="text" inputmode="numeric" placeholder="Random" />
+            </div>
+            <p class="muted small">
+              Each picture's caption shows its seed. Type it here to make the same picture again.
+            </p>
+          </details>
           <div class="actions">
             <button id="moss-go" class="primary" type="button">Make image</button>
             <button id="moss-cancel" class="danger" type="button" hidden>Cancel</button>
