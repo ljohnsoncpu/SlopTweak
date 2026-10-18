@@ -2536,3 +2536,5 @@ little higher). Bundle `instance-v0.1.7` (3d61aee0…bc1e).
   the one both live runs used), so it no longer matches the pin: a new dev
   pre-release (v0.1.8) must be published and `DEV_ASSETS_URL` pointed at it
   before another live run.
+  Published as `instance-v0.1.8` (hash verified after download); `DEV_ASSETS_URL`
+  now points at it.

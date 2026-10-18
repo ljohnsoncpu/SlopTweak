@@ -28,11 +28,11 @@ pub const ASSETS_URL: &str = concat!(
 );
 pub const ASSETS_SHA256: &str = "d2f31597067251692b745ffb856aa1ecea45eaf31389517afa58f0604dd86c6c";
 /// Debug builds of a version that has no release yet fetch the same bytes
-/// from the `instance-v0.1.7` dev pre-release; `SLOPTWEAK_DEV_ASSETS_URL` overrides it
+/// from the `instance-v0.1.8` dev pre-release; `SLOPTWEAK_DEV_ASSETS_URL` overrides it
 /// (the instance still checks [`ASSETS_SHA256`]).
 #[cfg(debug_assertions)]
 const DEV_ASSETS_URL: &str =
-    "https://github.com/ljohnsoncpu/SlopTweak/releases/download/instance-v0.1.7/instance-assets.tar.gz";
+    "https://github.com/ljohnsoncpu/SlopTweak/releases/download/instance-v0.1.8/instance-assets.tar.gz";
 
 /// Where instances fetch the bundle from.
 pub fn assets_url() -> String {
