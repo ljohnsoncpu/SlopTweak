@@ -2512,3 +2512,19 @@ little higher). Bundle `instance-v0.1.7` (3d61aee0…bc1e).
   50 steps or against an unpatched run, so how much of the distillation survives
   is still unmeasured.
 - 6/6 checks passed. Stop destroyed the instance; none left. Spend ~$0.275 (credit $9.1913 → $8.9161; late charges may post).
+
+### MOSS-Image panel live (2026-10-17) ✅ works
+
+`TEST_MODEL=moss-image-dmd LOCAL_CATALOG=1 MAX_DPH=0.45 node dev/vast-acceptance.mjs r7`
+(R7 now drives the real panel: prompt, Shape, Steps, Make image). Instance
+56493188, A40 48 GB, Belgium, 6.3 Gbps, $0.417-0.419/hr, same bundle
+`instance-v0.1.7`.
+
+- Ready in **520 s**. The MOSS panel showed, Identity Edit's stayed hidden.
+- 1024² at 8 steps: **29 s cold**, **8 s warm**; 4 steps 7 s; 896×1152 portrait
+  at 8 steps 10 s. All four clean (fox, café scene; signage text garbled).
+  Seeds are random from the panel, so pictures differ from the first run.
+- Stop destroyed the instance; none left. Spend **~$0.126** (credit $8.8925 →
+  $8.7663; late charges may post). Two rentals in all for MOSS: ~$0.40.
+- Not covered: Cancel mid-run, Save from the big view, the A/B against the
+  base model's 50 steps.

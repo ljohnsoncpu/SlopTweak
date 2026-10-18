@@ -621,7 +621,18 @@ async function r7() {
   for (const [tag, prompt, aspect, steps, seed] of shots) {
     const seen = new Set((await mossState()).results.map((r) => r.id));
     const t0 = Date.now();
-    await m.eval(`window.__TAURI_INTERNALS__.invoke('moss_generate', ${JSON.stringify({ prompt, aspect, steps, seed })})`);
+    // Through the panel itself: prompt, shape and steps, then the Make image button.
+    // (The seed isn't settable from the panel, so pictures differ between runs.)
+    await m.eval(`(() => {
+      const set = (id, v) => { const e = document.getElementById(id); e.value = v; e.dispatchEvent(new Event('input')); e.dispatchEvent(new Event('change')); };
+      set('moss-prompt', ${JSON.stringify(prompt)});
+      set('moss-aspect', ${JSON.stringify(aspect)});
+      set('moss-steps', ${JSON.stringify(String(steps))});
+    })()`);
+    await sleep(300);
+    const clicked = await m.eval("(() => { const b = document.getElementById('moss-go'); if (b.disabled) return 'disabled'; b.click(); return 'ok'; })()");
+    check(`${tag}: Make image was enabled`, clicked === "ok");
+    if (clicked !== "ok") break;
     const made = await waitFor(async () => {
       const v = await mossState();
       if (v.phase === "failed") throw new Error(v.message);
