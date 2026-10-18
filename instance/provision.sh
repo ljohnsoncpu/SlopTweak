@@ -36,9 +36,9 @@ COMFY_MOSS_SHA=a639f187a9f6abfecbda9673034f2045148b6d85
 COMFY_MOSS_DIR=/opt/sloptweak/ComfyUI-moss
 COMFY_MOSS_VENV=/opt/sloptweak/comfy-moss-venv
 # Catalog file names of the MOSS-Image entry (must match catalog.json and moss.rs).
-MOSS_BASE_FILE=moss_image_base_bf16.safetensors
-MOSS_TIME_FILE=moss-image-8-step-dmd-time-embedding.safetensors
-MOSS_TIME_DELTA=moss-image-8-step-dmd-time-delta.safetensors
+MOSS_BASE_FILE="moss_image_base_bf16.safetensors"
+MOSS_TIME_FILE="moss-image-8-step-dmd-time-embedding.safetensors"
+MOSS_TIME_DELTA="moss-image-8-step-dmd-time-delta.safetensors"
 CLOUDFLARED_VERSION=2026.9.3
 CLOUDFLARED_SHA256=77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2
 CLOUDFLARED_METRICS=127.0.0.1:20241

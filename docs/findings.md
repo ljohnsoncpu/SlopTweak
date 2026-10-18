@@ -2528,3 +2528,11 @@ little higher). Bundle `instance-v0.1.7` (3d61aee0…bc1e).
   $8.7663; late charges may post). Two rentals in all for MOSS: ~$0.40.
 - Not covered: Cancel mid-run, Save from the big view, the A/B against the
   base model's 50 steps.
+
+- CI follow-up (2026-10-18): shellcheck flagged SC2100 on the unquoted MOSS file
+  names in `provision.sh` (names like `moss-image-8-step-…` read as arithmetic).
+  Quoting them changes the bundle, now **d2f31597…6c6c**; `ASSETS_SHA256` is
+  updated. The published `instance-v0.1.7` holds the earlier bundle (3d61aee0…,
+  the one both live runs used), so it no longer matches the pin: a new dev
+  pre-release (v0.1.8) must be published and `DEV_ASSETS_URL` pointed at it
+  before another live run.
