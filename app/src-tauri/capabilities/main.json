@@ -46,6 +46,15 @@
     "allow-moss-state",
     "allow-moss-generate",
     "allow-moss-cancel",
-    "allow-moss-save-result"
+    "allow-moss-save-result",
+    "allow-train-defaults",
+    "allow-train-audit",
+    "allow-train-pick-dataset",
+    "allow-train-quote",
+    "allow-train-start",
+    "allow-train-status",
+    "allow-train-cancel",
+    "allow-train-dismiss",
+    "allow-train-open-results"
   ]
 }

@@ -13,6 +13,8 @@ use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::train::job::BaseModel;
 use url::Url;
 
 use crate::catalog::{is_civitai_url, validate_file, ModelFile};
@@ -293,6 +295,115 @@ pub async fn resolve_lora(
     Ok(lora)
 }
 
+/// Largest base checkpoint accepted for training (SDXL files are 2-7 GB).
+const MAX_CHECKPOINT_BYTES: u64 = 12_000_000_000;
+
+/// Build a training base model from a `/model-versions/{id}` response: an
+/// SDXL-family checkpoint in .safetensors with an exact size and hash.
+pub fn checkpoint_from_version(v: &Value) -> Result<BaseModel, CivitaiError> {
+    let invalid = |m: &str| CivitaiError::Invalid(m.to_string());
+    let s = |x: &Value, k: &str| x.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let version_id = v
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid("CivitAI sent an unexpected reply."))?;
+    let kind = v
+        .pointer("/model/type")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if kind != "Checkpoint" {
+        let what = if kind.is_empty() { "unknown" } else { kind };
+        return Err(CivitaiError::Invalid(format!(
+            "That link is a {what}, not a checkpoint."
+        )));
+    }
+    let base = s(v, "baseModel");
+    if family(&base) != Some("sdxl") {
+        return Err(CivitaiError::Invalid(format!(
+            "Training supports SDXL-family checkpoints (SDXL, Illustrious, Pony, NoobAI);              that one is {}.",
+            if base.is_empty() { "unknown" } else { &base }
+        )));
+    }
+    let files = v
+        .get("files")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let is_model = |f: &&Value| f.get("type").and_then(Value::as_str) == Some("Model");
+    let file = files
+        .iter()
+        .filter(is_model)
+        .find(|f| f.get("primary").and_then(Value::as_bool) == Some(true))
+        .or_else(|| files.iter().find(is_model))
+        .ok_or_else(|| invalid("That checkpoint has no downloadable file."))?;
+    let name = s(file, "name");
+    let format = file
+        .pointer("/metadata/format")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if format != "SafeTensor" && !name.ends_with(".safetensors") {
+        return Err(invalid(
+            "That checkpoint isn't a .safetensors file, so SlopTweak won't load it.",
+        ));
+    }
+    let sha256 = file
+        .pointer("/hashes/SHA256")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let size = file.get("sizeKB").and_then(Value::as_f64).unwrap_or(0.0) * 1024.0;
+    if !(size >= 1.0 && (size - size.round()).abs() < 0.01) {
+        return Err(invalid("CivitAI didn't give an exact size for that file."));
+    }
+    let bytes = size.round() as u64;
+    if bytes > MAX_CHECKPOINT_BYTES {
+        return Err(invalid("That file is too big to train on."));
+    }
+    let url = s(file, "downloadUrl");
+    let parsed = Url::parse(&url).map_err(|_| invalid("CivitAI sent a bad download link."))?;
+    if !is_civitai_url(&parsed) {
+        return Err(invalid("CivitAI sent a download link on another site."));
+    }
+    let mf = ModelFile {
+        url: url.clone(),
+        filename: clean_filename(&name, version_id),
+        sha256: sha256.clone(),
+        size_bytes: bytes,
+        kind: "main".into(),
+        requires_civitai_token: true,
+        dest: None,
+    };
+    validate_file(&mf)
+        .map_err(|e| CivitaiError::Invalid(format!("That checkpoint can't be used: {e}.")))?;
+    Ok(BaseModel {
+        file: mf.filename,
+        sha256,
+        bytes,
+        url,
+        requires_civitai_token: true,
+    })
+}
+
+/// Resolve a link to a validated training base checkpoint.
+pub async fn resolve_checkpoint(
+    api: &dyn CivitaiApi,
+    link: &str,
+    key: Option<&str>,
+) -> Result<BaseModel, CivitaiError> {
+    let version_id = match parse_link(link)? {
+        LinkRef::Version(v) => v,
+        LinkRef::Model {
+            version_id: Some(v),
+            ..
+        } => v,
+        LinkRef::Model {
+            model_id,
+            version_id: None,
+        } => api.latest_version(model_id, key).await?,
+    };
+    checkpoint_from_version(&api.model_version(version_id, key).await?)
+}
+
 pub struct HttpCivitai {
     http: reqwest::Client,
     base: String,
@@ -547,5 +658,69 @@ mod tests {
         .await
         .unwrap_err();
         assert!(e.to_string().contains("different model"));
+    }
+
+    fn checkpoint_json() -> Value {
+        serde_json::json!({
+            "id": 3407912u64,
+            "modelId": 1261882u64,
+            "name": "V2.0",
+            "baseModel": "Illustrious",
+            "model": {"name": "Banana Splitz XXL", "type": "Checkpoint"},
+            "files": [{
+                "name": "bananaSplitzXXL_v20.safetensors", "type": "Model", "primary": true,
+                "sizeKB": 6775432.8, "metadata": {"format": "SafeTensor"},
+                "hashes": {"SHA256": "C7CB23F8FA165145AE3931541BE8FAB8185CF98B64168C24FD829D1368EFAEAC"},
+                "downloadUrl": "https://civitai.com/api/download/models/3407912?fileId=3299653"
+            }]
+        })
+    }
+
+    #[test]
+    fn a_checkpoint_becomes_a_training_base() {
+        let mut v = checkpoint_json();
+        v["files"][0]["sizeKB"] = serde_json::json!(6_938_043_446.0 / 1024.0);
+        let m = checkpoint_from_version(&v).unwrap();
+        assert_eq!(m.bytes, 6_938_043_446);
+        assert_eq!(
+            m.sha256,
+            "c7cb23f8fa165145ae3931541be8fab8185cf98b64168c24fd829d1368efaeac"
+        );
+        assert!(m.file.ends_with(".safetensors"));
+        assert!(m.requires_civitai_token);
+        assert!(m
+            .url
+            .starts_with("https://civitai.com/api/download/models/"));
+    }
+
+    #[test]
+    fn unsuitable_checkpoints_are_explained() {
+        let bad = |edit: &dyn Fn(&mut Value)| {
+            let mut v = checkpoint_json();
+            v["files"][0]["sizeKB"] = serde_json::json!(6_938_043_446.0 / 1024.0);
+            edit(&mut v);
+            checkpoint_from_version(&v).unwrap_err().to_string()
+        };
+        assert!(bad(&|v| v["model"]["type"] = "LORA".into()).contains("not a checkpoint"));
+        assert!(bad(&|v| v["baseModel"] = "Flux.1 D".into()).contains("SDXL-family"));
+        assert!(bad(&|v| v["baseModel"] = "SD 1.5".into()).contains("SDXL-family"));
+        assert!(bad(&|v| {
+            v["files"][0]["name"] = "m.ckpt".into();
+            v["files"][0]["metadata"]["format"] = "PickleTensor".into();
+        })
+        .contains("safetensors"));
+        assert!(
+            bad(&|v| v["files"][0]["sizeKB"] = serde_json::json!(6_938_043_446.5 / 1024.0))
+                .contains("exact size")
+        );
+        assert!(
+            bad(&|v| v["files"][0]["sizeKB"] = serde_json::json!(20_000_000_000.0 / 1024.0))
+                .contains("too big")
+        );
+        assert!(
+            bad(&|v| v["files"][0]["downloadUrl"] = "https://evil.example/x".into())
+                .contains("another site")
+        );
+        assert!(bad(&|v| v["files"] = serde_json::json!([])).contains("no downloadable"));
     }
 }

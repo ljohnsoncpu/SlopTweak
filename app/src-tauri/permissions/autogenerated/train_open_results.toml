@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-train-open-results"
+description = "Enables the train_open_results command without any pre-configured scope."
+commands.allow = ["train_open_results"]
+
+[[permission]]
+identifier = "deny-train-open-results"
+description = "Denies the train_open_results command without any pre-configured scope."
+commands.deny = ["train_open_results"]

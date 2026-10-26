@@ -18,6 +18,7 @@ mod secrets;
 mod session;
 mod sidecar;
 mod sync;
+mod train;
 mod updater;
 
 use std::path::PathBuf;
@@ -110,6 +111,8 @@ struct AppState {
     default_output_dir: PathBuf,
     ui: Arc<TauriUi>,
     manager: Mutex<Option<Arc<SessionManager>>>,
+    /// LoRA training (the Train tab); built on first use like `manager`.
+    train: Mutex<Option<Arc<train::manager::TrainManager>>>,
     catalog: Mutex<Catalog>,
     civitai: Arc<dyn CivitaiApi>,
     /// Last known Vast credit and when it was read.
@@ -225,6 +228,60 @@ impl AppState {
                 ))
             }
         }
+    }
+
+    /// The training manager, built on first use (it needs the Vast key).
+    fn train_manager(&self) -> Result<Arc<train::manager::TrainManager>, String> {
+        use train::client::{HttpTrain, TunnelTrain};
+        use train::manager::{Deps, RemoteFactory, TrainManager};
+
+        let mut slot = self.train.lock().unwrap();
+        if let Some(m) = slot.as_ref() {
+            return Ok(m.clone());
+        }
+        let (provider, _) = self.provider()?;
+        let remote: RemoteFactory = match self.mode {
+            // Mock mode simulates the GPU side; nothing is rented.
+            Mode::Mock => Arc::new(|_secret, dir, job| {
+                Arc::new(train::sim::SimTrain::new(
+                    dir,
+                    job.total_steps,
+                    job.expected_eval_images,
+                ))
+            }),
+            Mode::Vast => {
+                let provider = provider.clone();
+                Arc::new(move |secret, results_dir, job| {
+                    Arc::new(TunnelTrain {
+                        provider: provider.clone(),
+                        http: HttpTrain::default(),
+                        secret,
+                        results_dir,
+                        job,
+                    })
+                })
+            }
+        };
+        let (secrets, config, default) = (
+            self.secrets.clone(),
+            self.config_dir.clone(),
+            self.default_output_dir.clone(),
+        );
+        let m = TrainManager::new(Deps {
+            provider,
+            civitai_token: Arc::new(move || secrets.get(secrets::CIVITAI_TOKEN).ok().flatten()),
+            results_root: Arc::new(move || output_dir(&config, &default).join("LoRAs")),
+            record_dir: self.data_dir.clone(),
+            machines_dir: self.data_dir.clone(),
+            remote,
+            poll: match self.mode {
+                Mode::Mock => Duration::from_secs(2),
+                Mode::Vast => Duration::from_secs(10),
+            },
+            clock: Arc::new(now_unix),
+        });
+        *slot = Some(m.clone());
+        Ok(m)
     }
 
     /// The session manager, built on first use (it needs the Vast key).
@@ -1065,6 +1122,99 @@ async fn open_output_folder(app: AppHandle, st: State<'_, AppState>) -> Result<(
         .map_err(|e| e.to_string())
 }
 
+/// What the Train tab sends to get a quote.
+#[derive(Debug, serde::Deserialize)]
+struct TrainQuoteArgs {
+    dir: String,
+    settings: train::settings::TrainSettings,
+    /// The dataset's trigger word (first caption tag), for the test prompts.
+    trigger: String,
+    /// A CivitAI link to an SDXL-family checkpoint.
+    base_link: String,
+    max_minutes: u64,
+    max_usd: f64,
+}
+
+#[tauri::command]
+async fn train_pick_dataset(app: AppHandle) -> Result<Option<String>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Pick the folder with your training images and captions")
+        .pick_folder(move |p| {
+            let _ = tx.send(p);
+        });
+    let picked = rx.await.map_err(|e| e.to_string())?;
+    Ok(picked
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+async fn train_quote(
+    st: State<'_, AppState>,
+    args: TrainQuoteArgs,
+) -> Result<train::manager::QuoteView, String> {
+    let key = st.secret(secrets::CIVITAI_TOKEN);
+    let model = civitai::resolve_checkpoint(st.civitai.as_ref(), &args.base_link, key.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+    let prompts = train::commands::preset_prompts(&args.settings, &args.trigger);
+    st.train_manager()?
+        .quote(train::manager::QuoteRequest {
+            dir: args.dir.into(),
+            settings: args.settings,
+            prompts,
+            model,
+            max_minutes: args.max_minutes,
+            max_usd: args.max_usd,
+            max_dph: 1.0,
+        })
+        .await
+}
+
+/// The user pressed Start on a specific quote: that is the approval.
+#[tauri::command]
+async fn train_start(st: State<'_, AppState>, plan_id: String) -> Result<(), String> {
+    st.train_manager()?.start(&plan_id)
+}
+
+#[tauri::command]
+async fn train_status(st: State<'_, AppState>) -> Result<train::manager::Status, String> {
+    let m = st.train.lock().unwrap().clone();
+    Ok(m.map_or_else(train::manager::Status::idle, |m| m.status()))
+}
+
+#[tauri::command]
+async fn train_cancel(st: State<'_, AppState>) -> Result<(), String> {
+    if let Some(m) = st.train.lock().unwrap().clone() {
+        m.cancel();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn train_dismiss(st: State<'_, AppState>) -> Result<(), String> {
+    if let Some(m) = st.train.lock().unwrap().clone() {
+        m.dismiss();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn train_open_results(app: AppHandle, st: State<'_, AppState>) -> Result<(), String> {
+    let dir = st
+        .train
+        .lock()
+        .unwrap()
+        .clone()
+        .and_then(|m| m.results_dir())
+        .ok_or("There are no results to show.")?;
+    app.opener()
+        .open_path(dir.to_string_lossy(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 /// Where the tutorial overlay starts. First sessions get it on their own
 /// until it's finished or skipped; it resumes at the saved stage.
 fn tutorial_start(settings: &Settings, catalog: &Catalog) -> TutorialStart {
@@ -1607,6 +1757,7 @@ pub fn run() {
                 Mode::Mock => data_dir.join("output"),
             };
             app.manage(AppState {
+                train: Mutex::new(None),
                 mode,
                 secrets,
                 catalog: Mutex::new(catalog::load_local(&data_dir)),
@@ -1710,6 +1861,15 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            train::commands::train_defaults,
+            train::commands::train_audit,
+            train_pick_dataset,
+            train_quote,
+            train_start,
+            train_status,
+            train_cancel,
+            train_dismiss,
+            train_open_results,
             identity_state,
             identity_pick_ref,
             identity_clear_ref,

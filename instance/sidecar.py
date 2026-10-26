@@ -10,6 +10,8 @@ Sits between the cloudflared tunnel and the backend app (InvokeAI or ComfyUI):
 * Reverse proxy (HTTP + websockets) to the backend on loopback: Invoke on
   127.0.0.1:9090 or ComfyUI on 127.0.0.1:8188, chosen by ``BACKEND``.
 * ``POST /__heartbeat`` and ``GET /__status`` for the launcher.
+* ``BACKEND=train`` has no upstream app: the sidecar serves ``/__train/*`` itself
+  (upload a job, start, state, logs, verified result files) to the launcher only.
 * Watchdog: destroys this instance through the Vast API using the instance-scoped
   ``CONTAINER_API_KEY`` on heartbeat loss, idle, or max session length.
 
@@ -49,6 +51,7 @@ Destroyer = Callable[[str], Coroutine[Any, Any, bool]]
 BACKENDS = {
     "invoke": "http://127.0.0.1:9090",
     "comfyui": "http://127.0.0.1:8188",
+    "train": "",  # served by the sidecar itself
 }
 
 SESSION_COOKIE = "st_session"
@@ -71,6 +74,13 @@ HOP_HEADERS = frozenset(
 # Request methods that don't count as user activity for the idle timer.
 PASSIVE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
+# Training backend: what the launcher may upload and read.
+TRAIN_UPLOADS = frozenset({"job.json", "dataset.tar"})
+TRAIN_UPLOAD_MAX_BYTES = 512 * 1024 * 1024
+TRAIN_LOGS = frozenset({"train", "evaluate-0", "bootstrap-packages"})
+TRAIN_LOG_TAIL_BYTES = 16 * 1024
+TRAIN_ACTIVE_STAGES = frozenset({"bootstrap", "prepare", "train", "evaluate"})
+
 
 def sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
@@ -89,6 +99,7 @@ class Config:
     container_api_key: str = ""
     vast_api_base: str = "https://console.vast.ai/api/v0"
     watchdog_interval_s: float = 15.0
+    train_work: Path = Path("/opt/sloptweak/train")
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Config:
@@ -109,6 +120,7 @@ class Config:
             status_file=Path(env.get("SLOPTWEAK_STATUS_FILE", "/run/sloptweak/status.json")),
             container_id=env.get("CONTAINER_ID", ""),
             container_api_key=env.get("CONTAINER_API_KEY", ""),
+            train_work=Path(env.get("TRAIN_WORK", "/opt/sloptweak/train")),
         )
 
 
@@ -251,6 +263,8 @@ class Sidecar:
         return data if isinstance(data, dict) else {"stage": "booting"}
 
     async def _queue_busy(self) -> bool:
+        if self.cfg.backend == "train":
+            return self.train_state().get("stage") in TRAIN_ACTIVE_STAGES
         assert self._http is not None
         comfy = self.cfg.backend == "comfyui"
         path = "/queue" if comfy else "/api/v1/queue/default/status"
@@ -332,7 +346,121 @@ class Sidecar:
             "deadlines": self.watchdog.deadlines(),
         }
 
+    # ----- training backend (bearer only) ------------------------------------
+
+    def _train_guard(self, request: web.Request) -> web.Response | None:
+        if self.cfg.backend != "train":
+            return web.Response(status=404, text="not found")
+        if not self.auth.check_bearer(request.headers.get("Authorization")):
+            return web.Response(status=401, text="unauthorized")
+        return None
+
+    def train_state(self) -> dict[str, Any]:
+        try:
+            data = json.loads((self.cfg.train_work / "state.json").read_text())
+        except (OSError, ValueError):
+            return {"stage": "waiting"}
+        return data if isinstance(data, dict) else {"stage": "waiting"}
+
+    def _train_manifest(self) -> dict[str, dict[str, Any]]:
+        try:
+            raw = json.loads((self.cfg.train_work / "manifest.json").read_text())
+            return {str(f["path"]): f for f in raw["files"]}
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}
+
+    async def handle_train_state(self, request: web.Request) -> web.Response:
+        if (denied := self._train_guard(request)) is not None:
+            return denied
+        started = (self.cfg.train_work / "incoming" / "start").exists()
+        return web.json_response({**self.train_state(), "started": started})
+
+    async def handle_train_manifest(self, request: web.Request) -> web.Response:
+        if (denied := self._train_guard(request)) is not None:
+            return denied
+        return web.json_response({"files": list(self._train_manifest().values())})
+
+    async def handle_train_log(self, request: web.Request) -> web.Response:
+        if (denied := self._train_guard(request)) is not None:
+            return denied
+        name = request.query.get("name", "train")
+        if name not in TRAIN_LOGS:
+            return web.Response(status=400, text="unknown log")
+        path = self.cfg.train_work / "runtime" / "logs" / f"{name}.log"
+        try:
+            with path.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - TRAIN_LOG_TAIL_BYTES))
+                body = f.read()
+        except OSError:
+            body = b""
+        return web.Response(body=body, content_type="text/plain", charset="utf-8")
+
+    async def handle_train_upload(self, request: web.Request) -> web.Response:
+        if (denied := self._train_guard(request)) is not None:
+            return denied
+        name = request.match_info["name"]
+        incoming = self.cfg.train_work / "incoming"
+        if name not in TRAIN_UPLOADS:
+            return web.Response(status=404, text="unknown upload")
+        if (incoming / "start").exists():
+            return web.Response(status=409, text="the run has already started")
+        expected = request.headers.get("X-Sha256", "").lower()
+        if len(expected) != 64:
+            return web.Response(status=400, text="X-Sha256 header required")
+        incoming.mkdir(parents=True, exist_ok=True)
+        part = incoming / f"{name}.part"
+        digest = hashlib.sha256()
+        size = 0
+        with part.open("wb") as out:
+            async for chunk in request.content.iter_chunked(1024 * 1024):
+                size += len(chunk)
+                if size > TRAIN_UPLOAD_MAX_BYTES:
+                    break
+                digest.update(chunk)
+                out.write(chunk)
+        if size > TRAIN_UPLOAD_MAX_BYTES:
+            part.unlink(missing_ok=True)
+            return web.Response(status=413, text="upload too large")
+        if digest.hexdigest() != expected:
+            part.unlink(missing_ok=True)
+            return web.Response(status=422, text="checksum mismatch")
+        part.replace(incoming / name)
+        return web.json_response({"name": name, "bytes": size})
+
+    async def handle_train_start(self, request: web.Request) -> web.Response:
+        if (denied := self._train_guard(request)) is not None:
+            return denied
+        incoming = self.cfg.train_work / "incoming"
+        if not all((incoming / n).is_file() for n in TRAIN_UPLOADS):
+            return web.Response(status=409, text="upload job.json and dataset.tar first")
+        (incoming / "start").write_text("go")
+        return web.json_response({"started": True})
+
+    async def handle_train_cancel(self, request: web.Request) -> web.Response:
+        if (denied := self._train_guard(request)) is not None:
+            return denied
+        incoming = self.cfg.train_work / "incoming"
+        incoming.mkdir(parents=True, exist_ok=True)
+        (incoming / "cancel").write_text("stop")
+        return web.json_response({"cancelling": True})
+
+    async def handle_train_file(self, request: web.Request) -> web.StreamResponse:
+        if (denied := self._train_guard(request)) is not None:
+            return denied
+        # Only manifest entries are served, never a caller-chosen path.
+        entry = self._train_manifest().get(request.query.get("path", ""))
+        if entry is None:
+            return web.Response(status=404, text="no such result file")
+        runtime = (self.cfg.train_work / "runtime").resolve()
+        path = (runtime / str(entry["path"])).resolve()
+        if not path.is_relative_to(runtime) or not path.is_file():
+            return web.Response(status=404, text="no such result file")
+        return web.FileResponse(path, headers={"X-Sha256": str(entry["sha256"])})
+
     async def handle_proxy(self, request: web.Request) -> web.StreamResponse:
+        if self.cfg.backend == "train":
+            return web.Response(status=404, text="not found")
         via_session = self.auth.check_session(request.cookies.get(SESSION_COOKIE))
         via_bearer = not via_session and self.auth.check_bearer(
             request.headers.get("Authorization")
@@ -447,6 +575,13 @@ class Sidecar:
         app.router.add_get("/__auth", self.handle_auth)
         app.router.add_post("/__heartbeat", self.handle_heartbeat)
         app.router.add_get("/__status", self.handle_status)
+        app.router.add_get("/__train/state", self.handle_train_state)
+        app.router.add_get("/__train/manifest", self.handle_train_manifest)
+        app.router.add_get("/__train/log", self.handle_train_log)
+        app.router.add_get("/__train/file", self.handle_train_file)
+        app.router.add_put("/__train/upload/{name}", self.handle_train_upload)
+        app.router.add_post("/__train/start", self.handle_train_start)
+        app.router.add_post("/__train/cancel", self.handle_train_cancel)
         app.router.add_route("*", "/{tail:.*}", self.handle_proxy)
 
         async def lifecycle(_: web.Application) -> Any:

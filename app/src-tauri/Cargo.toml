@@ -33,6 +33,7 @@ tauri-plugin-dialog = "2.7"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tauri-plugin-updater = "2.12"
 tauri-plugin-clipboard-manager = "2.3"
+tar = { version = "0.4", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
@@ -40,3 +41,4 @@ winreg = "0.55"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
 tempfile = "3"
+toml = "0.8"

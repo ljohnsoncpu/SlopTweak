@@ -44,6 +44,15 @@ fn main() {
             "moss_generate",
             "moss_cancel",
             "moss_save_result",
+            "train_defaults",
+            "train_audit",
+            "train_pick_dataset",
+            "train_quote",
+            "train_start",
+            "train_status",
+            "train_cancel",
+            "train_dismiss",
+            "train_open_results",
         ]),
     ))
     .expect("tauri build");

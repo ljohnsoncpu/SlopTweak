@@ -1,7 +1,7 @@
 """Build the instance asset bundle reproducibly and print its SHA-256.
 
 The bundle (provision.sh, sidecar.py, model_defaults.py, moss_time_delta.py,
-moss_workflow.py, requirements.txt)
+moss_workflow.py, requirements.txt, train_runner.py and its lock files)
 is what onstart downloads and verifies. Same inputs always give the same bytes, so the
 pinned hash is stable.
 """
@@ -24,6 +24,10 @@ FILES = {
     "moss_time_delta.py": 0o644,
     "moss_workflow.py": 0o644,
     "requirements.txt": 0o644,
+    "train_runner.py": 0o644,
+    "train_requirements.lock": 0o644,
+    "train_bootstrap.lock": 0o644,
+    "train_tokenizers.json": 0o644,
 }
 ONSTART_LIMIT = 4048
 CONFIG_RS = HERE.parent / "app" / "src-tauri" / "src" / "config.rs"

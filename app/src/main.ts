@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { mountTrain } from "./train";
 
 // ----- types mirrored from src-tauri/src (session.rs, lib.rs, cost.rs) --------
 
@@ -204,6 +205,7 @@ function shot(name: string, alt: string): HTMLElement | null {
 const ui = {
   mode: el("mode"),
   costbar: el("costbar"),
+  navTrain: el<HTMLButtonElement>("nav-train"),
   navSettings: el<HTMLButtonElement>("nav-settings"),
   navHome: el<HTMLButtonElement>("nav-home"),
   wizard: el("view-wizard"),
@@ -307,7 +309,8 @@ let cost: CostBar | null = null;
 let sync: SyncReport | null = null;
 let credit: number | null = null;
 let estimate: Estimate | null = null;
-let view: "wizard" | "home" | "settings" = "home";
+let view: "wizard" | "home" | "settings" | "train" = "home";
+const train = mountTrain(el("view-train"));
 let update: UpdateInfo | null = null;
 let updateDismissed = false;
 /** An update is downloading/installing; the app will exit, so no new session. */
@@ -349,7 +352,10 @@ function showView(v: typeof view): void {
   ui.home.hidden = v !== "home";
   ui.settings.hidden = v !== "settings";
   ui.navSettings.hidden = v !== "home";
-  ui.navHome.hidden = v !== "settings";
+  ui.navTrain.hidden = v !== "home";
+  ui.navHome.hidden = v !== "settings" && v !== "train";
+  if (v === "train") train.show();
+  else train.hide();
   if (v === "wizard") renderWizard();
   if (v === "settings") renderSettings();
   if (v === "home") {
@@ -1048,6 +1054,7 @@ async function load(): Promise<void> {
 }
 
 ui.navSettings.onclick = () => showView("settings");
+ui.navTrain.onclick = () => showView("train");
 ui.navHome.onclick = () => showView("home");
 ui.rerunWizard.onclick = () => {
   wizardStep = 0;

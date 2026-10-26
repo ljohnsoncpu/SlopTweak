@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Train tab preview</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <header class="bar"><span class="brand">SlopTweak</span><span class="badge">PREVIEW (stubbed backend)</span></header>
+    <main><div id="view-train" class="view"></div></main>
+    <script type="module">
+      // Dev-only: stands in for the Rust commands so the Train tab can be seen
+      // and clicked without the Tauri shell. Mirrors the shapes in train/*.rs.
+      let t0 = null;
+      let cancelled = false;
+      const plan = { images: 23, total_steps: 920, warmup_steps: 46, checkpoint_steps: [230, 460, 690, 920], eval_images: 312 };
+      const rows = Array.from({ length: 23 }, (_, i) => ({ id: `thalia_miletus_${i}`, width: 1033, height: 1522, first_tag: "thalia_miletus", tags: 17 }));
+      const stub = {
+        train_defaults: () => ({ settings: { output_name: "lora", rank: 16, alpha: 16, learning_rate: 0.0001, epochs: 40, repeats: 1, warmup_fraction: 0.05, resolution: 1024, save_points: 4, seed: 1, keep_tokens: 1, eval_strengths: [0.5, 0.75, 1], eval_seeds: [1, 2], eval_preset: "quick" }, prompts: [] }),
+        train_pick_dataset: () => "C:/Users/user/Documents/datasets/thalia_miletus",
+        train_audit: () => ({ report: { images: rows, issues: [{ severity: "warning", message: "thalia_miletus_9.png is 400x600; the short side is under 512 and will be upscaled." }], buckets: { "832x1216": 23 } }, plan, settings_error: null }),
+        train_quote: () => ({ plan_id: "abc", gpu_name: "RTX 3090", gpu_location: "Spain, ES", hourly: 0.3605, max_minutes: 120, max_usd: 1.5, worst_usd: 0.72, expected_minutes: 38, plan, expires_unix: 0 }),
+        train_start: () => { t0 = Date.now(); cancelled = false; },
+        train_cancel: () => { cancelled = true; },
+        train_dismiss: () => { t0 = null; },
+        train_open_results: () => {},
+        train_status: () => {
+          if (t0 === null) return { state: "idle", message: "" };
+          const s = (Date.now() - t0) / 1000;
+          const base = { gpu_name: "RTX 3090", hourly: 0.3605, elapsed_secs: Math.floor(s), max_minutes: 120, spent_usd: 0.3605 * s / 3600, max_usd: 1.5, instance_id: 57743540, results_dir: "C:/Users/user/Pictures/SlopTweak/LoRAs/thalia-1", total_steps: 920, step: null, eval_done: null, eval_total: 312, synced: false, outcome: null, error: null, destroyed: false };
+          if (cancelled) return { ...base, state: "finished", message: "Stopped. The GPU is destroyed.", outcome: "cancelled", synced: true, destroyed: true };
+          if (s < 4) return { ...base, state: "running", message: "Renting a GPU" };
+          if (s < 8) return { ...base, state: "running", message: "Setting up the GPU" };
+          if (s < 24) return { ...base, state: "running", message: "Training", step: Math.floor((s - 8) * 57) };
+          if (s < 32) return { ...base, state: "running", message: "Making test images", step: 920, eval_done: Math.floor((s - 24) * 39) };
+          return { ...base, state: "finished", message: "Done. The GPU is destroyed.", outcome: "completed", synced: true, destroyed: true, step: 920, eval_done: 312 };
+        },
+      };
+      window.__TAURI_INTERNALS__ = { invoke: async (cmd, args) => { if (!(cmd in stub)) throw new Error("no stub for " + cmd); return stub[cmd](args); }, transformCallback: () => 0 };
+      const { mountTrain } = await import("/src/train.ts");
+      mountTrain(document.getElementById("view-train")).show();
+    </script>
+  </body>
+</html>

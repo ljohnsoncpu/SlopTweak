@@ -2574,3 +2574,73 @@ checks, spend ~$0.295 (credit $8.5041 → $8.2095). Pictures in `.dev/acceptance
   1728×1344, about the same pixel count); Full quality stays at 1024². Switching mode resets
   size, steps and CFG. The Fast workflow written for Open ComfyUI still defaults its latent
   to 1024; change it with the next `instance/` change.
+
+## LoRA trainer (Phase T, 2026-10-26)
+
+Verified from the Codex Thalia run (2026-10-25) and while building T1/T2:
+
+- **Reference run:** SDXL U-Net LoRA on Banana Splitz XXL V2.0 (Illustrious),
+  23 images at 1033x1522 (all bucket to 832x1216), rank/alpha 16, AdamW 1e-4,
+  bf16, 920 steps, saves every 230. About 14.5 min of training on a 24 GB
+  RTX 3090 (Spain, $0.36/hr all-in); final average loss 0.0773. Peak ingress
+  was 10 GB because Codex uploaded a prebuilt environment; T2 builds the locked
+  environment on the instance instead.
+- **Trainer pin:** kohya `sd-scripts` commit `11d8cedd0c67b93a10f8b2d75f43554f6f12c794`.
+  GitHub's `codeload` tarball bytes differ from the tarball Codex stored
+  (6,451,624 vs 6,378,644 bytes; 307 vs 308 files), so the pin is the commit
+  plus a digest over file contents and relative paths
+  (`TRAINER_TREE_SHA256` in `train/job.rs`, `tree_digest` in
+  `instance/train_runner.py`): `82c63720...ce6b0`, from codeload on 2026-10-26.
+  The one-file difference with Codex's copy was not investigated.
+- **Locks:** `instance/train_requirements.lock` (1,103 hashes, Python 3.12,
+  torch 2.6.0+cu124) and `train_bootstrap.lock` (uv 0.9.5) are Codex's, copied
+  unchanged. `instance/train_tokenizers.json` pins the two CLIP tokenizer repos
+  by revision and file SHA-256; the runner downloads them (training runs with
+  `HF_HUB_OFFLINE=1`).
+- **Image:** `pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime` by digest
+  `sha256:77f17f84...b0f563dee`. Pulling it is about 3.3 GB.
+- **Bucketing:** kohya builds buckets as, for each width in 512..1536 step 32,
+  the tallest height with area <= res^2, plus the transpose, and picks the
+  nearest aspect ratio. 1033x1522 -> 832x1216. 1536x1024 -> 1248x832.
+- **Blackwell:** the pinned CUDA 12.4 stack excludes it, so train offers are
+  limited to compute capability 800-999 and 23+ GB VRAM (`run::offer_query`).
+- **Not yet verified on a real instance:** the bootstrap (uv, Python 3.12.12,
+  hash-locked install on the pytorch image), the `BACKEND=train` branch of
+  `provision.sh`, and the runner under Linux. All were tested with a simulated
+  executor only; the first real run (Phase T3) is the check.
+
+### First real training run (2026-10-26)
+
+- **Attempt 1** (instance 57823544, RTX 3090, Quebec, $0.218/hr): Vast reported the
+  container `exited` after about 60 s; the app destroyed it (cost about $0.004). Cause
+  unknown: the failure message did not keep the host's `status_msg`, now it does. The
+  same host, offered again, worked on attempt 2, so this looks like a transient host
+  fault rather than a problem with the image, runtype or onstart.
+- **Attempt 2** (instance 57824296, same host): the whole pipeline worked up to the
+  test images. Setup (pytorch image pull, locked environment, tokenizers, trainer,
+  model download and hash check) plus 920 training steps took about 17.5 min;
+  training itself was about 0.95 s/step. Final average loss **0.0774** (Codex's run:
+  0.0773). All five checkpoints (230/460/690/920/final, 85,426,364 bytes each) were
+  downloaded and hash-verified; the instance was destroyed and the app confirmed it.
+  Total cost about $0.066.
+- **Found and fixed:** the test-image stage (`sdxl_gen_img.py`) exited 1 on its first
+  command. The log was not downloadable, so the cause is unconfirmed; the likely cause
+  is a missing `--tokenizer_cache_dir` (Codex passed it; the run is offline). The runner
+  now passes it and lists `logs/*.log` in the manifest so any failure can be read.
+  Also fixed: `loss.csv` repeated each step several times (the progress bar repeats
+  lines); it is now one row per step.
+- **Not yet confirmed:** the test-image stage with the fix, and the full run end to end.
+- **App bug found only by the real app:** new Tauri commands must be listed in
+  `build.rs` and granted in `capabilities/main.json`; the browser preview with a
+  stubbed backend cannot catch this.
+- **Attempt 3** (instance 57827045, same host, bundle `instance-v0.1.11`): **completed end
+  to end.** 920 steps, final loss 0.0775, 208 test images (13 sets of 16) including the
+  base-model control, all checkpoints and images hash-verified on download, logs
+  downloaded, GPU destroyed and confirmed. 50 min wall time and about $0.183 total
+  (setup and training about 18 min, the 208 test images the rest). This confirms the
+  `--tokenizer_cache_dir` fix. First spot-checked image (920 steps, strength 1.0) shows
+  the character (grey tiger, blue-streaked black hair, yellow eyes).
+- **Done (user request, 2026-10-26):** the Train tab now has a Quick test-image preset
+  (default: 6 prompts, 1 seed, the base plus the final checkpoint at 1.0 = 12 images)
+  and a Thorough one (the full grid, 208 images at 8 prompts). The Quick path is covered
+  by tests only; it has not run on a GPU yet (needs bundle `instance-v0.1.12`).
