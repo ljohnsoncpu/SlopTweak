@@ -12,6 +12,7 @@ use tokio::time::Instant;
 
 use super::commands::{self, Plan};
 use super::dataset;
+use super::diag::{self, StageView};
 use super::job::{self, BaseModel, JobBundle};
 use super::run::{
     destroy_all, offer_query, Approval, Limits, Live, Outcome, Phase, Plan as RunPlan, Progress,
@@ -96,6 +97,10 @@ struct Active {
     view: QuoteView,
     total_steps: u32,
     eval_images: usize,
+    /// What was done about the machine once the run ended.
+    host_note: Arc<Mutex<Option<String>>>,
+    /// Where the failure report was saved, if one was.
+    diagnostics: Arc<Mutex<Option<String>>>,
 }
 
 /// A snapshot for the UI.
@@ -129,6 +134,18 @@ pub struct Status {
     pub setup_detail: Option<String>,
     pub setup_log: Option<String>,
     pub setup_quiet_secs: Option<u64>,
+    /// When each stage began and how long it took.
+    pub stages: Vec<StageView>,
+    /// What Vast said while starting the machine, with run-relative times.
+    pub host_status: Vec<String>,
+    /// The end of the container's own output, fetched from Vast.
+    pub container_log: Option<String>,
+    /// How fresh that is, or why it isn't there.
+    pub container_log_note: Option<String>,
+    /// What was done about the machine once the run ended.
+    pub host_note: Option<String>,
+    /// Where the failure report was saved.
+    pub diagnostics_path: Option<String>,
 }
 
 impl Status {
@@ -155,6 +172,12 @@ impl Status {
             setup_detail: None,
             setup_log: None,
             setup_quiet_secs: None,
+            stages: Vec::new(),
+            host_status: Vec::new(),
+            container_log: None,
+            container_log_note: None,
+            host_note: None,
+            diagnostics_path: None,
         }
     }
 }
@@ -403,6 +426,9 @@ impl TrainManager {
 
         let secret = crate::session::new_launch_secret();
         let hash = crate::session::sha256_hex(&secret);
+        // Everything fetched from the instance is masked against these.
+        let mut secrets = vec![secret.clone()];
+        secrets.extend((self.deps.civitai_token)());
         let label = attempt_label(&crate::session::new_nonce());
         let spec = job::launch_spec(
             &label,
@@ -419,7 +445,13 @@ impl TrainManager {
 
         let live = Arc::new(Mutex::new(Live::default()));
         let seen_live = live.clone();
+        let results_for_report = results_dir.clone();
         let machine = pending.offer.machine_id;
+        let gpu = pending.view.gpu_name.clone();
+        let host_note = Arc::new(Mutex::new(None));
+        let diagnostics = Arc::new(Mutex::new(None));
+        let (note_slot, diag_slot) = (host_note.clone(), diagnostics.clone());
+        let known = secrets.clone();
         let machines = MachineFile::new(&self.deps.machines_dir);
         let clock = self.deps.clock.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -432,6 +464,7 @@ impl TrainManager {
             clock: self.deps.clock.clone(),
             poll: self.deps.poll,
             cancel: cancel.clone(),
+            secrets,
         };
         let plan = RunPlan {
             offer: pending.offer.clone(),
@@ -452,6 +485,8 @@ impl TrainManager {
             view: pending.view.clone(),
             total_steps: pending.bundle.total_steps,
             eval_images: pending.bundle.expected_eval_images,
+            host_note,
+            diagnostics,
         });
         *self.active.lock().unwrap() = Some(active);
 
@@ -473,15 +508,58 @@ impl TrainManager {
                 },
             };
             // Remember how this host did: one that never got the run going is
-            // skipped by later quotes; one that finished is preferred.
-            if let Some(m) = machine {
-                let never_started =
-                    matches!(seen_live.lock().unwrap().progress, Progress::Starting);
-                let now = clock();
-                if let Some(ok) =
-                    host_verdict(&result.outcome, never_started, now.saturating_sub(stamp))
-                {
-                    let _ = machines.record(m, ok, now);
+            // skipped by later quotes; one that finished is preferred. Say
+            // what was decided, either way.
+            let now = clock();
+            let ran_secs = now.saturating_sub(stamp);
+            let never_started = matches!(seen_live.lock().unwrap().progress, Progress::Starting);
+            // No instance means the host was never involved (the offer was taken
+            // or the rental was refused): that says nothing about the machine.
+            let created = result.record.instance_id.is_some();
+            let verdict = created
+                .then(|| host_verdict(&result.outcome, never_started, ran_secs))
+                .flatten();
+            let mut saved = Ok(());
+            if let (Some(m), Some(ok)) = (machine, verdict) {
+                let reason = blame_reason(&result.outcome, ran_secs);
+                saved = machines.record_with(m, ok, now, Some(&gpu), Some(&reason));
+            }
+            let note = host_feedback(
+                machine,
+                &gpu,
+                verdict,
+                created,
+                never_started,
+                ran_secs,
+                saved.err().map(|e| e.to_string()),
+            );
+            *note_slot.lock().unwrap() = Some(note.clone());
+            if let Ok(mut live) = seen_live.lock() {
+                live.stages.push(super::run::Timed {
+                    at_unix: now,
+                    text: diag::END_MARK.into(),
+                });
+            }
+            if result.outcome != Outcome::Completed {
+                let live = seen_live.lock().unwrap().clone();
+                let known: Vec<&str> = known.iter().map(String::as_str).collect();
+                let text = diag::render(
+                    &diag::Report {
+                        label: &result.record.label,
+                        instance_id: result.record.instance_id,
+                        machine_id: machine,
+                        gpu: &gpu,
+                        result: &outcome_text(&result.outcome),
+                        run_start: stamp,
+                        ended: now,
+                        host_note: &note,
+                        live: &live,
+                    },
+                    &known,
+                );
+                match diag::write(&results_for_report, &text) {
+                    Ok(p) => *diag_slot.lock().unwrap() = Some(p.display().to_string()),
+                    Err(e) => log::warn!("could not save the training diagnostics: {e}"),
                 }
             }
             *done.lock().unwrap() = Some(result);
@@ -551,6 +629,34 @@ impl TrainManager {
                 s.setup_quiet_secs = live.setup_quiet_since.map(|q| self.now().saturating_sub(q));
             }
         }
+        let now = self.now();
+        s.stages = diag::stage_views(&live.stages, a.started_unix, now);
+        s.host_status = live
+            .host_status
+            .iter()
+            .rev()
+            .take(40)
+            .rev()
+            .map(|h| {
+                format!(
+                    "{}  {}",
+                    diag::offset(h.at_unix.saturating_sub(a.started_unix)),
+                    h.text
+                )
+            })
+            .collect();
+        s.container_log = Some(live.container_log.trim().to_string()).filter(|t| !t.is_empty());
+        s.container_log_note = match (&live.container_log_error, live.container_log_unix) {
+            (Some(e), _) => Some(format!("Couldn't fetch the machine's log: {e}")),
+            (None, Some(u)) => Some(format!(
+                "Machine log, refreshed {}s ago (about every 15 s while the GPU exists)",
+                now.saturating_sub(u)
+            )),
+            (None, None) => Some("The machine log isn't available yet.".into()),
+        }
+        .filter(|_| result.is_none() || s.container_log.is_some());
+        s.host_note = a.host_note.lock().unwrap().clone();
+        s.diagnostics_path = a.diagnostics.lock().unwrap().clone();
         s.message = message(&live.progress, rec.map(|r| r.phase), result.as_ref());
         if let Some(r) = &result {
             let (outcome, error) = match &r.outcome {
@@ -589,6 +695,69 @@ fn host_verdict(outcome: &Outcome, never_started: bool, ran_secs: u64) -> Option
         }
         _ => None,
     }
+}
+
+/// Why a machine was blamed, for the Settings list.
+fn blame_reason(outcome: &Outcome, ran_secs: u64) -> String {
+    match outcome {
+        Outcome::Failed(why) => why.clone(),
+        _ => format!(
+            "Setup hadn't finished after {} min and the run was stopped",
+            ran_secs / 60
+        ),
+    }
+}
+
+fn outcome_text(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Completed => "Completed".into(),
+        Outcome::Failed(e) => format!("Failed: {e}"),
+        Outcome::DeadlineHit => "Stopped at the time limit".into(),
+        Outcome::Cancelled => "Stopped by you".into(),
+    }
+}
+
+/// Tell the user what a run's end did to the machine's record.
+fn host_feedback(
+    machine: Option<u64>,
+    gpu: &str,
+    verdict: Option<bool>,
+    created: bool,
+    never_started: bool,
+    ran_secs: u64,
+    save_error: Option<String>,
+) -> String {
+    let Some(m) = machine else {
+        return "Vast didn't say which physical machine this was, so it can't be remembered \
+                or skipped later."
+            .into();
+    };
+    let who = format!("Machine {m} ({gpu})");
+    let mut text = match verdict {
+        Some(true) => {
+            format!("{who} worked. It will be preferred next time when it costs about the same.")
+        }
+        Some(false) => format!(
+            "{who} is marked bad and won't be offered for {} days. \
+             You can undo this in Settings, under GPU machines.",
+            crate::provider::machines::AVOID_FOR_S / 86_400
+        ),
+        None if !created => format!("No GPU was created, so {who} was not marked either way."),
+        None if never_started => format!(
+            "{who} was not marked bad: the run was stopped after {} min of setup, \
+             under the {} min needed to blame a machine.",
+            ran_secs / 60,
+            STUCK_SETUP_BLAME_SECS / 60
+        ),
+        None => format!(
+            "{who} was not marked: the run ended after training had begun, \
+             which isn't blamed on the host."
+        ),
+    };
+    if let Some(e) = save_error {
+        text.push_str(&format!(" (Couldn't save the machine history: {e})"));
+    }
+    text
 }
 
 fn spent(hourly: f64, elapsed_secs: u64, max_minutes: u64) -> f64 {
@@ -825,6 +994,8 @@ mod tests {
         let s = finish(&r.mgr).await;
         assert_eq!(s.outcome.as_deref(), Some("completed"));
         assert!(s.synced && s.destroyed);
+        assert!(s.host_note.as_deref().is_some_and(|n| n.contains("worked")));
+        assert!(s.diagnostics_path.is_none(), "a good run needs no report");
         assert_eq!(s.gpu_name.as_deref(), Some("RTX A6000"));
         assert!(s.message.contains("destroyed"), "{}", s.message);
         assert!(r.provider.live_ids().is_empty());
@@ -936,6 +1107,76 @@ mod tests {
         r.mgr.dismiss();
         let e = r.mgr.quote(request(&r)).await.unwrap_err();
         assert!(e.contains("No suitable GPU"), "{e}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_host_marked_bad_is_reported_and_the_failure_is_saved() {
+        let r = rig(vec![Progress::Starting]);
+        let q = r.mgr.quote(request(&r)).await.unwrap();
+        r.mgr.start(&q.plan_id).unwrap();
+        tokio::time::sleep(Duration::from_secs(STUCK_SETUP_BLAME_SECS + 30)).await;
+        r.mgr.cancel();
+        let s = finish(&r.mgr).await;
+        let note = s
+            .host_note
+            .expect("the user is told what happened to the host");
+        assert!(note.contains("marked bad"), "{note}");
+        assert!(note.contains("RTX A6000"), "{note}");
+        // The stages and the machine log survive the run, and a report is saved.
+        assert!(s.stages.iter().any(|st| st.name == "Renting the GPU"));
+        assert!(s.container_log.is_some());
+        let path = s
+            .diagnostics_path
+            .expect("a failed run keeps its diagnostics");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("Stopped by you") && text.contains("Stages"),
+            "{text}"
+        );
+        // The Settings list shows the machine, with the GPU and why.
+        let rows = MachineFile::new(&r.out.path().join("data"))
+            .load()
+            .rows(r.mgr.now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "avoided");
+        assert_eq!(rows[0].gpu.as_deref(), Some("RTX A6000"));
+        assert!(rows[0].reason.is_some());
+        // Forgetting it makes the machine eligible again.
+        assert!(MachineFile::new(&r.out.path().join("data"))
+            .forget(rows[0].id)
+            .unwrap());
+        r.mgr.dismiss();
+        assert!(r.mgr.quote(request(&r)).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_offer_taken_before_the_rental_does_not_blame_the_machine() {
+        use crate::provider::mock::MockBehavior;
+        let r = rig_with(vec![Progress::Starting], vec![MockBehavior::Unavailable]);
+        let q = r.mgr.quote(request(&r)).await.unwrap();
+        r.mgr.start(&q.plan_id).unwrap();
+        let s = finish(&r.mgr).await;
+        assert_eq!(s.outcome.as_deref(), Some("failed"));
+        let note = s.host_note.unwrap();
+        assert!(note.contains("No GPU was created"), "{note}");
+        assert!(MachineFile::new(&r.out.path().join("data"))
+            .load()
+            .rows(0)
+            .is_empty());
+        r.mgr.dismiss();
+        assert!(r.mgr.quote(request(&r)).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quick_stop_says_why_the_host_was_not_blamed() {
+        let r = rig(vec![Progress::Starting]);
+        let q = r.mgr.quote(request(&r)).await.unwrap();
+        r.mgr.start(&q.plan_id).unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        r.mgr.cancel();
+        let s = finish(&r.mgr).await;
+        let note = s.host_note.unwrap();
+        assert!(note.contains("not marked bad"), "{note}");
     }
 
     #[tokio::test(start_paused = true)]

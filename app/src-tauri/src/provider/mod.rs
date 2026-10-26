@@ -137,7 +137,7 @@ pub const MAX_STALL: Duration = Duration::from_secs(5 * 60);
 pub const MAX_STALL_PULLING: Duration = Duration::from_secs(10 * 60);
 
 /// `status_msg` looks like `docker pull` progress.
-fn is_pull_output(msg: &str) -> bool {
+pub fn is_pull_output(msg: &str) -> bool {
     [
         ": Pull complete",
         ": Download complete",
@@ -256,6 +256,12 @@ pub trait GpuProvider: Send + Sync {
     async fn list_instances(&self) -> Result<Vec<InstanceInfo>, ProviderError>;
     /// Succeeds if the instance is already gone.
     async fn destroy(&self, id: u64) -> Result<(), ProviderError>;
+
+    /// The end of the container's own output (`tail` lines), for diagnosing a
+    /// setup that is slow or has failed. Empty if the provider can't say.
+    async fn logs(&self, _id: u64, _tail: u32) -> Result<String, ProviderError> {
+        Ok(String::new())
+    }
 
     /// Where the instance's sidecar can be reached, once published.
     fn sidecar_url(&self, info: &InstanceInfo) -> Option<Url> {

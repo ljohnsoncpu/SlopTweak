@@ -6,6 +6,7 @@
 pub mod client;
 pub mod commands;
 pub mod dataset;
+pub mod diag;
 pub mod job;
 pub mod manager;
 pub mod run;

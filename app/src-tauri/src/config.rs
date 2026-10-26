@@ -19,29 +19,26 @@ pub const IMAGE_COMFY: &str = "vastai/comfy:v0.38.0-cuda-12.9-py312@sha256:5375f
 /// Instance asset bundle (provision.sh, sidecar.py, requirements.txt),
 /// published by the release workflow to this app version's own release. CI
 /// rebuilds the bundle and refuses to release if its hash isn't
-/// [`ASSETS_SHA256`]. Debug builds use [`assets_url`]'s dev default.
-#[cfg_attr(debug_assertions, allow(dead_code))]
+/// [`ASSETS_SHA256`].
 pub const ASSETS_URL: &str = concat!(
     "https://github.com/ljohnsoncpu/SlopTweak/releases/download/v",
     env!("CARGO_PKG_VERSION"),
     "/instance-assets.tar.gz"
 );
 pub const ASSETS_SHA256: &str = "c8604f050a7c20f0945ece81a9b6fa452e31e5bdbae50d5a8270b752c59ab73b";
-/// Debug builds of a version that has no release yet fetch the same bytes
-/// from the `instance-v0.1.9` dev pre-release; `SLOPTWEAK_DEV_ASSETS_URL` overrides it
-/// (the instance still checks [`ASSETS_SHA256`]).
-#[cfg(debug_assertions)]
-const DEV_ASSETS_URL: &str =
-    "https://github.com/ljohnsoncpu/SlopTweak/releases/download/instance-v0.1.9/instance-assets.tar.gz";
-
-/// Where instances fetch the bundle from.
+/// Debug builds fetch the same release as a shipped build: the pinned
+/// [`ASSETS_SHA256`] is the hash of that release's bundle. (A dev pre-release
+/// holds older bytes and fails the hash, so every instance would start no
+/// sidecar and the run would end as "couldn't reach the GPU".)
+/// `SLOPTWEAK_DEV_ASSETS_URL` overrides it; the instance still checks
+/// [`ASSETS_SHA256`], so the override must serve the pinned bytes.
 pub fn assets_url() -> String {
     #[cfg(debug_assertions)]
     {
         std::env::var("SLOPTWEAK_DEV_ASSETS_URL")
             .ok()
             .filter(|u| u.starts_with("https://"))
-            .unwrap_or_else(|| DEV_ASSETS_URL.to_string())
+            .unwrap_or_else(|| ASSETS_URL.to_string())
     }
     #[cfg(not(debug_assertions))]
     {

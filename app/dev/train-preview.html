@@ -28,10 +28,12 @@
         train_status: () => {
           if (t0 === null) return { state: "idle", message: "" };
           const s = (Date.now() - t0) / 1000;
-          const base = { gpu_name: "RTX 3090", hourly: 0.3605, elapsed_secs: Math.floor(s), max_minutes: 120, spent_usd: 0.3605 * s / 3600, max_usd: 1.5, instance_id: 57743540, results_dir: "C:/Users/user/Pictures/SlopTweak/LoRAs/thalia-1", total_steps: 920, step: null, eval_done: null, eval_total: 312, synced: false, outcome: null, error: null, destroyed: false };
-          if (cancelled) return { ...base, state: "finished", message: "Stopped. The GPU is destroyed.", outcome: "cancelled", synced: true, destroyed: true };
-          if (s < 4) return { ...base, state: "running", message: "Renting a GPU" };
-          if (s < 8) return { ...base, state: "running", message: "Setting up the GPU" };
+          const base = { gpu_name: "RTX 3090", hourly: 0.3605, elapsed_secs: Math.floor(s), max_minutes: 120, spent_usd: 0.3605 * s / 3600, max_usd: 1.5, instance_id: 57743540, results_dir: "C:/Users/user/Pictures/SlopTweak/LoRAs/thalia-1", total_steps: 920, step: null, eval_done: null, eval_total: 312, synced: false, outcome: null, error: null, destroyed: false, stages: [], host_status: [], container_log: null, container_log_note: null, host_note: null, diagnostics_path: null };
+          const stages = (names) => names.map(([name, at], i) => ({ name, started_secs: at, secs: Math.floor((names[i + 1]?.[1] ?? s) - at), current: i === names.length - 1 }));
+          const live = { stages: stages([["Renting the GPU", 0], ["Vast is pulling the image and starting the machine", 3], ["Installing the training environment", 6]].filter((x) => x[1] <= s)), host_status: ["+0m03s  abc123: Downloading", "+0m05s  abc123: Pull complete"], container_log: "starting sidecar\nonstart: ok\nuv pip sync: resolving", container_log_note: "Machine log, refreshed 4s ago (about every 15 s while the GPU exists)" };
+          if (cancelled) return { ...base, ...live, host_note: "Machine 12345 (RTX 3090) was not marked bad: the run was stopped after 0 min of setup, under the 10 min needed to blame a machine.", state: "finished", message: "Stopped. The GPU is destroyed.", outcome: "cancelled", synced: true, destroyed: true };
+          if (s < 4) return { ...base, ...live, state: "running", message: "Renting a GPU" };
+          if (s < 8) return { ...base, ...live, state: "running", message: "Setting up the GPU" };
           if (s < 24) return { ...base, state: "running", message: "Training", step: Math.floor((s - 8) * 57) };
           if (s < 32) return { ...base, state: "running", message: "Making test images", step: 920, eval_done: Math.floor((s - 24) * 39) };
           return { ...base, state: "finished", message: "Done. The GPU is destroyed.", outcome: "completed", synced: true, destroyed: true, step: 920, eval_done: 312 };

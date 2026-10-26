@@ -1115,14 +1115,20 @@ impl SessionManager {
             // Remember how this machine did (not for our own problems, like a
             // bad LoRA or a rejected key, and not for a stop).
             if let Some(m) = best.offer.machine_id {
-                let ok = match &outcome {
-                    Provisioned::Ready(_) => Some(true),
-                    Provisioned::Retry(_) | Provisioned::Gone(_) => Some(false),
-                    Provisioned::Fatal(_) | Provisioned::Stopped => None,
+                let (ok, why) = match &outcome {
+                    Provisioned::Ready(_) => (Some(true), None),
+                    Provisioned::Retry(r) | Provisioned::Gone(r) => (Some(false), Some(r.as_str())),
+                    Provisioned::Fatal(_) | Provisioned::Stopped => (None, None),
                 };
                 if let Some(ok) = ok {
-                    if let Err(e) = self.deps.machines.record(m, ok, now_unix()) {
-                        self.log(format!("couldn't save machine history: {e}"));
+                    let gpu = Some(best.offer.gpu_name.as_str());
+                    match self.deps.machines.record_with(m, ok, now_unix(), gpu, why) {
+                        Ok(()) if ok => self.log(format!("Machine {m} worked; it will be preferred next time.")),
+                        Ok(()) => self.log(format!(
+                            "Machine {m} is marked bad and won't be offered for {} days (Settings, GPU machines).",
+                            crate::provider::machines::AVOID_FOR_S / 86_400
+                        )),
+                        Err(e) => self.log(format!("couldn't save machine history: {e}")),
                     }
                 }
             }

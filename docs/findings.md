@@ -2688,3 +2688,111 @@ Verified from the Codex Thalia run (2026-10-25) and while building T1/T2:
 - Not done: reconnecting to a leftover training GPU to download its results.
   The launch secret isn't stored, and the instance's deadman timer destroys
   it soon after the app stops sending heartbeats.
+
+## Live setup logs, failure reports, machine list (2026-10-26)
+
+- **Found:** the `machines.json` blacklist already existed for training
+  (`ff69405`), but the three or four failed setups the user hit ran before it
+  landed (the file's last write was 11:16, before the trainer's first commit),
+  so they were never recorded. Nothing in the UI said what was marked or why,
+  and nothing fetched Vast's container log, so a failed setup left only the
+  short `status_msg` before its instance was destroyed.
+- **Now (training runs):**
+  - `GpuProvider::logs` calls `PUT /instances/request_logs/{id}/`, then
+    downloads the pre-signed link (https only, never sent the API key, up to 4
+    tries 2 s apart). The runner refreshes it about every 15 s alongside the
+    watch loop, and once more before destroying a failed run.
+  - The runner marks when each stage begins (renting, Vast pulling/starting,
+    reaching the GPU, installing the environment, preparing, training, test
+    images, saving, destroying) and keeps every change of Vast's `status_msg`
+    with its time. The Train tab shows "Where the time is going" and a live
+    machine log (Vast lines, then the container tail).
+  - Anything fetched from the instance is masked against the launch secret and
+    the CivitAI token (plus the shape-based patterns) before it is stored.
+  - A run that doesn't complete writes `diagnostics.txt` (stages with
+    durations, Vast status history, last setup report, container log) into its
+    results folder.
+  - When a run ends the Train tab says what happened to the machine: marked
+    bad (7 days), preferred next time, or not marked and why (for example a
+    stop before the 10 min blame threshold).
+  - Settings has a "GPU machines" list (skipped first, with GPU, reason and
+    date) and an Allow again / Forget button (`machine_list`, `machine_forget`).
+    `machines.json` entries now also keep `gpu` and `reason`; old files load.
+  - Invoke sessions record the GPU and reason too and log the verdict in the
+    details log.
+- 🧪 **Unverified on a real GPU:** the response shape of `request_logs` was
+  recorded earlier (§1) but the poller hasn't run against a live instance. In
+  particular, whether the container log shows anything useful while Vast is
+  still `loading` (before the container exists, only `status_msg` carries
+  image-pull lines), and whether `uv pip sync` output reaches the container
+  log. The sidecar and instance bundle are unchanged, so no new bundle hash.
+- Not done: the Invoke (generation) session path has no live log panel; it only
+  gained the machine feedback line.
+
+## First real run with the live logs (2026-10-26, evening)
+
+Debug build, Thales dataset (24 images, Quick preset), RTX 3090, ~$0.05 spent.
+
+- **Offers vanish between quote and Start.** Two cheap 3090 offers were gone
+  ("that GPU offer is no longer available") 40 s to 10 min after the quote, so
+  nothing was created. The first version of the host feedback wrongly marked
+  those machines bad for 7 days; no instance means no verdict now, and the note
+  says so.
+- **Why "can't reach the GPU" / stuck setups:**
+  - Debug builds fetched `instance-v0.1.9` against the hash pinned for the
+    `v0.3.1` bundle (different bytes: `d081…` vs `c860…`), so every instance
+    would reject the bundle and never start. Fixed (debug builds use the version's
+    own release), and training now runs the same pre-rent bundle check as Invoke.
+  - **The trainer's state says `waiting` for the whole of provisioning,
+    including the base-model download.** `/__train/state` returns
+    `{"stage":"waiting"}` until `train_runner.py` writes `state.json`, and the
+    runner only starts after `provision.sh` has downloaded and verified the model.
+    Provisioning progress lives on `/__status` (`downloading <file>` with a 0-1
+    `progress`, `verifying`, `starting`, `failed`), which training never read. The
+    run sat 8 min in "Waiting for the job to start" with no change and the stall
+    watchdog ended it. Whether that host's download was slow, stuck or failed is
+    unknown (no sidecar-side log reaches the app), but a slow healthy download
+    would have been killed the same way.
+  - Fix: while the trainer says `waiting`, the app reads `/__status` and shows
+    `downloading <file> NN%` as the step (the percentage keeps the stall watchdog
+    honest); `failed` ends the run with the instance's reason.
+- **Vast's `actual_status` stayed `loading` for 3 min** while `status_msg` already
+  said `success, running pytorch/…`. The stage label now follows the pull text,
+  not the word "pulling" for everything.
+- Container log (`request_logs`) works live: it returned Vast's own boot output
+  (apt, sshd) within 15 s of create. It does **not** include `provision.sh`'s
+  `$LOG_DIR` logs or the trainer's, so provisioning detail has to come through
+  the sidecar (`/__status`, `/__train/state`).
+- Not verified: the fix itself on a GPU (a second run is needed), and the Quick
+  preset's first real run (needs the model to finish downloading).
+- Ideas not built: expose the tail of `train-runner.log` and `download.log` from
+  the sidecar (needs a new bundle and hash) so a dead runner or failing download
+  is visible.
+
+### Second real run, after the fix (2026-10-26, 19:21 to 19:42 UTC-4)
+
+RTX 3090 (Quebec, CA), $0.22/hr, machine 32831 (a previously known good host),
+same dataset and Quick preset. **Completed**: 960 steps, 4 checkpoints plus the
+final LoRA, 12 test images (6 base, 6 trained), logs, all hash-verified and
+downloaded (29 files, 421 MB), GPU destroyed and confirmed. Spend about $0.05
+(credit $6.83 to $6.78). This is the Quick preset's first real GPU run.
+
+Where the time went (the stage timeline the app now shows):
+
+| Stage | Time |
+|---|---|
+| Vast starts the machine | 0:56 |
+| Reaching the GPU (tunnel, job upload) | 0:11 |
+| Downloading the base model (6.5 GB) | 1:35 |
+| Checking the downloaded model | 0:21 |
+| Installing the training environment | 0:31 |
+| Training (960 steps) | 14:24 |
+| Test images (12) | 1:55 |
+| Saving results | 0:16 |
+
+Setup to the first training step was 3 min 34 s on this host, not 8+. The
+earlier stuck run (a different host) never left the model download as far as
+the app could tell; the app now reads `/__status`, so a slow download shows as
+`downloading <file> NN%` and a failed one ends the run with its reason.
+The container log (`request_logs`) only ever showed Vast's own boot output; it is
+useful for "did the container start" but not for provisioning detail.
