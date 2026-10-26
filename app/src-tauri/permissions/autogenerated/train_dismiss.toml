@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-train-dismiss"
+description = "Enables the train_dismiss command without any pre-configured scope."
+commands.allow = ["train_dismiss"]
+
+[[permission]]
+identifier = "deny-train-dismiss"
+description = "Denies the train_dismiss command without any pre-configured scope."
+commands.deny = ["train_dismiss"]

@@ -560,3 +560,35 @@ button.link.primary-link {
 #moss-more {
   margin: 8px 0 12px;
 }
+
+/* Train tab */
+#view-train .error {
+  color: var(--danger);
+}
+
+#view-train .form {
+  grid-template-columns: 160px 1fr;
+  margin-top: 8px;
+}
+
+#view-train .form .hint {
+  grid-column: 2;
+  margin-top: -4px;
+}
+
+#view-train .limits {
+  margin-top: 12px;
+}
+
+#view-train .quote {
+  margin-top: 12px;
+  border-color: var(--accent);
+}
+
+#view-train .row .path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

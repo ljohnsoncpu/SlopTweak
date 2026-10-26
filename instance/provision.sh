@@ -5,7 +5,8 @@
 #
 # Env (from the Vast create call):
 #   LAUNCH_TOKEN_HASH   sha256 hex of the launcher's per-session secret (required)
-#   BACKEND             invoke (default) or comfyui: the app behind the sidecar
+#   BACKEND             invoke (default), comfyui, or train: the app behind the sidecar
+#                       (train = LoRA trainer: train_runner.py, no app UI)
 #   MODELS_B64          base64 JSON: [{url, sha256, size_bytes, filename,
 #                                      requires_civitai_token,
 #                                      default_settings?, dest?}] (required).
@@ -89,6 +90,7 @@ export BACKEND
 case "$BACKEND" in
   invoke) MODELS_DIR=/invokeai/sloptweak-models ;;
   comfyui) MODELS_DIR=/opt/sloptweak/models ;;
+  train) MODELS_DIR=/opt/sloptweak/models ;;
   *) fail "unknown BACKEND: $BACKEND" ;;
 esac
 mkdir -p "$MODELS_DIR"
@@ -416,8 +418,23 @@ finish_comfy() {
   [[ "$out" == *"$probe"* ]] || fail "ComfyUI did not start with the expected nodes"
 }
 
+# ---- Trainer (LoRA training; the base model is the one MODELS_B64 entry) -----
+# The runner waits for the launcher to upload the job through the sidecar, then
+# builds its own pinned environment; nothing here touches the image's Python.
+finish_train() {
+  local work=/opt/sloptweak/train
+  mkdir -p "$work/incoming"
+  status starting "starting the trainer"
+  (
+    export TRAIN_WORK="$work" TRAIN_MODELS_DIR="$MODELS_DIR"
+    nohup setsid python3 "$ASSET_DIR/train_runner.py" >"$LOG_DIR/train-runner.log" 2>&1 </dev/null &
+  )
+}
+
 if [[ "$BACKEND" == comfyui ]]; then
   finish_comfy
+elif [[ "$BACKEND" == train ]]; then
+  finish_train
 else
   finish_invoke
 fi

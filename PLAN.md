@@ -33,7 +33,8 @@ The user experience, end to end:
   hidden second backend for the Identity Edit panel; the user never sees a
   node graph. See "Backends" under Key decisions.)
 - Persistent Vast volumes (outputs sync locally instead).
-- Training, LoRA management beyond "paste a CivitAI link".
+- LoRA management beyond "paste a CivitAI link". (Training: amended
+  2026-10-26, user decision; see Phase T.)
 
 ### Hard requirements
 - **No surprise bills.** An instance must self-destruct if the launcher
@@ -279,6 +280,36 @@ model using the given values; the fallback path works; every label named
 in the copy matches the pinned Invoke version (checked live).
 
 ---
+
+### Phase T — LoRA trainer (user decision 2026-10-26)
+Goal: replace the hand-driven Codex pipeline (Thalia run, 2026-10-25) with a
+Train tab. Reference run: SDXL U-Net LoRA on Banana Splitz XXL V2.0, 23
+images, rank/alpha 16, AdamW 1e-4, 920 steps, 24 GB RTX 3090, about 15 min.
+Pinned trainer: kohya sd-scripts (commit pinned in the instance bundle).
+Scope v1: SDXL/Illustrious character LoRAs only; other bases become presets.
+- **T1 (done):** `app/src-tauri/src/train/`: settings and kohya config
+  rendering (`settings.rs`), dataset audit and bucket prediction
+  (`dataset.rs`), and the approve, persist, watch, sync, destroy lifecycle
+  against `GpuProvider` with `MockProvider` tests (`run.rs`).
+- **T2 (done; untested on a real instance):** `instance/train_runner.py`
+  (bootstrap, prepare, train, evaluate, hash manifest), `/__train/*` sidecar
+  endpoints, a `BACKEND=train` branch in `provision.sh`, the asset bundle and
+  its pin, and in Rust `train/job.rs` (job.json, dataset tar, launch spec),
+  `train/client.rs` (upload, state, verified result download) and
+  `train/commands.rs` (`train_defaults`, `train_audit`). The run manager that
+  starts, watches and cancels a run ships with the UI in T3.
+- **T3 (built; real run pending):** `train/manager.rs` (quote, approve, run,
+  status, cancel; the Start button is the approval of one exact quote that
+  expires in 10 minutes), `train/sim.rs` (mock-mode stand-in for the GPU),
+  CivitAI checkpoint resolution, Tauri commands, and the Train tab
+  (`app/src/train.ts`). The UI was checked in the browser pane against a
+  stubbed backend (`app/dev/train-preview.html`); the Rust side was tested with
+  `MockProvider`. Acceptance: the third real run (2026-10-26) reproduced Thalia end
+  to end (loss 0.0775 vs 0.0773, 208 test images, about $0.18, GPU destroyed).
+Invariants: nothing is rented without an approval matching the exact offer and
+limits; the record is saved before the create call; results are synced and
+hash-verified before destroy unless under two minutes remain; destroy runs on
+every exit path.
 
 ## 5. Security checklist
 - Vast key and CivitAI key only in Credential Manager; never logged, never in

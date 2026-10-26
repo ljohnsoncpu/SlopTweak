@@ -525,7 +525,7 @@ pub fn new_launch_secret() -> String {
 }
 
 /// Random hex for a per-attempt instance label.
-fn new_nonce() -> String {
+pub(crate) fn new_nonce() -> String {
     let mut bytes = [0u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     hex::encode(bytes)

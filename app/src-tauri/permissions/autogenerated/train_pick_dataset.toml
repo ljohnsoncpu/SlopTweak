@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-train-pick-dataset"
+description = "Enables the train_pick_dataset command without any pre-configured scope."
+commands.allow = ["train_pick_dataset"]
+
+[[permission]]
+identifier = "deny-train-pick-dataset"
+description = "Denies the train_pick_dataset command without any pre-configured scope."
+commands.deny = ["train_pick_dataset"]
