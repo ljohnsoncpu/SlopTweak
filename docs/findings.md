@@ -2644,3 +2644,47 @@ Verified from the Codex Thalia run (2026-10-25) and while building T1/T2:
   (default: 6 prompts, 1 seed, the base plus the final checkpoint at 1.0 = 12 images)
   and a Thorough one (the full grid, 208 images at 8 prompts). The Quick path is covered
   by tests only; it has not run on a GPU yet (needs bundle `instance-v0.1.12`).
+
+## Training setup stalls and bad hosts (2026-10-26)
+
+- **Found:** training runs had no stall check. `Runner::watch` passed a zero
+  `stalled` to `health()`, and once Vast said `running` the sidecar's
+  bootstrap/prepare stages (all `Progress::Starting`) could take forever, up to
+  the user's cap. A user-stopped or limit-hit run recorded nothing against the
+  host, so the same machine could be rented again.
+- **Now:** while the instance reports `Starting`, the app fails the run if the
+  step (`stage`, `detail`) and the total setup-log size are unchanged for
+  8 min, or setup takes over 20 min. A good host needs ~8 min (setup plus
+  training was ~18 min on the first full run). The failure destroys the GPU and
+  records the machine as bad (skipped for 7 days).
+- **Also recorded as bad:** a Stop or time-limit that ends a run that never
+  reached training after 10+ min. Quicker stops don't count.
+- **Sidecar:** `/__train/state` now adds `log_bytes` and `log_tail` (last 1 KiB
+  of the newest `bootstrap-*.log`) during waiting/bootstrap/prepare. The Train
+  tab shows the step, "no change for N min", and the latest output. An older
+  sidecar sends no `log_bytes`; the app then applies only the 20 min cap.
+  New instance bundle needed for the stall check to apply.
+- 🧪 Unverified on a real GPU: whether `uv pip sync` writes anything to its
+  log while downloading torch (non-tty, so probably not). If a healthy host
+  trips the 8 min stall, raise `SETUP_STALL_SECS` in `train/run.rs`.
+
+## Training GPUs and closing the app (2026-10-26)
+
+- **Found:** closing the main window, or installing an update, checked only the
+  session manager (`session_active`). With a training run going, the app exited
+  and the run's task died with it, leaving the GPU billing until the
+  instance's own deadman timer fired. The live training GPU also showed up in
+  the "GPU from an earlier session" list with a Shut-it-down button, and a
+  stale unfinished run record blocked every later run with no way to clear it.
+- **Now:** `gpu_active` (session or training) guards the window close and the
+  update install. The close dialog names what is running; confirming stops the
+  run (it downloads what exists, then destroys the GPU) and waits up to
+  5 min for the destroy to be confirmed, else the app stays open to retry.
+  The running training GPU is not listed as an orphan. A leftover from a killed
+  app is listed as a "Training run" with Shut it down (never destroyed
+  unasked); shutting it down, or finding it already gone, closes the run
+  record so new runs can start. Matching uses the instance id, or the attempt
+  label for a crash during the create call.
+- Not done: reconnecting to a leftover training GPU to download its results.
+  The launch secret isn't stored, and the instance's deadman timer destroys
+  it soon after the app stops sending heartbeats.

@@ -80,6 +80,9 @@ interface Status {
   outcome: "completed" | "failed" | "deadline" | "cancelled" | null;
   error: string | null;
   destroyed: boolean;
+  setup_detail: string | null;
+  setup_log: string | null;
+  setup_quiet_secs: number | null;
 }
 
 const money = (n: number) => `$${n.toFixed(2)}`;
@@ -395,6 +398,23 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
   function renderRun(s: Status): Node {
     const card = h("section", { class: "card" }, h("h2", {}, s.state === "running" ? "Training" : "Run finished"));
     card.append(h("p", { class: "run-message" }, s.message));
+    if (s.setup_detail || s.setup_log) {
+      const quiet = s.setup_quiet_secs ?? 0;
+      card.append(
+        h(
+          "p",
+          { class: quiet >= 180 ? "error small" : "muted small" },
+          [s.setup_detail, quiet >= 60 && `no change for ${Math.floor(quiet / 60)} min`].filter(Boolean).join(" · "),
+        ),
+      );
+      if (s.setup_log) {
+        const d = h("details", {}, h("summary", {}, "Latest setup output"));
+        const pre = h("pre", { class: "small" }, s.setup_log);
+        pre.style.cssText = "white-space:pre-wrap;overflow-wrap:anywhere;max-height:12em;overflow:auto";
+        d.append(pre);
+        card.append(d);
+      }
+    }
     if (s.step !== null && s.total_steps) {
       const training = s.eval_done === null;
       card.append(h("p", { class: "small" }, training ? `Step ${s.step} of ${s.total_steps}` : `Training done (${s.total_steps} steps)`));

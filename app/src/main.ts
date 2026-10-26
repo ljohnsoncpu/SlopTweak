@@ -144,8 +144,15 @@ interface KeyCheck {
   username: string | null;
 }
 
+interface CloseRequest {
+  session: boolean;
+  training: boolean;
+}
+
 interface Orphan {
   instance_id: number;
+  /** Left by a training run. */
+  training: boolean;
   gpu_name: string | null;
   hourly: number | null;
   status: string | null;
@@ -677,7 +684,11 @@ async function refreshOrphans(): Promise<void> {
       h(
         "div",
         { class: "orphan" },
-        h("span", {}, `${o.gpu_name ?? "GPU"} (#${o.instance_id})${price} · ${o.status ?? "unknown"}`),
+        h(
+          "span",
+          {},
+          `${o.training ? "Training run: " : ""}${o.gpu_name ?? "GPU"} (#${o.instance_id})${price} · ${o.status ?? "unknown"}`,
+        ),
         o.can_reattach &&
           h(
             "button",
@@ -1207,10 +1218,36 @@ ui.updateInstall.onclick = async () => {
 ui.modalCancel.onclick = () => {
   ui.modal.hidden = true;
 };
+let closing: CloseRequest = { session: true, training: false };
+
+function describeClose(c: CloseRequest): { title: string; body: string; working: string } {
+  if (c.training && c.session) {
+    return {
+      title: "Stop the GPUs and close?",
+      body:
+        "A training run and a session each have a rented GPU. Closing SlopTweak stops the run (it downloads the checkpoints and test images made so far), saves your last images, then shuts both GPUs down so they stop billing.",
+      working: "Downloading what the training run made and shutting down both GPUs… this can take several minutes.",
+    };
+  }
+  if (c.training) {
+    return {
+      title: "Stop training and close?",
+      body:
+        "A training run is using a rented GPU. Closing SlopTweak stops the run, downloads the checkpoints and test images made so far, then shuts the GPU down so it stops billing. The run can't be resumed.",
+      working: "Downloading what the run made and shutting down the GPU… this can take several minutes.",
+    };
+  }
+  return {
+    title: "Shut down the GPU and close?",
+    body: "Closing SlopTweak saves your last images, then shuts down the rented GPU so it stops billing.",
+    working: "Saving your last images and shutting down the GPU… this can take up to two minutes.",
+  };
+}
+
 ui.modalOk.onclick = async () => {
   ui.modalOk.disabled = true;
   ui.modalCancel.disabled = true;
-  ui.modalMsg.textContent = "Saving your last images and shutting down the GPU… this can take up to two minutes.";
+  ui.modalMsg.textContent = describeClose(closing).working;
   try {
     await invoke("confirm_close");
   } catch (e) {
@@ -1285,7 +1322,11 @@ await listen<number>("update-progress", (e) => {
   ui.updateMsg.textContent =
     e.payload >= 100 ? "Starting the installer…" : `Downloading the update… ${Math.round(e.payload)}%`;
 });
-await listen("close-requested", () => {
+await listen<CloseRequest>("close-requested", (e) => {
+  closing = e.payload;
+  const text = describeClose(closing);
+  el("modal-title").textContent = text.title;
+  el("modal-body").textContent = text.body;
   ui.modalMsg.textContent = "";
   ui.modal.hidden = false;
 });

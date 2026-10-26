@@ -26,6 +26,17 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 20;
 /// How long the instance may take to publish its tunnel and accept the job
 /// (image pull, environment setup) before the run is given up.
 const BEGIN_GRACE_SECS: u64 = 15 * 60;
+/// Setup (environment install, model check) that shows no change at all (same
+/// step, same log size) for this long is stuck. A big wheel download writes
+/// nothing to its log while it runs, so this is deliberately patient.
+const SETUP_STALL_SECS: u64 = 8 * 60;
+/// Longest setup, counted from when the instance first answered. A good host
+/// needs about 8 minutes; the app's own estimate is 12.
+const SETUP_CAP_SECS: u64 = 20 * 60;
+/// A run the user stops (or that hits its limit) before training begins counts
+/// against the host only if it had been going this long: a quick cancel says
+/// nothing about the host.
+pub const STUCK_SETUP_BLAME_SECS: u64 = 10 * 60;
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq)]
 #[error("{0}")]
@@ -176,6 +187,62 @@ pub enum Progress {
     Failed(String),
 }
 
+/// What the instance is doing before the first training step.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SetupNote {
+    pub stage: String,
+    pub detail: Option<String>,
+    /// Total size of the setup logs: grows while something is being written.
+    /// `None` from an older sidecar, in which case a stall can't be judged and
+    /// only the overall cap applies.
+    pub log_bytes: Option<u64>,
+    /// The end of the newest setup log.
+    pub log_tail: String,
+}
+
+/// Watches setup for a stall. `check` is called on every poll while the
+/// instance reports `Progress::Starting`.
+#[derive(Debug, Default)]
+struct SetupWatch {
+    since: Option<u64>,
+    quiet_since: u64,
+    sig: Option<(String, Option<String>, Option<u64>)>,
+}
+
+impl SetupWatch {
+    /// `now` is unix seconds. Returns why setup should be abandoned, if so.
+    fn check(&mut self, now: u64, note: Option<&SetupNote>) -> Option<String> {
+        let since = *self.since.get_or_insert_with(|| {
+            self.quiet_since = now;
+            now
+        });
+        if let Some(n) = note.filter(|n| n.log_bytes.is_some()) {
+            let sig = (n.stage.clone(), n.detail.clone(), n.log_bytes);
+            if self.sig.as_ref() != Some(&sig) {
+                self.sig = Some(sig);
+                self.quiet_since = now;
+            }
+        }
+        let doing = note
+            .and_then(|n| n.detail.as_deref())
+            .map(|d| format!(" (last step: {d})"))
+            .unwrap_or_default();
+        let quiet = now.saturating_sub(self.quiet_since);
+        if self.sig.is_some() && quiet >= SETUP_STALL_SECS {
+            return Some(format!(
+                "Setting up the GPU stopped making progress for {} min{doing}.",
+                quiet / 60
+            ));
+        }
+        (now.saturating_sub(since) >= SETUP_CAP_SECS).then(|| {
+            format!(
+                "Setting up the GPU took longer than {} min{doing}.",
+                SETUP_CAP_SECS / 60
+            )
+        })
+    }
+}
+
 /// The instance side of a run, reached through the sidecar (Phase T2).
 #[async_trait]
 pub trait RemoteTrain: Send + Sync {
@@ -183,6 +250,11 @@ pub trait RemoteTrain: Send + Sync {
     /// reachable; must be safe to repeat after a lost answer.
     async fn begin(&self, instance: u64) -> Result<(), String>;
     async fn progress(&self, instance: u64) -> Result<Progress, String>;
+    /// [`progress`](Self::progress) plus, while the run is still being set
+    /// up, what setup is doing. Backends that can't say leave it `None`.
+    async fn status(&self, instance: u64) -> Result<(Progress, Option<SetupNote>), String> {
+        Ok((self.progress(instance).await?, None))
+    }
     /// Download every result file and verify its hash. `Ok(true)` only when
     /// all of them are verified locally.
     async fn sync(&self, instance: u64) -> Result<bool, String>;
@@ -213,6 +285,10 @@ pub struct Plan {
 pub struct Live {
     pub record: Option<RunRecord>,
     pub progress: Progress,
+    /// What setup is doing now (only while `progress` is `Starting`).
+    pub setup: Option<SetupNote>,
+    /// Unix time setup last changed (a step started or a log grew).
+    pub setup_quiet_since: Option<u64>,
 }
 
 impl Default for Live {
@@ -220,6 +296,8 @@ impl Default for Live {
         Self {
             record: None,
             progress: Progress::Starting,
+            setup: None,
+            setup_quiet_since: None,
         }
     }
 }
@@ -356,12 +434,27 @@ impl Runner {
     }
 
     /// Ask the instance how it is doing and keep the answer for the UI.
-    async fn progress_noted(&self, id: u64) -> Result<Progress, String> {
-        let p = self.remote.progress(id).await?;
+    /// Also feeds setup into `watch`, so a stuck setup ends the run.
+    async fn progress_noted(
+        &self,
+        id: u64,
+        watch: &mut SetupWatch,
+    ) -> Result<(Progress, Option<String>), String> {
+        let (p, note) = self.remote.status(id).await?;
+        let mut stuck = None;
+        if p == Progress::Starting {
+            stuck = watch.check((self.clock)(), note.as_ref());
+        }
         if let Ok(mut live) = self.live.lock() {
             live.progress = p.clone();
+            if p == Progress::Starting {
+                live.setup = note;
+                live.setup_quiet_since = watch.sig.is_some().then_some(watch.quiet_since);
+            } else {
+                live.setup = None;
+            }
         }
-        Ok(p)
+        Ok((p, stuck))
     }
 
     fn elapsed(&self, rec: &RunRecord) -> u64 {
@@ -374,6 +467,7 @@ impl Runner {
         let mut provider_errors = 0;
         let mut remote_errors = 0;
         let mut begun = false;
+        let mut setup = SetupWatch::default();
         loop {
             if self.cancel.load(Ordering::SeqCst) {
                 return (Outcome::Cancelled, ran);
@@ -426,16 +520,21 @@ impl Runner {
                             }
                             Err(_) => {}
                         },
-                        Health::Running => match self.progress_noted(id).await {
-                            Ok(Progress::Done) => {
+                        Health::Running => match self.progress_noted(id, &mut setup).await {
+                            Ok((Progress::Done, _)) => {
                                 ran = true;
                                 return (Outcome::Completed, ran);
                             }
-                            Ok(Progress::Failed(m)) => {
+                            Ok((Progress::Failed(m), _)) => {
                                 ran = true;
                                 return (Outcome::Failed(m), ran);
                             }
-                            Ok(Progress::Starting) => remote_errors = 0,
+                            Ok((Progress::Starting, stuck)) => {
+                                remote_errors = 0;
+                                if let Some(why) = stuck {
+                                    return (Outcome::Failed(why), ran);
+                                }
+                            }
                             Ok(_) => {
                                 ran = true;
                                 remote_errors = 0;
@@ -480,26 +579,32 @@ impl Runner {
         }
         rec.phase = Phase::Destroying;
         self.save(rec);
-        let mut leftover: Vec<u64> = ids.to_vec();
-        for _ in 0..DESTROY_ATTEMPTS {
-            for id in &leftover {
-                let _ = self.provider.destroy(*id).await;
-            }
-            if let Ok(list) = self.provider.list_instances().await {
-                leftover.retain(|id| list.iter().any(|i: &InstanceInfo| i.id == *id));
-                if leftover.is_empty() {
-                    break;
-                }
-            }
-            tokio::time::sleep(self.poll).await;
-        }
-        rec.phase = if leftover.is_empty() {
+        rec.phase = if destroy_all(self.provider.as_ref(), ids, self.poll).await {
             Phase::Destroyed
         } else {
             Phase::CleanupUnconfirmed
         };
         self.save(rec);
     }
+}
+
+/// Destroy `ids`, retrying, until the provider no longer lists any of them.
+/// `false` means at least one may still be billing.
+pub async fn destroy_all(provider: &dyn GpuProvider, ids: &[u64], poll: Duration) -> bool {
+    let mut leftover: Vec<u64> = ids.to_vec();
+    for _ in 0..DESTROY_ATTEMPTS {
+        for id in &leftover {
+            let _ = provider.destroy(*id).await;
+        }
+        if let Ok(list) = provider.list_instances().await {
+            leftover.retain(|id| list.iter().any(|i: &InstanceInfo| i.id == *id));
+            if leftover.is_empty() {
+                return true;
+            }
+        }
+        tokio::time::sleep(poll).await;
+    }
+    leftover.is_empty()
 }
 
 #[cfg(test)]
@@ -519,6 +624,16 @@ mod tests {
         syncs: Mutex<u32>,
         begins: Mutex<Vec<Result<(), String>>>,
         begin_calls: Mutex<u32>,
+        notes: Mutex<Vec<Option<SetupNote>>>,
+    }
+
+    fn note(detail: &str, log_bytes: u64) -> Option<SetupNote> {
+        Some(SetupNote {
+            stage: "bootstrap".into(),
+            detail: Some(detail.into()),
+            log_bytes: Some(log_bytes),
+            log_tail: "Downloading torch".into(),
+        })
     }
 
     impl Script {
@@ -532,7 +647,13 @@ mod tests {
                 syncs: Mutex::new(0),
                 begins: Mutex::new(vec![Ok(())]),
                 begin_calls: Mutex::new(0),
+                notes: Mutex::new(vec![None]),
             })
+        }
+
+        fn with_notes(self: Arc<Self>, notes: Vec<Option<SetupNote>>) -> Arc<Self> {
+            *self.notes.lock().unwrap() = notes;
+            self
         }
     }
 
@@ -553,6 +674,9 @@ mod tests {
         }
         async fn progress(&self, _: u64) -> Result<Progress, String> {
             next(&self.progress)
+        }
+        async fn status(&self, _: u64) -> Result<(Progress, Option<SetupNote>), String> {
+            Ok((next(&self.progress)?, next(&self.notes)))
         }
         async fn sync(&self, _: u64) -> Result<bool, String> {
             *self.syncs.lock().unwrap() += 1;
@@ -792,6 +916,119 @@ mod tests {
         assert_eq!(res.record.phase, Phase::Destroyed);
         assert!(r.provider.live_ids().is_empty());
         assert!(start.elapsed() < Duration::from_secs(300 + 60));
+    }
+
+    #[test]
+    fn setup_watch_flags_a_stall_and_resets_on_any_change() {
+        let mut w = SetupWatch::default();
+        let a = note("installing: packages", 100);
+        assert!(w.check(0, a.as_ref()).is_none());
+        assert!(w.check(SETUP_STALL_SECS - 1, a.as_ref()).is_none());
+        // The log grew: the clock restarts.
+        let b = note("installing: packages", 200);
+        assert!(w.check(SETUP_STALL_SECS, b.as_ref()).is_none());
+        assert!(w.check(SETUP_STALL_SECS * 2 - 1, b.as_ref()).is_none());
+        let why = w.check(SETUP_STALL_SECS * 2, b.as_ref()).unwrap();
+        assert!(
+            why.contains("8 min") && why.contains("installing: packages"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn setup_watch_without_notes_only_enforces_the_cap() {
+        let mut w = SetupWatch::default();
+        assert!(w.check(0, None).is_none());
+        assert!(w.check(SETUP_CAP_SECS - 1, None).is_none());
+        assert!(w.check(SETUP_CAP_SECS, None).unwrap().contains("20 min"));
+    }
+
+    #[test]
+    fn setup_watch_ignores_stalls_from_a_sidecar_without_log_sizes() {
+        let mut w = SetupWatch::default();
+        let old = Some(SetupNote {
+            detail: Some("installing: packages".into()),
+            ..SetupNote::default()
+        });
+        assert!(w.check(0, old.as_ref()).is_none());
+        assert!(w.check(SETUP_CAP_SECS - 1, old.as_ref()).is_none());
+        assert!(w.check(SETUP_CAP_SECS, old.as_ref()).is_some());
+    }
+
+    #[test]
+    fn setup_watch_cap_applies_even_when_the_log_keeps_growing() {
+        let mut w = SetupWatch::default();
+        for t in (0..SETUP_CAP_SECS).step_by(60) {
+            assert!(w
+                .check(t, note("installing: packages", t).as_ref())
+                .is_none());
+        }
+        let n = note("installing: packages", SETUP_CAP_SECS);
+        assert!(w
+            .check(SETUP_CAP_SECS, n.as_ref())
+            .unwrap()
+            .contains("longer than"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_setup_ends_the_run_and_destroys_the_gpu() {
+        let script = Script::new(vec![Ok(Progress::Starting)], vec![Ok(true)])
+            .with_notes(vec![note("installing: packages", 500)]);
+        let r = rig(vec![], script);
+        let (plan, approval) = make_plan(&r.provider, limits());
+        let start = Instant::now();
+        let res = r.runner.run(&plan, &approval).await.unwrap();
+        let Outcome::Failed(why) = &res.outcome else {
+            panic!("{:?}", res.outcome)
+        };
+        assert!(
+            why.contains("stopped making progress") && why.contains("packages"),
+            "{why}"
+        );
+        // Long before the one-hour limit.
+        assert!(start.elapsed() < Duration::from_secs(SETUP_STALL_SECS + 120));
+        assert_eq!(res.record.phase, Phase::Destroyed);
+        assert!(r.provider.live_ids().is_empty());
+        assert_eq!(r.runner.live.lock().unwrap().progress, Progress::Starting);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_setup_that_keeps_moving_is_left_alone_until_training() {
+        let mut notes: Vec<Option<SetupNote>> =
+            (1..=60).map(|i| note("installing: packages", i)).collect();
+        notes.push(None);
+        let mut progress = vec![Ok(Progress::Starting); 60];
+        progress.extend([step(1), Ok(Progress::Done)]);
+        let r = rig(
+            vec![],
+            Script::new(progress, vec![Ok(true)]).with_notes(notes),
+        );
+        let (plan, approval) = make_plan(&r.provider, limits());
+        let res = r.runner.run(&plan, &approval).await.unwrap();
+        assert_eq!(res.outcome, Outcome::Completed);
+        assert!(r.runner.live.lock().unwrap().setup.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_ui_sees_what_setup_is_doing() {
+        let script = Script::new(vec![Ok(Progress::Starting)], vec![Ok(true)])
+            .with_notes(vec![note("installing: packages", 500)]);
+        let r = rig(vec![], script);
+        let (plan, approval) = make_plan(&r.provider, limits());
+        let live = r.runner.live.clone();
+        let cancel = r.runner.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let seen = live.lock().unwrap().clone();
+            assert_eq!(
+                seen.setup.unwrap().detail.as_deref(),
+                Some("installing: packages")
+            );
+            assert!(seen.setup_quiet_since.is_some());
+            cancel.store(true, Ordering::SeqCst);
+        });
+        let res = r.runner.run(&plan, &approval).await.unwrap();
+        assert_eq!(res.outcome, Outcome::Cancelled);
     }
 
     #[tokio::test(start_paused = true)]

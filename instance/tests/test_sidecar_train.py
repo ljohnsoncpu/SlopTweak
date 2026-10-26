@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -102,11 +103,31 @@ async def test_train_backend_has_no_proxy(rig: Rig) -> None:
 
 async def test_state_defaults_to_waiting_then_follows_the_runner(rig: Rig) -> None:
     resp = await rig.client.get("/__train/state", headers=BEARER)
-    assert await resp.json() == {"stage": "waiting", "started": False}
+    assert await resp.json() == {
+        "stage": "waiting",
+        "log_bytes": 0,
+        "log_tail": "",
+        "started": False,
+    }
     rig.work.mkdir(parents=True, exist_ok=True)
     (rig.work / "state.json").write_text(json.dumps({"stage": "train", "step": 5, "total": 9}))
     resp = await rig.client.get("/__train/state", headers=BEARER)
     assert await resp.json() == {"stage": "train", "step": 5, "total": 9, "started": False}
+
+
+async def test_setup_state_reports_log_size_and_the_newest_tail(rig: Rig) -> None:
+    logs = rig.work / "runtime" / "logs"
+    logs.mkdir(parents=True)
+    (rig.work / "state.json").write_text(
+        json.dumps({"stage": "bootstrap", "detail": "installing: packages"})
+    )
+    old = logs / "bootstrap-venv.log"
+    old.write_bytes(b"venv ok\n")
+    os.utime(old, (1, 1))
+    (logs / "bootstrap-packages.log").write_text("x" * 2000 + "Downloading torch")
+    state = await (await rig.client.get("/__train/state", headers=BEARER)).json()
+    assert state["log_bytes"] == len("venv ok\n") + 2017
+    assert state["log_tail"].endswith("Downloading torch") and len(state["log_tail"]) == 1024
 
 
 async def test_upload_start_and_cancel_flow(rig: Rig) -> None:

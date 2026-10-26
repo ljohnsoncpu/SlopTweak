@@ -13,7 +13,7 @@ use tokio::io::AsyncWriteExt;
 use url::Url;
 
 use super::job::JobBundle;
-use super::run::{Progress, RemoteTrain};
+use super::run::{Progress, RemoteTrain, SetupNote};
 use crate::provider::GpuProvider;
 
 /// Largest result set the app will pull in one run (the approved egress).
@@ -38,9 +38,24 @@ pub struct TrainState {
     pub error: Option<String>,
     #[serde(default)]
     pub started: bool,
+    /// Setup only: size of the setup logs and the end of the newest one.
+    #[serde(default)]
+    pub log_bytes: Option<u64>,
+    #[serde(default)]
+    pub log_tail: Option<String>,
 }
 
 impl TrainState {
+    /// What setup is doing, or `None` once training has begun.
+    pub fn setup_note(&self) -> Option<SetupNote> {
+        (self.progress() == Progress::Starting).then(|| SetupNote {
+            stage: self.stage.clone(),
+            detail: self.detail.clone(),
+            log_bytes: self.log_bytes,
+            log_tail: self.log_tail.clone().unwrap_or_default(),
+        })
+    }
+
     pub fn progress(&self) -> Progress {
         let total = self.total.unwrap_or(0);
         match self.stage.as_str() {
@@ -402,6 +417,13 @@ impl RemoteTrain for TunnelTrain {
         Ok(self.http.state(&base, &self.secret).await?.progress())
     }
 
+    async fn status(&self, instance: u64) -> Result<(Progress, Option<SetupNote>), String> {
+        let base = self.base(instance).await?;
+        let _ = self.http.heartbeat(&base, &self.secret).await;
+        let state = self.http.state(&base, &self.secret).await?;
+        Ok((state.progress(), state.setup_note()))
+    }
+
     async fn sync(&self, instance: u64) -> Result<bool, String> {
         let base = self.base(instance).await?;
         self.http
@@ -525,6 +547,34 @@ mod tests {
             Progress::Failed(_)
         ));
         assert_eq!(st(serde_json::json!({"stage": "???"})), Progress::Starting);
+    }
+
+    #[test]
+    fn setup_note_is_only_for_setup() {
+        let st = |v: serde_json::Value| serde_json::from_value::<TrainState>(v).unwrap();
+        let note = st(serde_json::json!({
+            "stage": "bootstrap",
+            "detail": "installing: packages",
+            "log_bytes": 4096,
+            "log_tail": "Downloading torch"
+        }))
+        .setup_note()
+        .unwrap();
+        assert_eq!(note.detail.as_deref(), Some("installing: packages"));
+        assert_eq!(
+            (note.log_bytes, note.log_tail.as_str()),
+            (Some(4096), "Downloading torch")
+        );
+        // An older sidecar sends no log fields.
+        let bare = st(serde_json::json!({"stage": "waiting"}))
+            .setup_note()
+            .unwrap();
+        assert_eq!((bare.log_bytes, bare.log_tail.as_str()), (None, ""));
+        assert!(
+            st(serde_json::json!({"stage": "train", "step": 1, "total": 2}))
+                .setup_note()
+                .is_none()
+        );
     }
 
     #[test]

@@ -466,6 +466,11 @@ pub struct Orphan {
     pub status: Option<String>,
     /// We have its launch secret and its tunnel is published.
     pub can_reattach: bool,
+    /// Left by a training run rather than a session; set by the caller.
+    pub training: bool,
+    /// The instance label, for matching it to a run record.
+    #[serde(skip)]
+    pub label: Option<String>,
 }
 
 struct Active {
@@ -893,6 +898,8 @@ impl SessionManager {
                     hourly: i.dph_total,
                     status: i.actual_status.clone(),
                     can_reattach: has_secret && self.deps.provider.sidecar_url(&i).is_some(),
+                    training: false,
+                    label: i.label.clone(),
                 }
             })
             .collect())
