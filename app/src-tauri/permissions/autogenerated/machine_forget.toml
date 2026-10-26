@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-machine-forget"
+description = "Enables the machine_forget command without any pre-configured scope."
+commands.allow = ["machine_forget"]
+
+[[permission]]
+identifier = "deny-machine-forget"
+description = "Denies the machine_forget command without any pre-configured scope."
+commands.deny = ["machine_forget"]

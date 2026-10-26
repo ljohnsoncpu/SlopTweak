@@ -83,6 +83,19 @@ interface Status {
   setup_detail: string | null;
   setup_log: string | null;
   setup_quiet_secs: number | null;
+  stages: StageView[];
+  host_status: string[];
+  container_log: string | null;
+  container_log_note: string | null;
+  host_note: string | null;
+  diagnostics_path: string | null;
+}
+
+interface StageView {
+  name: string;
+  started_secs: number;
+  secs: number;
+  current: boolean;
 }
 
 const money = (n: number) => `$${n.toFixed(2)}`;
@@ -91,6 +104,9 @@ function minutes(secs: number): string {
   const m = Math.floor(secs / 60);
   return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min ${secs % 60} s`;
 }
+
+/** `+3m07s`, the same way the saved report writes offsets. */
+const offset = (secs: number) => `+${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, "0")}s`;
 
 type Child = Node | string | null | undefined | false;
 
@@ -126,6 +142,10 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
   let maxMinutes = 120;
   let maxUsd = 1.5;
   let timer: number | undefined;
+  // The machine log is rebuilt on every poll: remember how the user left it.
+  let logOpen = true;
+  let logScroll = 0;
+  let logStick = true;
 
   const trigger = () => audit?.report.images[0]?.first_tag ?? "";
 
@@ -395,10 +415,60 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
     return h("div", { class: "progress" }, fill);
   }
 
+  /** Where the time goes, what was done about the machine, and the live machine log. */
+  function renderActivity(s: Status): Node[] {
+    const out: Node[] = [];
+    if (s.host_note) {
+      out.push(h("p", { class: s.host_note.includes("marked bad") ? "error small" : "muted small" }, s.host_note));
+    }
+    if (s.stages.length > 0) {
+      out.push(
+        h("p", { class: "small" }, s.state === "running" ? "Where the time is going" : "Where the time went"),
+        h(
+          "ul",
+          { class: "small stages", style: "margin:0 0 .5em;padding-left:1.2em;list-style:none;font-variant-numeric:tabular-nums" },
+          ...s.stages.map((st) =>
+            h(
+              "li",
+              { class: st.current && s.state === "running" ? "" : "muted" },
+              `${offset(st.started_secs)}  ${st.name} · ${minutes(st.secs)}${st.current && s.state === "running" ? " (now)" : ""}`,
+            ),
+          ),
+        ),
+      );
+    }
+    const parts: string[] = [];
+    if (s.host_status.length > 0) parts.push(["— What Vast said —", ...s.host_status].join("\n"));
+    if (s.container_log) parts.push(["— Machine log —", s.container_log].join("\n"));
+    if (parts.length > 0 || s.container_log_note) {
+      const pre = h("pre", { class: "small" }, parts.join("\n\n") || "Nothing yet.");
+      pre.style.cssText = "white-space:pre-wrap;overflow-wrap:anywhere;max-height:16em;overflow:auto";
+      pre.addEventListener("scroll", () => {
+        logScroll = pre.scrollTop;
+        logStick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
+      });
+      requestAnimationFrame(() => {
+        pre.scrollTop = logStick ? pre.scrollHeight : logScroll;
+      });
+      const d = h("details", { open: logOpen }, h("summary", {}, s.state === "running" ? "Live machine log" : "Machine log"));
+      d.addEventListener("toggle", () => {
+        logOpen = d.open;
+      });
+      d.append(pre);
+      if (s.container_log_note) d.append(h("p", { class: "muted small" }, s.container_log_note));
+      out.push(d);
+    }
+    if (s.diagnostics_path) {
+      out.push(h("p", { class: "muted small" }, `Details for troubleshooting were saved to ${s.diagnostics_path}`));
+    }
+    return out;
+  }
+
   function renderRun(s: Status): Node {
     const card = h("section", { class: "card" }, h("h2", {}, s.state === "running" ? "Training" : "Run finished"));
     card.append(h("p", { class: "run-message" }, s.message));
-    if (s.setup_detail || s.setup_log) {
+    card.append(...renderActivity(s));
+    if (s.setup_detail || s.setup_log || s.setup_quiet_secs !== null) {
       const quiet = s.setup_quiet_secs ?? 0;
       card.append(
         h(

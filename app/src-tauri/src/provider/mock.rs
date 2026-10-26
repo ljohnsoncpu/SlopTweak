@@ -863,6 +863,19 @@ impl GpuProvider for MockProvider {
         Ok(())
     }
 
+    async fn logs(&self, id: u64, _tail: u32) -> Result<String, ProviderError> {
+        let s = self.state.lock().unwrap();
+        let Some(i) = s.instances.get(&id).filter(|i| !i.destroyed) else {
+            return Ok(String::new());
+        };
+        Ok(format!(
+            "mock: container started {}s ago
+mock: onstart running
+",
+            i.created.elapsed().as_secs()
+        ))
+    }
+
     fn sidecar_url(&self, info: &InstanceInfo) -> Option<Url> {
         info.label_host().map(|_| self.remote_base.clone())
     }

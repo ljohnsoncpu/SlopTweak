@@ -55,6 +55,8 @@
     "allow-train-status",
     "allow-train-cancel",
     "allow-train-dismiss",
-    "allow-train-open-results"
+    "allow-train-open-results",
+    "allow-machine-list",
+    "allow-machine-forget"
   ]
 }

@@ -79,6 +79,64 @@ impl TrainState {
     }
 }
 
+/// The instance's own setup status (`/__status`): booting, downloading the
+/// base model, verifying it, starting the trainer. The trainer's state says
+/// only `waiting` until the trainer exists, so this is what a slow model
+/// download looks like from outside.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Provision {
+    #[serde(default)]
+    pub stage: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Download progress, 0 to 1.
+    #[serde(default)]
+    pub progress: Option<f64>,
+}
+
+impl Provision {
+    /// One line for the screen, e.g. `base.safetensors 37%`.
+    pub fn describe(&self) -> String {
+        let what = self.detail.as_deref().unwrap_or("").trim();
+        let pct = self
+            .progress
+            .filter(|p| (0.0..=1.0).contains(p) && self.stage == "downloading")
+            .map(|p| format!(" {:.0}%", p * 100.0));
+        format!(
+            "{}{}{}",
+            self.stage,
+            if what.is_empty() { "" } else { " " },
+            what
+        ) + pct.as_deref().unwrap_or("")
+    }
+
+    /// What to report while the trainer is still `waiting`. `None` once the
+    /// instance says it is ready (the trainer is about to answer itself).
+    pub fn while_waiting(&self) -> Option<(Progress, Option<SetupNote>)> {
+        match self.stage.as_str() {
+            "" | "ready" => None,
+            "failed" => Some((
+                Progress::Failed(format!(
+                    "The GPU's setup failed: {}",
+                    self.detail.as_deref().unwrap_or("no reason given")
+                )),
+                None,
+            )),
+            other => Some((
+                Progress::Starting,
+                Some(SetupNote {
+                    stage: format!("provision:{other}"),
+                    detail: Some(self.describe()),
+                    // Present so a stalled download is caught by the watchdog;
+                    // the percentage in `detail` is what changes.
+                    log_bytes: Some(0),
+                    log_tail: String::new(),
+                }),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ManifestEntry {
     pub path: String,
@@ -171,6 +229,10 @@ impl HttpTrain {
 
     pub async fn state(&self, base: &Url, secret: &str) -> Result<TrainState, String> {
         self.get_json(base, secret, "/__train/state").await
+    }
+
+    pub async fn provision(&self, base: &Url, secret: &str) -> Result<Provision, String> {
+        self.get_json(base, secret, "/__status").await
     }
 
     pub async fn manifest(&self, base: &Url, secret: &str) -> Result<Vec<ManifestEntry>, String> {
@@ -421,6 +483,14 @@ impl RemoteTrain for TunnelTrain {
         let base = self.base(instance).await?;
         let _ = self.http.heartbeat(&base, &self.secret).await;
         let state = self.http.state(&base, &self.secret).await?;
+        if state.stage == "waiting" {
+            // No trainer yet: ask the instance what it is doing instead.
+            if let Ok(p) = self.http.provision(&base, &self.secret).await {
+                if let Some(answer) = p.while_waiting() {
+                    return Ok(answer);
+                }
+            }
+        }
         Ok((state.progress(), state.setup_note()))
     }
 
@@ -547,6 +617,43 @@ mod tests {
             Progress::Failed(_)
         ));
         assert_eq!(st(serde_json::json!({"stage": "???"})), Progress::Starting);
+    }
+
+    #[test]
+    fn provisioning_shows_through_while_the_trainer_waits() {
+        let p = |v: serde_json::Value| serde_json::from_value::<Provision>(v).unwrap();
+        let (progress, note) = p(serde_json::json!({
+            "stage": "downloading", "detail": "base.safetensors", "progress": 0.371
+        }))
+        .while_waiting()
+        .unwrap();
+        assert_eq!(progress, Progress::Starting);
+        let note = note.unwrap();
+        assert_eq!(note.stage, "provision:downloading");
+        assert_eq!(
+            note.detail.as_deref(),
+            Some("downloading base.safetensors 37%")
+        );
+        assert!(note.log_bytes.is_some());
+        // A failed setup ends the run with the reason, instead of looking stuck.
+        let (progress, _) =
+            p(serde_json::json!({"stage": "failed", "detail": "download failed: base"}))
+                .while_waiting()
+                .unwrap();
+        assert_eq!(
+            progress,
+            Progress::Failed("The GPU's setup failed: download failed: base".into())
+        );
+        // Ready, or an answer we can't read: fall back to the trainer's own state.
+        assert!(p(serde_json::json!({"stage": "ready"}))
+            .while_waiting()
+            .is_none());
+        assert!(p(serde_json::json!({})).while_waiting().is_none());
+        // Percentages only appear while downloading.
+        assert_eq!(
+            p(serde_json::json!({"stage": "verifying", "detail": "m", "progress": 1.0})).describe(),
+            "verifying m"
+        );
     }
 
     #[test]

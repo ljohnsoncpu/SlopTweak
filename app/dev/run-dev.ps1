@@ -9,9 +9,9 @@
 # never printed. The debug build shares settings and Credential Manager with
 # the installed app, so close that first.
 #
-# Instances still fetch their setup files from the instance-v0.1.5 bundle
-# (SLOPTWEAK_DEV_ASSETS_URL overrides it); changes under instance/ need a bundle
-# you built.
+# Instances fetch their setup files from this version's own release (the same
+# bytes the pinned hash covers); SLOPTWEAK_DEV_ASSETS_URL overrides it. Changes
+# under instance/ need a bundle you built and a new pinned hash.
 
 [CmdletBinding()]
 param(

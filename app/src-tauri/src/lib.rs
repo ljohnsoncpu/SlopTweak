@@ -1176,6 +1176,12 @@ async fn train_quote(
 /// The user pressed Start on a specific quote: that is the approval.
 #[tauri::command]
 async fn train_start(st: State<'_, AppState>, plan_id: String) -> Result<(), String> {
+    // Same pre-rent check as an Invoke session: an instance that can't fetch
+    // the bundle never starts, and the run only ends as "couldn't reach the
+    // GPU" after the full wait (and blames a host that did nothing wrong).
+    if matches!(st.mode, Mode::Vast) {
+        assets::check(&config::assets_url(), config::ASSETS_SHA256).await?;
+    }
     st.train_manager()?.start(&plan_id)
 }
 
@@ -1199,6 +1205,23 @@ async fn train_dismiss(st: State<'_, AppState>) -> Result<(), String> {
         m.dismiss();
     }
     Ok(())
+}
+
+/// Machines remembered from earlier rentals, skipped ones first.
+#[tauri::command]
+async fn machine_list(
+    st: State<'_, AppState>,
+) -> Result<Vec<provider::machines::MachineRow>, String> {
+    Ok(MachineFile::new(&st.data_dir).load().rows(now_unix()))
+}
+
+/// Stop skipping (or preferring) one machine.
+#[tauri::command]
+async fn machine_forget(st: State<'_, AppState>, machine_id: u64) -> Result<(), String> {
+    MachineFile::new(&st.data_dir)
+        .forget(machine_id)
+        .map(|_| ())
+        .map_err(|e| format!("Couldn't update the machine list: {e}"))
 }
 
 #[tauri::command]
@@ -1943,6 +1966,8 @@ pub fn run() {
             train_cancel,
             train_dismiss,
             train_open_results,
+            machine_list,
+            machine_forget,
             identity_state,
             identity_pick_ref,
             identity_clear_ref,

@@ -989,6 +989,7 @@ function renderSettings(): void {
   ui.outReset.hidden = !s.output_dir;
   renderOutLock();
   renderLoras();
+  void renderMachines();
   ui.accounts.replaceChildren(
     h("p", {}, snapshot.has_vast_key ? "✓ Vast key saved. Paste a new one to replace it." : "No Vast key yet."),
     keyField("vast", renderSettings),
@@ -1004,6 +1005,67 @@ function renderSettings(): void {
         ? `Using the list saved ${ago(c.fetched_unix)}; couldn't check for a newer one.`
         : "Using the list built into this version; couldn't check for a newer one.") +
     ` ${snapshot.models.length} model${snapshot.models.length === 1 ? "" : "s"}.`;
+}
+
+interface MachineRow {
+  id: number;
+  gpu: string | null;
+  status: "avoided" | "good" | "expired";
+  ok_unix: number | null;
+  failed_unix: number | null;
+  avoid_until_unix: number | null;
+  reason: string | null;
+}
+
+/** The machines the app remembers, skipped ones first, each with a way to undo it. */
+async function renderMachines(): Promise<void> {
+  const list = document.getElementById("machines-list");
+  const msg = document.getElementById("machines-msg");
+  if (!list || !msg) return;
+  let rows: MachineRow[];
+  try {
+    rows = await invoke<MachineRow[]>("machine_list");
+  } catch (e) {
+    msg.textContent = String(e);
+    return;
+  }
+  const forget = async (id: number) => {
+    try {
+      await invoke("machine_forget", { machineId: id });
+      msg.textContent = "";
+    } catch (e) {
+      msg.textContent = String(e);
+    }
+    await renderMachines();
+  };
+  list.replaceChildren(
+    ...(rows.length === 0
+      ? [h("p", { class: "muted" }, "None yet. Machines appear here after your first rental.")]
+      : rows.map((m) => {
+          const what =
+            m.status === "avoided"
+              ? `Skipped until ${new Date((m.avoid_until_unix ?? 0) * 1000).toLocaleDateString()}`
+              : m.status === "good"
+                ? `Worked ${ago(m.ok_unix)}; preferred when the price is close`
+                : `Failed ${ago(m.failed_unix)}; no longer skipped`;
+          return h(
+            "div",
+            { class: "lora" },
+            h("span", { class: "lora-name" }, `Machine ${m.id}`, m.gpu ? ` · ${m.gpu}` : ""),
+            h("span", { class: m.status === "avoided" ? "error small" : "muted small" }, what),
+            m.status !== "good" && m.reason && h("span", { class: "muted small" }, `Why: ${m.reason}`),
+            h(
+              "span",
+              { class: "lora-actions" },
+              h(
+                "button",
+                { class: "ghost", onclick: () => void forget(m.id) },
+                m.status === "avoided" ? "Allow again" : "Forget",
+              ),
+            ),
+          );
+        })),
+  );
 }
 
 function renderLoras(): void {

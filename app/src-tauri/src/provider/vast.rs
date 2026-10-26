@@ -326,11 +326,83 @@ impl GpuProvider for VastProvider {
         }
         Err(http_error(status, &v))
     }
+
+    async fn logs(&self, id: u64, tail: u32) -> Result<String, ProviderError> {
+        // Two steps (findings §1): ask for the logs, then download them from
+        // the temporary link a few seconds later.
+        let v = self
+            .ok(
+                Method::PUT,
+                &format!("/instances/request_logs/{id}/"),
+                Some(&json!({ "tail": tail.to_string() })),
+            )
+            .await?;
+        let url = v
+            .get("temp_download_url")
+            .and_then(Value::as_str)
+            .and_then(log_download_url)
+            .ok_or_else(|| ProviderError::Parse("no log download link".into()))?;
+        for attempt in 0..LOG_FETCH_ATTEMPTS {
+            tokio::time::sleep(LOG_FETCH_WAIT).await;
+            // The link is pre-signed: it never gets our API key.
+            let resp = self
+                .http
+                .get(url.clone())
+                .send()
+                .await
+                .map_err(|e| ProviderError::Network(e.without_url().to_string()))?;
+            if resp.status().is_success() {
+                if resp.content_length().is_some_and(|n| n > MAX_LOG_BYTES) {
+                    return Err(ProviderError::Parse("the log is too large".into()));
+                }
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| ProviderError::Network(e.without_url().to_string()))?;
+                return Ok(tail_lossy(&bytes, MAX_LOG_BYTES as usize));
+            }
+            if attempt + 1 == LOG_FETCH_ATTEMPTS {
+                return Err(ProviderError::Http {
+                    status: resp.status().as_u16(),
+                    message: "the log wasn't ready".into(),
+                });
+            }
+        }
+        Err(ProviderError::Parse("no log".into()))
+    }
+}
+
+/// How often and how long to wait for a requested log to appear.
+const LOG_FETCH_ATTEMPTS: u32 = 4;
+const LOG_FETCH_WAIT: Duration = Duration::from_secs(2);
+const MAX_LOG_BYTES: u64 = 512 * 1024;
+
+/// Only an `https` link is followed.
+fn log_download_url(link: &str) -> Option<url::Url> {
+    url::Url::parse(link).ok().filter(|u| u.scheme() == "https")
+}
+
+/// The last `max` bytes as text, starting on a character boundary.
+fn tail_lossy(bytes: &[u8], max: usize) -> String {
+    let start = bytes.len().saturating_sub(max);
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_links_must_be_https_and_tails_are_bounded() {
+        assert!(log_download_url("https://bucket.s3.amazonaws.com/x?sig=1").is_some());
+        assert!(log_download_url("http://bucket.s3.amazonaws.com/x").is_none());
+        assert!(log_download_url("file:///etc/passwd").is_none());
+        assert!(log_download_url("not a url").is_none());
+        assert_eq!(tail_lossy(b"abcdef", 3), "def");
+        assert_eq!(tail_lossy(b"abc", 10), "abc");
+        // A cut inside a multi-byte character doesn't panic.
+        assert!(!tail_lossy("é".repeat(5).as_bytes(), 3).is_empty());
+    }
 
     #[test]
     fn env_string_rejects_injection() {

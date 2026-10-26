@@ -11,8 +11,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::{
-    GpuProvider, Health, InstanceInfo, LaunchSpec, Offer, OfferQuery, ProviderError, LABEL,
+    is_pull_output, GpuProvider, Health, InstanceInfo, LaunchSpec, Offer, OfferQuery,
+    ProviderError, LABEL,
 };
+use crate::redact::redact;
 
 /// Hard ceilings no setting can raise: a first-run safety net.
 pub const ABSOLUTE_MAX_SECONDS: u64 = 4 * 3600;
@@ -37,6 +39,15 @@ const SETUP_CAP_SECS: u64 = 20 * 60;
 /// against the host only if it had been going this long: a quick cancel says
 /// nothing about the host.
 pub const STUCK_SETUP_BLAME_SECS: u64 = 10 * 60;
+/// How often the container's output is fetched from Vast while a run is going.
+const LOG_POLL: Duration = Duration::from_secs(15);
+const LOG_TAIL_LINES: u32 = 300;
+/// One last fetch when a run ends badly, before the GPU (and its log) is gone.
+const FINAL_LOG_WAIT: Duration = Duration::from_secs(20);
+/// Most of the container log kept in memory and shown.
+const MAX_LOG_CHARS: usize = 64 * 1024;
+/// Most stage marks and host status lines kept.
+const MAX_TIMED: usize = 60;
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq)]
 #[error("{0}")]
@@ -280,6 +291,57 @@ pub struct Plan {
     pub limits: Limits,
 }
 
+/// Something that happened at a moment: a stage began, or Vast said something.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Timed {
+    pub at_unix: u64,
+    pub text: String,
+}
+
+/// Add `text` unless it is empty or repeats the latest entry.
+fn push_if_new(list: &mut Vec<Timed>, at_unix: u64, text: &str) {
+    let text = text.trim();
+    if text.is_empty() || list.last().is_some_and(|t| t.text == text) {
+        return;
+    }
+    list.push(Timed {
+        at_unix,
+        text: text.to_string(),
+    });
+    if list.len() > MAX_TIMED {
+        list.remove(0);
+    }
+}
+
+/// The last `max` characters, starting at a line start when one is near.
+fn tail_chars(text: &str, max: usize) -> String {
+    let n = text.chars().count();
+    if n <= max {
+        return text.to_string();
+    }
+    let cut = text.char_indices().nth(n - max).map_or(0, |(i, _)| i);
+    let tail = &text[cut..];
+    tail.split_once('\n')
+        .map_or(tail, |(_, rest)| rest)
+        .to_string()
+}
+
+/// What the sidecar's setup stage means in plain words.
+fn setup_stage_label(note: Option<&SetupNote>) -> String {
+    match note.map(|n| n.stage.as_str()) {
+        Some("provision:downloading") => "Downloading the base model onto the GPU".into(),
+        Some("provision:verifying") => "Checking the downloaded model".into(),
+        Some("provision:booting") => "Starting the GPU's services".into(),
+        Some("provision:starting") => "Starting the trainer".into(),
+        Some(p) if p.starts_with("provision:") => "Setting up the GPU".into(),
+        Some("waiting") => "Waiting for the trainer to start".into(),
+        Some("bootstrap") => "Installing the training environment".into(),
+        Some("prepare") => "Preparing the model and dataset".into(),
+        Some(other) if !other.is_empty() => format!("Setting up the GPU ({other})"),
+        _ => "Setting up the GPU".into(),
+    }
+}
+
 /// What the UI shows while a run is going; the runner keeps it current.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Live {
@@ -289,6 +351,15 @@ pub struct Live {
     pub setup: Option<SetupNote>,
     /// Unix time setup last changed (a step started or a log grew).
     pub setup_quiet_since: Option<u64>,
+    /// When each stage of the run began, oldest first.
+    pub stages: Vec<Timed>,
+    /// What Vast's `status_msg` said, each time it changed (image pull lines).
+    pub host_status: Vec<Timed>,
+    /// The end of the container's own output, redacted.
+    pub container_log: String,
+    pub container_log_unix: Option<u64>,
+    /// Why the last attempt to fetch it failed.
+    pub container_log_error: Option<String>,
 }
 
 impl Default for Live {
@@ -298,6 +369,11 @@ impl Default for Live {
             progress: Progress::Starting,
             setup: None,
             setup_quiet_since: None,
+            stages: Vec::new(),
+            host_status: Vec::new(),
+            container_log: String::new(),
+            container_log_unix: None,
+            container_log_error: None,
         }
     }
 }
@@ -310,9 +386,60 @@ pub struct Runner {
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     pub poll: Duration,
     pub cancel: Arc<AtomicBool>,
+    /// Secret values to mask in anything fetched from the instance.
+    pub secrets: Vec<String>,
 }
 
 impl Runner {
+    /// A stage began now (a repeat of the current one changes nothing).
+    fn mark(&self, stage: &str) {
+        let now = (self.clock)();
+        if let Ok(mut live) = self.live.lock() {
+            push_if_new(&mut live.stages, now, stage);
+        }
+    }
+
+    fn host_said(&self, msg: &str) {
+        let now = (self.clock)();
+        let known: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+        let msg = redact(msg, &known);
+        if let Ok(mut live) = self.live.lock() {
+            push_if_new(&mut live.host_status, now, &msg);
+        }
+    }
+
+    /// Fetch the container's output once and keep it for the UI. A failure is
+    /// noted but the last good output stays.
+    async fn fetch_logs(&self, id: u64) {
+        let got = self.provider.logs(id, LOG_TAIL_LINES).await;
+        let now = (self.clock)();
+        let known: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+        let got = got
+            .map(|t| tail_chars(&redact(&t, &known), MAX_LOG_CHARS))
+            .map_err(|e| redact(&e.to_string(), &known));
+        let Ok(mut live) = self.live.lock() else {
+            return;
+        };
+        match got {
+            Ok(text) => {
+                if !text.trim().is_empty() || live.container_log.is_empty() {
+                    live.container_log = text;
+                    live.container_log_unix = Some(now);
+                }
+                live.container_log_error = None;
+            }
+            Err(e) => live.container_log_error = Some(e),
+        }
+    }
+
+    /// Keep the container output fresh until the future is dropped.
+    async fn poll_logs(&self, id: u64) -> std::convert::Infallible {
+        loop {
+            self.fetch_logs(id).await;
+            tokio::time::sleep(LOG_POLL).await;
+        }
+    }
+
     fn save(&self, rec: &RunRecord) {
         if let Ok(mut live) = self.live.lock() {
             live.record = Some(rec.clone());
@@ -369,6 +496,7 @@ impl Runner {
         rec.phase = Phase::Creating;
         rec.started_unix = Some((self.clock)());
         self.save(&rec);
+        self.mark("Renting the GPU");
 
         let mut ids = Vec::new();
         match self
@@ -402,8 +530,16 @@ impl Runner {
         rec.instance_id = Some(id);
         rec.phase = Phase::Created;
         self.save(&rec);
+        self.mark("Waiting for Vast to start the machine");
 
-        let (outcome, ran) = self.watch(id, &mut rec, plan.limits.max_seconds).await;
+        let (outcome, ran) = tokio::select! {
+            r = self.watch(id, &mut rec, plan.limits.max_seconds) => r,
+            never = self.poll_logs(id) => match never {},
+        };
+        if outcome != Outcome::Completed {
+            // The log goes with the GPU: take what it says while it exists.
+            let _ = tokio::time::timeout(FINAL_LOG_WAIT, self.fetch_logs(id)).await;
+        }
         self.cleanup(&mut rec, &ids, ran, plan.limits.max_seconds)
             .await;
         rec.outcome = Some(format!("{outcome:?}"));
@@ -441,6 +577,13 @@ impl Runner {
         watch: &mut SetupWatch,
     ) -> Result<(Progress, Option<String>), String> {
         let (p, note) = self.remote.status(id).await?;
+        match &p {
+            Progress::Starting => self.mark(&setup_stage_label(note.as_ref())),
+            Progress::Training { .. } => self.mark("Training"),
+            Progress::Evaluating { .. } => self.mark("Making test images"),
+            Progress::Done => self.mark("Finishing up"),
+            Progress::Failed(_) => {}
+        }
         let mut stuck = None;
         if p == Progress::Starting {
             stuck = watch.check((self.clock)(), note.as_ref());
@@ -497,6 +640,9 @@ impl Runner {
                 }
                 Ok(Some(info)) => {
                     provider_errors = 0;
+                    if let Some(m) = info.status_msg.as_deref() {
+                        self.host_said(m);
+                    }
                     match info.health(Duration::from_secs(elapsed), Duration::ZERO) {
                         Health::Failed(m) => {
                             // Keep the host's own words: they say why it died.
@@ -509,16 +655,41 @@ impl Runner {
                             };
                             return (Outcome::Failed(msg), ran);
                         }
-                        Health::Starting => {}
+                        Health::Starting => {
+                            let pulling =
+                                is_pull_output(info.status_msg.as_deref().unwrap_or_default());
+                            self.mark(if pulling {
+                                "Vast is pulling the image"
+                            } else {
+                                "Vast is starting the machine"
+                            });
+                        }
                         Health::Running if !begun => match self.remote.begin(id).await {
                             Ok(()) => {
                                 begun = true;
                                 remote_errors = 0;
+                                self.mark("Reaching the GPU");
                             }
-                            Err(_) if elapsed >= BEGIN_GRACE_SECS => {
-                                return (Outcome::Failed("Couldn't reach the GPU.".into()), ran);
+                            Err(e) => {
+                                // Keep why: it is what tells a tunnel that never
+                                // came up from an upload that failed.
+                                self.host_said(&format!(
+                                    "Couldn't reach the app on the GPU yet: {e}"
+                                ));
+                                if elapsed >= BEGIN_GRACE_SECS {
+                                    let known: Vec<&str> =
+                                        self.secrets.iter().map(String::as_str).collect();
+                                    let why: String =
+                                        redact(&e, &known).chars().take(200).collect();
+                                    return (
+                                        Outcome::Failed(format!(
+                                            "Couldn't reach the GPU after {} min ({why}).",
+                                            BEGIN_GRACE_SECS / 60
+                                        )),
+                                        ran,
+                                    );
+                                }
                             }
-                            Err(_) => {}
                         },
                         Health::Running => match self.progress_noted(id, &mut setup).await {
                             Ok((Progress::Done, _)) => {
@@ -565,6 +736,7 @@ impl Runner {
         if let (Some(&id), true) = (ids.first(), ran) {
             rec.phase = Phase::Syncing;
             self.save(rec);
+            self.mark("Saving results");
             for attempt in 0..SYNC_ATTEMPTS {
                 if matches!(self.remote.sync(id).await, Ok(true)) {
                     rec.synced = true;
@@ -579,6 +751,7 @@ impl Runner {
         }
         rec.phase = Phase::Destroying;
         self.save(rec);
+        self.mark("Destroying the GPU");
         rec.phase = if destroy_all(self.provider.as_ref(), ids, self.poll).await {
             Phase::Destroyed
         } else {
@@ -760,6 +933,7 @@ mod tests {
             clock: Arc::new(move || 1_000_000 + t0.elapsed().as_secs()),
             poll: Duration::from_secs(10),
             cancel: Arc::new(AtomicBool::new(false)),
+            secrets: Vec::new(),
         };
         Rig {
             runner,
@@ -1031,6 +1205,105 @@ mod tests {
         assert_eq!(res.outcome, Outcome::Cancelled);
     }
 
+    /// Provider whose container prints a secret, to prove it is masked.
+    struct LeakyLogs(MockProvider);
+
+    #[async_trait]
+    impl GpuProvider for LeakyLogs {
+        async fn credit(&self) -> Result<f64, ProviderError> {
+            self.0.credit().await
+        }
+        async fn search_offers(&self, q: &OfferQuery) -> Result<Vec<Offer>, ProviderError> {
+            self.0.search_offers(q).await
+        }
+        async fn create_instance(&self, o: u64, s: &LaunchSpec) -> Result<u64, ProviderError> {
+            self.0.create_instance(o, s).await
+        }
+        async fn instance(&self, id: u64) -> Result<Option<InstanceInfo>, ProviderError> {
+            self.0.instance(id).await
+        }
+        async fn list_instances(&self) -> Result<Vec<InstanceInfo>, ProviderError> {
+            self.0.list_instances().await
+        }
+        async fn destroy(&self, id: u64) -> Result<(), ProviderError> {
+            self.0.destroy(id).await
+        }
+        async fn logs(&self, _: u64, _: u32) -> Result<String, ProviderError> {
+            Ok("pulling\nCIVITAI_TOKEN=sekrit-value-1234 loaded\n".into())
+        }
+    }
+
+    #[test]
+    fn timed_lists_skip_repeats_and_stay_bounded() {
+        let mut l = Vec::new();
+        push_if_new(&mut l, 1, "a");
+        push_if_new(&mut l, 2, "a");
+        push_if_new(&mut l, 3, "  ");
+        push_if_new(&mut l, 4, "b");
+        push_if_new(&mut l, 5, "a");
+        assert_eq!(
+            l.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "a"]
+        );
+        for i in 0..200 {
+            push_if_new(&mut l, i, &format!("s{i}"));
+        }
+        assert_eq!(l.len(), MAX_TIMED);
+        assert_eq!(l.last().unwrap().text, "s199");
+        assert_eq!(tail_chars("a\nb\nc\nd", 4), "c\nd");
+        assert_eq!(tail_chars("short", 100), "short");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stages_and_the_container_log_are_visible_during_setup() {
+        let script = Script::new(vec![Ok(Progress::Starting)], vec![Ok(true)])
+            .with_notes(vec![note("installing: packages", 500)]);
+        let r = rig(vec![], script);
+        let (plan, approval) = make_plan(&r.provider, limits());
+        let live = r.runner.live.clone();
+        let cancel = r.runner.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            let seen = live.lock().unwrap().clone();
+            let names: Vec<_> = seen.stages.iter().map(|t| t.text.as_str()).collect();
+            assert_eq!(names.first(), Some(&"Renting the GPU"), "{names:?}");
+            assert!(
+                names.contains(&"Installing the training environment"),
+                "{names:?}"
+            );
+            assert!(seen.container_log.contains("container started"));
+            assert!(seen.container_log_unix.is_some() && seen.container_log_error.is_none());
+            cancel.store(true, Ordering::SeqCst);
+        });
+        let res = r.runner.run(&plan, &approval).await.unwrap();
+        assert_eq!(res.outcome, Outcome::Cancelled);
+        // The log taken before the GPU was destroyed is still there.
+        let live = r.runner.live.lock().unwrap();
+        assert!(live.container_log.contains("container started"));
+        assert_eq!(live.stages.last().unwrap().text, "Destroying the GPU");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn container_logs_are_masked_with_known_secrets() {
+        let script = Script::new(vec![Ok(Progress::Starting)], vec![Ok(true)]);
+        let mut r = rig(vec![], script);
+        r.runner.provider = Arc::new(LeakyLogs(r.provider.clone()));
+        r.runner.secrets = vec!["sekrit-value-1234".into()];
+        let (plan, approval) = make_plan(&r.provider, limits());
+        let live = r.runner.live.clone();
+        let cancel = r.runner.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let log = live.lock().unwrap().container_log.clone();
+            assert!(
+                log.contains("loaded") && !log.contains("sekrit-value-1234"),
+                "{log}"
+            );
+            cancel.store(true, Ordering::SeqCst);
+        });
+        r.runner.run(&plan, &approval).await.unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cancel_destroys() {
         let r = rig(vec![], Script::new(vec![step(5)], vec![Ok(true)]));
@@ -1192,8 +1465,14 @@ mod tests {
         let res = r.runner.run(&plan, &approval).await.unwrap();
         assert_eq!(
             res.outcome,
-            Outcome::Failed("Couldn't reach the GPU.".into())
+            Outcome::Failed("Couldn't reach the GPU after 15 min (no route).".into())
         );
+        // The reason is also in what the user sees, with when it first happened.
+        let live = r.runner.live.lock().unwrap();
+        assert!(live.host_status.iter().any(|h| h
+            .text
+            .contains("Couldn't reach the app on the GPU yet: no route")));
+        drop(live);
         assert_eq!(res.record.phase, Phase::Destroyed);
         assert!(r.provider.live_ids().is_empty());
         // It never ran, so there was nothing to sync.

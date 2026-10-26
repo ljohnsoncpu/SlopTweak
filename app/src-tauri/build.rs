@@ -53,6 +53,8 @@ fn main() {
             "train_cancel",
             "train_dismiss",
             "train_open_results",
+            "machine_list",
+            "machine_forget",
         ]),
     ))
     .expect("tauri build");
