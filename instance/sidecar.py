@@ -79,6 +79,8 @@ TRAIN_UPLOADS = frozenset({"job.json", "dataset.tar"})
 TRAIN_UPLOAD_MAX_BYTES = 512 * 1024 * 1024
 TRAIN_LOGS = frozenset({"train", "evaluate-0", "bootstrap-packages"})
 TRAIN_LOG_TAIL_BYTES = 16 * 1024
+TRAIN_SETUP_STAGES = frozenset({"waiting", "bootstrap", "prepare"})
+TRAIN_SETUP_TAIL_BYTES = 1024
 TRAIN_ACTIVE_STAGES = frozenset({"bootstrap", "prepare", "train", "evaluate"})
 
 
@@ -373,7 +375,36 @@ class Sidecar:
         if (denied := self._train_guard(request)) is not None:
             return denied
         started = (self.cfg.train_work / "incoming" / "start").exists()
-        return web.json_response({**self.train_state(), "started": started})
+        state = self.train_state()
+        extra: dict[str, Any] = {}
+        if state.get("stage") in TRAIN_SETUP_STAGES:
+            extra = self._setup_log()
+        return web.json_response({**state, **extra, "started": started})
+
+    def _setup_log(self) -> dict[str, Any]:
+        """Total size and tail of the setup logs, so the app can tell a quiet
+        install from a stuck one and show what it is doing."""
+        logs = self.cfg.train_work / "runtime" / "logs"
+        total = 0
+        newest: tuple[float, Path] | None = None
+        for path in logs.glob("bootstrap-*.log"):
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            total += st.st_size
+            if newest is None or st.st_mtime > newest[0]:
+                newest = (st.st_mtime, path)
+        tail = b""
+        if newest is not None:
+            try:
+                with newest[1].open("rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    f.seek(max(0, f.tell() - TRAIN_SETUP_TAIL_BYTES))
+                    tail = f.read()
+            except OSError:
+                pass
+        return {"log_bytes": total, "log_tail": tail.decode("utf-8", "replace")}
 
     async def handle_train_manifest(self, request: web.Request) -> web.Response:
         if (denied := self._train_guard(request)) is not None:

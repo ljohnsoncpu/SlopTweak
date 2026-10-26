@@ -14,7 +14,7 @@ use super::dataset;
 use super::job::{self, BaseModel, JobBundle};
 use super::run::{
     offer_query, Approval, Limits, Live, Outcome, Phase, Plan as RunPlan, Progress, Quote,
-    RemoteTrain, RunFile, RunResult, Runner,
+    RemoteTrain, RunFile, RunResult, Runner, STUCK_SETUP_BLAME_SECS,
 };
 use super::settings::{EvalPrompt, TrainSettings};
 use crate::provider::machines::MachineFile;
@@ -120,6 +120,11 @@ pub struct Status {
     pub error: Option<String>,
     /// The GPU is confirmed gone. False means the user must check Vast.
     pub destroyed: bool,
+    /// While the GPU is being set up: the step it reports, the end of its log,
+    /// and how long nothing has changed.
+    pub setup_detail: Option<String>,
+    pub setup_log: Option<String>,
+    pub setup_quiet_secs: Option<u64>,
 }
 
 impl Status {
@@ -143,6 +148,9 @@ impl Status {
             outcome: None,
             error: None,
             destroyed: false,
+            setup_detail: None,
+            setup_log: None,
+            setup_quiet_secs: None,
         }
     }
 }
@@ -364,14 +372,11 @@ impl TrainManager {
             if let Some(m) = machine {
                 let never_started =
                     matches!(seen_live.lock().unwrap().progress, Progress::Starting);
-                match &result.outcome {
-                    Outcome::Completed => {
-                        let _ = machines.record(m, true, clock());
-                    }
-                    Outcome::Failed(_) if never_started => {
-                        let _ = machines.record(m, false, clock());
-                    }
-                    _ => {}
+                let now = clock();
+                if let Some(ok) =
+                    host_verdict(&result.outcome, never_started, now.saturating_sub(stamp))
+                {
+                    let _ = machines.record(m, ok, now);
                 }
             }
             *done.lock().unwrap() = Some(result);
@@ -434,6 +439,13 @@ impl TrainManager {
             }
             _ => {}
         }
+        if result.is_none() {
+            if let Some(n) = &live.setup {
+                s.setup_detail = n.detail.clone();
+                s.setup_log = Some(n.log_tail.trim().to_string()).filter(|t| !t.is_empty());
+                s.setup_quiet_secs = live.setup_quiet_since.map(|q| self.now().saturating_sub(q));
+            }
+        }
         s.message = message(&live.progress, rec.map(|r| r.phase), result.as_ref());
         if let Some(r) = &result {
             let (outcome, error) = match &r.outcome {
@@ -454,6 +466,23 @@ impl TrainManager {
             .unwrap()
             .as_ref()
             .map(|a| a.results_dir.clone())
+    }
+}
+
+/// What a finished run says about its host: `Some(true)` worked, `Some(false)`
+/// never got the run going, `None` says nothing (a crash mid-training, or a
+/// quick cancel). A run the user stops or that hits its limit while still in
+/// setup counts against the host once it had run [`STUCK_SETUP_BLAME_SECS`].
+fn host_verdict(outcome: &Outcome, never_started: bool, ran_secs: u64) -> Option<bool> {
+    match outcome {
+        Outcome::Completed => Some(true),
+        Outcome::Failed(_) if never_started => Some(false),
+        Outcome::Cancelled | Outcome::DeadlineHit
+            if never_started && ran_secs >= STUCK_SETUP_BLAME_SECS =>
+        {
+            Some(false)
+        }
+        _ => None,
     }
 }
 
@@ -764,6 +793,56 @@ mod tests {
         // The mock has one qualifying machine, and it just failed.
         let e = r.mgr.quote(request(&r)).await.unwrap_err();
         assert!(e.contains("No suitable GPU"), "{e}");
+    }
+
+    #[test]
+    fn only_a_long_stop_during_setup_counts_against_the_host() {
+        let long = STUCK_SETUP_BLAME_SECS;
+        assert_eq!(host_verdict(&Outcome::Completed, false, 0), Some(true));
+        assert_eq!(
+            host_verdict(&Outcome::Failed("x".into()), true, 5),
+            Some(false)
+        );
+        // Failed after training began: not the host's setup.
+        assert_eq!(
+            host_verdict(&Outcome::Failed("x".into()), false, long),
+            None
+        );
+        for o in [Outcome::Cancelled, Outcome::DeadlineHit] {
+            assert_eq!(host_verdict(&o, true, long), Some(false));
+            assert_eq!(
+                host_verdict(&o, true, long - 1),
+                None,
+                "a quick stop says nothing"
+            );
+            assert_eq!(host_verdict(&o, false, long), None);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopping_a_host_stuck_in_setup_gets_it_skipped() {
+        let r = rig(vec![Progress::Starting]);
+        let q = r.mgr.quote(request(&r)).await.unwrap();
+        r.mgr.start(&q.plan_id).unwrap();
+        tokio::time::sleep(Duration::from_secs(STUCK_SETUP_BLAME_SECS + 30)).await;
+        r.mgr.cancel();
+        let s = finish(&r.mgr).await;
+        assert_eq!(s.outcome.as_deref(), Some("cancelled"));
+        r.mgr.dismiss();
+        let e = r.mgr.quote(request(&r)).await.unwrap_err();
+        assert!(e.contains("No suitable GPU"), "{e}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quick_stop_leaves_the_host_eligible() {
+        let r = rig(vec![Progress::Starting]);
+        let q = r.mgr.quote(request(&r)).await.unwrap();
+        r.mgr.start(&q.plan_id).unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        r.mgr.cancel();
+        finish(&r.mgr).await;
+        r.mgr.dismiss();
+        assert!(r.mgr.quote(request(&r)).await.is_ok());
     }
 
     #[tokio::test(start_paused = true)]
