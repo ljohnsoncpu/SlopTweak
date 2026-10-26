@@ -579,26 +579,32 @@ impl Runner {
         }
         rec.phase = Phase::Destroying;
         self.save(rec);
-        let mut leftover: Vec<u64> = ids.to_vec();
-        for _ in 0..DESTROY_ATTEMPTS {
-            for id in &leftover {
-                let _ = self.provider.destroy(*id).await;
-            }
-            if let Ok(list) = self.provider.list_instances().await {
-                leftover.retain(|id| list.iter().any(|i: &InstanceInfo| i.id == *id));
-                if leftover.is_empty() {
-                    break;
-                }
-            }
-            tokio::time::sleep(self.poll).await;
-        }
-        rec.phase = if leftover.is_empty() {
+        rec.phase = if destroy_all(self.provider.as_ref(), ids, self.poll).await {
             Phase::Destroyed
         } else {
             Phase::CleanupUnconfirmed
         };
         self.save(rec);
     }
+}
+
+/// Destroy `ids`, retrying, until the provider no longer lists any of them.
+/// `false` means at least one may still be billing.
+pub async fn destroy_all(provider: &dyn GpuProvider, ids: &[u64], poll: Duration) -> bool {
+    let mut leftover: Vec<u64> = ids.to_vec();
+    for _ in 0..DESTROY_ATTEMPTS {
+        for id in &leftover {
+            let _ = provider.destroy(*id).await;
+        }
+        if let Ok(list) = provider.list_instances().await {
+            leftover.retain(|id| list.iter().any(|i: &InstanceInfo| i.id == *id));
+            if leftover.is_empty() {
+                return true;
+            }
+        }
+        tokio::time::sleep(poll).await;
+    }
+    leftover.is_empty()
 }
 
 #[cfg(test)]

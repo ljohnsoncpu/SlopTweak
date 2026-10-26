@@ -1379,14 +1379,49 @@ async fn open_link(app: AppHandle, st: State<'_, AppState>, id: String) -> Resul
 
 #[tauri::command]
 async fn scan_orphans(st: State<'_, AppState>) -> Result<Vec<Orphan>, String> {
-    st.manager()?
+    let orphans = st
+        .manager()?
         .scan_orphans()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Built here if needed: a run killed last time leaves a record to settle.
+    let Ok(train) = st.train_manager() else {
+        return Ok(orphans);
+    };
+    // A leftover run record whose GPU is gone would block new runs forever.
+    train.settle_leftover().await;
+    Ok(orphans
+        .into_iter()
+        .filter_map(
+            |mut o| match train.ownership(o.instance_id, o.label.as_deref()) {
+                // The run in progress is not an orphan; it is watched.
+                train::manager::Ownership::Running => None,
+                train::manager::Ownership::Leftover => {
+                    o.training = true;
+                    o.can_reattach = false;
+                    Some(o)
+                }
+                train::manager::Ownership::Other => Some(o),
+            },
+        )
+        .collect())
 }
 
 #[tauri::command]
 async fn destroy_orphan(st: State<'_, AppState>, instance_id: u64) -> Result<(), String> {
+    if let Ok(train) = st.train_manager() {
+        let manager = st.manager()?;
+        let label = match manager.scan_orphans().await {
+            Ok(list) => list
+                .into_iter()
+                .find(|o| o.instance_id == instance_id)
+                .and_then(|o| o.label),
+            Err(_) => None,
+        };
+        if train.ownership(instance_id, label.as_deref()) == train::manager::Ownership::Leftover {
+            return train.destroy_leftover(instance_id, label.as_deref()).await;
+        }
+    }
     st.manager()?.destroy_orphan(instance_id)
 }
 
@@ -1399,15 +1434,34 @@ async fn reattach_orphan(st: State<'_, AppState>, instance_id: u64) -> Result<()
     st.manager()?.reattach(instance_id).await
 }
 
+/// What the close dialog needs to say: which kinds of GPU are rented.
+#[derive(Clone, Serialize)]
+struct CloseRequest {
+    session: bool,
+    training: bool,
+}
+
 /// The user confirmed closing while a GPU runs: destroy it, then exit.
 #[tauri::command]
 async fn confirm_close(app: AppHandle, st: State<'_, AppState>) -> Result<(), String> {
-    let m = st.manager()?;
-    // The last image sync, then destroy + confirm; both are bounded.
-    if !m.stop_and_wait(m.timing().stop_budget()).await {
-        return Err(
-            "Couldn't confirm the GPU was shut down. Not closing, so you can try again.".into(),
-        );
+    // A training run downloads what exists, then destroys its GPU.
+    let train = st.train.lock().unwrap().clone();
+    if let Some(t) = train.filter(|t| t.is_running()) {
+        if !t.stop_and_wait(train::manager::STOP_BUDGET).await {
+            return Err(
+                "Couldn't confirm the training GPU was shut down. Not closing, so you can                  try again."
+                    .into(),
+            );
+        }
+    }
+    let manager = st.manager.lock().unwrap().clone();
+    if let Some(m) = manager {
+        // The last image sync, then destroy + confirm; both are bounded.
+        if !m.stop_and_wait(m.timing().stop_budget()).await {
+            return Err(
+                "Couldn't confirm the GPU was shut down. Not closing, so you can try again.".into(),
+            );
+        }
     }
     st.ui.remote.close();
     app.exit(0);
@@ -1560,7 +1614,7 @@ async fn install_update(app: AppHandle, st: State<'_, AppState>) -> Result<(), S
         if *installing {
             return Err("The update is already being installed.".into());
         }
-        updater::may_install(session_active(&app))?;
+        updater::may_install(gpu_active(&app))?;
         *installing = true;
     }
     let result = install_pending(&app, &st).await;
@@ -1599,7 +1653,7 @@ async fn install_pending(app: &AppHandle, st: &AppState) -> Result<(), String> {
         .map_err(|e| format!("The update didn't download ({e}). SlopTweak wasn't changed."))?;
     // `installing` has kept sessions from starting since the check above;
     // check again right before the installer takes over, to be sure.
-    updater::may_install(session_active(app))?;
+    updater::may_install(gpu_active(app))?;
     // The installer closes this process: close the Invoke window first.
     st.ui.remote.close();
     update
@@ -1613,6 +1667,18 @@ fn session_active(app: &AppHandle) -> bool {
     let st = app.state::<AppState>();
     let m = st.manager.lock().unwrap().clone();
     m.is_some_and(|m| m.is_busy() || m.state().is_active())
+}
+
+/// A training run holds a rented GPU until it has synced and destroyed it.
+fn training_active(app: &AppHandle) -> bool {
+    let st = app.state::<AppState>();
+    let m = st.train.lock().unwrap().clone();
+    m.is_some_and(|m| m.is_running())
+}
+
+/// Any rented GPU: closing the app or installing an update would abandon it.
+fn gpu_active(app: &AppHandle) -> bool {
+    session_active(app) || training_active(app)
 }
 
 /// The output folder is fixed while a GPU runs: sync skips images it already
@@ -1851,9 +1917,16 @@ pub fn run() {
             }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle();
-                if session_active(app) {
+                if gpu_active(app) {
                     api.prevent_close();
-                    let _ = app.emit_to("main", "close-requested", ());
+                    let _ = app.emit_to(
+                        "main",
+                        "close-requested",
+                        CloseRequest {
+                            session: session_active(app),
+                            training: training_active(app),
+                        },
+                    );
                 } else {
                     app.state::<AppState>().ui.remote.close();
                     app.exit(0);

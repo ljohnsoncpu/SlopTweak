@@ -8,13 +8,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
+use tokio::time::Instant;
 
 use super::commands::{self, Plan};
 use super::dataset;
 use super::job::{self, BaseModel, JobBundle};
 use super::run::{
-    offer_query, Approval, Limits, Live, Outcome, Phase, Plan as RunPlan, Progress, Quote,
-    RemoteTrain, RunFile, RunResult, Runner, STUCK_SETUP_BLAME_SECS,
+    destroy_all, offer_query, Approval, Limits, Live, Outcome, Phase, Plan as RunPlan, Progress,
+    Quote, RemoteTrain, RunFile, RunRecord, RunResult, Runner, STUCK_SETUP_BLAME_SECS,
 };
 use super::settings::{EvalPrompt, TrainSettings};
 use crate::provider::machines::MachineFile;
@@ -23,6 +24,9 @@ use crate::provider::{attempt_label, GpuProvider, Offer};
 
 /// A quote stays valid this long; after that the GPU price may have changed.
 pub const QUOTE_TTL_SECS: u64 = 10 * 60;
+/// How long closing the app waits for a stopping run to download what exists
+/// and destroy its GPU. Past this the app stays open so the user can retry.
+pub const STOP_BUDGET: Duration = Duration::from_secs(5 * 60);
 /// Where the app's own estimate of a run's length starts: environment setup and
 /// model download before the first training step.
 const SETUP_MINUTES: u64 = 12;
@@ -155,6 +159,16 @@ impl Status {
     }
 }
 
+/// How an instance relates to the training run record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ownership {
+    /// The GPU of the run in progress.
+    Running,
+    /// A GPU an earlier run left behind that may still bill.
+    Leftover,
+    Other,
+}
+
 pub struct TrainManager {
     deps: Deps,
     pending: Mutex<Option<Pending>>,
@@ -176,6 +190,97 @@ impl TrainManager {
 
     fn now(&self) -> u64 {
         (self.deps.clock)()
+    }
+
+    fn run_file(&self) -> RunFile {
+        RunFile::new(&self.deps.record_dir.join("train_run.json"))
+    }
+
+    /// The record of the run in progress, if one is.
+    fn running_record(&self) -> Option<RunRecord> {
+        let a = self.active.lock().unwrap().clone()?;
+        if a.done.lock().unwrap().is_some() {
+            return None;
+        }
+        let rec = a.live.lock().unwrap().record.clone();
+        rec
+    }
+
+    /// A run record that says a GPU may be billing, left by a run that is not
+    /// in progress (the app was killed or crashed).
+    fn leftover_record(&self) -> Option<RunRecord> {
+        if self.is_running() {
+            return None;
+        }
+        self.run_file().load().filter(|r| !r.phase.is_finished())
+    }
+
+    /// Whose is this instance? The run in progress is not an orphan, and a
+    /// leftover one needs the user to shut it down.
+    pub fn ownership(&self, id: u64, label: Option<&str>) -> Ownership {
+        let matches = |r: &RunRecord| r.instance_id == Some(id) || label == Some(r.label.as_str());
+        if self.running_record().is_some_and(|r| matches(&r)) {
+            Ownership::Running
+        } else if self.leftover_record().is_some_and(|r| matches(&r)) {
+            Ownership::Leftover
+        } else {
+            Ownership::Other
+        }
+    }
+
+    /// A leftover record whose GPU is no longer listed has nothing billing:
+    /// close it, so it stops blocking new runs.
+    pub async fn settle_leftover(&self) {
+        let Some(mut rec) = self.leftover_record() else {
+            return;
+        };
+        let Ok(list) = self.deps.provider.list_instances().await else {
+            return;
+        };
+        let listed = list
+            .iter()
+            .any(|i| rec.instance_id == Some(i.id) || i.label.as_deref() == Some(&rec.label));
+        if !listed {
+            rec.phase = Phase::Destroyed;
+            rec.outcome = Some("The GPU was already gone when SlopTweak reopened.".into());
+            let _ = self.run_file().save(&rec);
+        }
+    }
+
+    /// Shut down a GPU left by an earlier run, and confirm it is gone.
+    pub async fn destroy_leftover(&self, id: u64, label: Option<&str>) -> Result<(), String> {
+        if self.is_running() {
+            return Err("A training run is in progress. Stop it first.".into());
+        }
+        if !destroy_all(self.deps.provider.as_ref(), &[id], self.deps.poll).await {
+            return Err(format!(
+                "Couldn't confirm GPU {id} was shut down. Check the Vast console."
+            ));
+        }
+        if self.ownership(id, label) == Ownership::Leftover {
+            if let Some(mut rec) = self.leftover_record() {
+                rec.phase = Phase::Destroyed;
+                rec.outcome = Some("Shut down after the app stopped watching it.".into());
+                let _ = self.run_file().save(&rec);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop the run (it downloads what exists, then destroys the GPU) and wait
+    /// for that. `true` only when no run is left and its GPU is confirmed gone.
+    pub async fn stop_and_wait(&self, limit: Duration) -> bool {
+        self.cancel();
+        let deadline = Instant::now() + limit;
+        while self.is_running() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let active = self.active.lock().unwrap().clone();
+        let done = active.and_then(|a| a.done.lock().unwrap().clone());
+        done.is_none_or(|r| r.record.phase != Phase::CleanupUnconfirmed)
     }
 
     pub fn is_running(&self) -> bool {
@@ -323,7 +428,7 @@ impl TrainManager {
             live: live.clone(),
             provider: self.deps.provider.clone(),
             remote: (self.deps.remote)(secret, results_dir.join("results"), pending.bundle.clone()),
-            file: RunFile::new(&self.deps.record_dir.join("train_run.json")),
+            file: self.run_file(),
             clock: self.deps.clock.clone(),
             poll: self.deps.poll,
             cancel: cancel.clone(),
@@ -843,6 +948,141 @@ mod tests {
         finish(&r.mgr).await;
         r.mgr.dismiss();
         assert!(r.mgr.quote(request(&r)).await.is_ok());
+    }
+
+    fn leftover_record(r: &Rig, id: u64, phase: Phase) {
+        let rec = RunRecord {
+            label: "sloptweak-leftover".into(),
+            phase,
+            instance_id: Some(id),
+            offer_id: 104,
+            hourly: 0.4,
+            started_unix: Some(1_000_000),
+            synced: false,
+            outcome: None,
+        };
+        r.mgr.run_file().save(&rec).unwrap();
+    }
+
+    async fn rent(r: &Rig) -> u64 {
+        let spec = crate::provider::LaunchSpec {
+            image: "img".into(),
+            disk_gb: 80,
+            label: "sloptweak-leftover".into(),
+            env: vec![],
+            onstart: String::new(),
+        };
+        r.provider.create_instance(104, &spec).await.unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_gpu_of_a_run_in_progress_is_not_an_orphan() {
+        let r = rig(vec![Progress::Starting]);
+        let q = r.mgr.quote(request(&r)).await.unwrap();
+        r.mgr.start(&q.plan_id).unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let id = r.provider.live_ids()[0];
+        assert_eq!(r.mgr.ownership(id, None), Ownership::Running);
+        assert_eq!(r.mgr.ownership(id + 1, None), Ownership::Other);
+        r.mgr.cancel();
+        finish(&r.mgr).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_and_wait_downloads_destroys_and_confirms() {
+        let r = rig(vec![Progress::Training {
+            step: 5,
+            total: 400,
+        }]);
+        let q = r.mgr.quote(request(&r)).await.unwrap();
+        r.mgr.start(&q.plan_id).unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(r.mgr.is_running());
+        assert!(r.mgr.stop_and_wait(STOP_BUDGET).await);
+        assert!(!r.mgr.is_running());
+        assert!(r.provider.live_ids().is_empty());
+        let s = r.mgr.status();
+        assert_eq!(
+            (s.outcome.as_deref(), s.destroyed, s.synced),
+            (Some("cancelled"), true, true)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_and_wait_gives_up_after_its_budget_but_keeps_stopping() {
+        let r = rig(vec![Progress::Starting]);
+        let q = r.mgr.quote(request(&r)).await.unwrap();
+        r.mgr.start(&q.plan_id).unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        // Too short for a destroy to be confirmed: the caller must not close.
+        assert!(!r.mgr.stop_and_wait(Duration::from_millis(1)).await);
+        // The stop was requested anyway, so the run still ends and destroys.
+        finish(&r.mgr).await;
+        assert!(r.provider.live_ids().is_empty());
+        assert!(r.mgr.stop_and_wait(STOP_BUDGET).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_running_means_nothing_to_wait_for() {
+        let r = rig(vec![Progress::Done]);
+        assert!(r.mgr.stop_and_wait(STOP_BUDGET).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_leftover_whose_gpu_is_gone_stops_blocking_new_runs() {
+        let r = rig(vec![Progress::Done]);
+        leftover_record(&r, 999, Phase::Running);
+        assert_eq!(r.mgr.ownership(999, None), Ownership::Leftover);
+        r.mgr.settle_leftover().await;
+        assert_eq!(r.mgr.ownership(999, None), Ownership::Other);
+        assert_eq!(r.mgr.run_file().load().unwrap().phase, Phase::Destroyed);
+        let q = r.mgr.quote(request(&r)).await.unwrap();
+        assert!(r.mgr.start(&q.plan_id).is_ok());
+        finish(&r.mgr).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_leftover_that_still_bills_waits_for_the_user_then_is_destroyed() {
+        let r = rig(vec![Progress::Done]);
+        let id = rent(&r).await;
+        leftover_record(&r, id, Phase::Running);
+        r.mgr.settle_leftover().await;
+        assert_eq!(r.provider.live_ids(), vec![id], "never destroyed unasked");
+        assert_eq!(r.mgr.ownership(id, None), Ownership::Leftover);
+        r.mgr.destroy_leftover(id, None).await.unwrap();
+        assert!(r.provider.live_ids().is_empty());
+        assert_eq!(r.mgr.run_file().load().unwrap().phase, Phase::Destroyed);
+        assert!(r.mgr.quote(request(&r)).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_crash_mid_create_is_matched_by_label() {
+        let r = rig(vec![Progress::Done]);
+        let id = rent(&r).await;
+        let rec = RunRecord {
+            label: "sloptweak-leftover".into(),
+            phase: Phase::Creating,
+            instance_id: None,
+            offer_id: 104,
+            hourly: 0.4,
+            started_unix: Some(1_000_000),
+            synced: false,
+            outcome: None,
+        };
+        r.mgr.run_file().save(&rec).unwrap();
+        assert_eq!(
+            r.mgr.ownership(id, Some("sloptweak-leftover")),
+            Ownership::Leftover
+        );
+        assert_eq!(
+            r.mgr.ownership(id, Some("sloptweak-other")),
+            Ownership::Other
+        );
+        r.mgr
+            .destroy_leftover(id, Some("sloptweak-leftover"))
+            .await
+            .unwrap();
+        assert_eq!(r.mgr.run_file().load().unwrap().phase, Phase::Destroyed);
     }
 
     #[tokio::test(start_paused = true)]

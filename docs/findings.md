@@ -2667,3 +2667,24 @@ Verified from the Codex Thalia run (2026-10-25) and while building T1/T2:
 - 🧪 Unverified on a real GPU: whether `uv pip sync` writes anything to its
   log while downloading torch (non-tty, so probably not). If a healthy host
   trips the 8 min stall, raise `SETUP_STALL_SECS` in `train/run.rs`.
+
+## Training GPUs and closing the app (2026-10-26)
+
+- **Found:** closing the main window, or installing an update, checked only the
+  session manager (`session_active`). With a training run going, the app exited
+  and the run's task died with it, leaving the GPU billing until the
+  instance's own deadman timer fired. The live training GPU also showed up in
+  the "GPU from an earlier session" list with a Shut-it-down button, and a
+  stale unfinished run record blocked every later run with no way to clear it.
+- **Now:** `gpu_active` (session or training) guards the window close and the
+  update install. The close dialog names what is running; confirming stops the
+  run (it downloads what exists, then destroys the GPU) and waits up to
+  5 min for the destroy to be confirmed, else the app stays open to retry.
+  The running training GPU is not listed as an orphan. A leftover from a killed
+  app is listed as a "Training run" with Shut it down (never destroyed
+  unasked); shutting it down, or finding it already gone, closes the run
+  record so new runs can start. Matching uses the instance id, or the attempt
+  label for a crash during the create call.
+- Not done: reconnecting to a leftover training GPU to download its results.
+  The launch secret isn't stored, and the instance's deadman timer destroys
+  it soon after the app stops sending heartbeats.
