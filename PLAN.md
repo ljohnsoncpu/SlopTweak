@@ -330,8 +330,63 @@ time at a pinned commit and tree digest, never vendored.
 - **K3 (pending):** evaluation images (MOSS ComfyUI graph with the exported LoRA
   against a base control, or the trainer's sampler), the saved per-card
   kernel-tuning cache, and a `kromoss` catalog entry for the MOSS panel.
-Invariants are Phase T's. Caption default (`mix` or `nl`) and whether this
-becomes a general MOSS preset are open (§9).
+- **K3 progress (2026-10-28):** the `kromoss` catalog entry is R0's; a trained LoRA can be tried in the
+  MOSS panel (upload, strength, base control; committed) and picked from the latest runs' results
+  without a file dialog (`train/recent.rs`); the bundle carries the 4090 kernel-tuning tables
+  (`moss_kernel_cache.tgz`, restored before training) and every run hands its own tables back as
+  `kernel-cache.tgz` for `kernel_cache.py merge`. Both are untried on an instance.
+Invariants are Phase T's.
+
+### Phase R — Regional-LoRA layouts in the MOSS panel (user decision 2026-10-28)
+Goal: a **Layout** mode in the MOSS panel. The user draws labelled boxes, gives a box
+its own LoRA, and gets one picture where each LoRA only changes its own box. Mechanism
+(settled by the spike): MOSS's trained-in JSON layout prompt makes the base picture, then
+one masked img2img pass per LoRA box, pasted back through the mask, all in one ComfyUI
+graph. ComfyUI hook LoRAs were tried and rejected (int8 crash; bf16 bleed, broken layout,
+6-40x slower). Evidence: `docs/findings.md` ("Regional-LoRA spike" sections); design:
+`docs/spikes/regional-lora-design.md`.
+Settled 2026-10-28: v1 is **Fast mode only**; **Layout is a mode inside the MOSS panel**;
+LoRAs come from **local files uploaded to the instance** (CivitAI-at-provision later);
+limits 12 boxes, 6 LoRA passes, 1 GB per LoRA, 8 LoRAs per session; the result is the
+final picture only.
+- **R0 (code done, unit-tested; never run on an instance):** the `kromoss` catalog entry
+  (all files pinned: Kromoss at HF revision `a4fe9744`, the shared int8 encoder, the
+  small FLUX.2 VAE, the DMD2 LoRA), `moss::ModelFiles.time_delta` (the time-embedding
+  patch is optional), `provision.sh` recognising a MOSS instance by either main file and
+  building the delta only when a time-embedding file exists, and `moss_workflow.py`
+  without a patch node. The bundle changed, so `ASSETS_SHA256` is re-pinned; the entry
+  works on a real instance only after a release publishes that bundle (needs the user's OK).
+  This is also Phase K3's catalog entry.
+- **R1 (done; unit-tested and run on the local ComfyUI, never on an instance):**
+  `app/src-tauri/src/moss/layout.rs` (`LayoutRequest`, `layout::check`, layout JSON, `extend_graph`
+  called by `build_graph`, scaled timeout, estimate), wired into `moss.rs`. Local acceptance
+  (`spikes/regional-lora/check_graphs.py`): the Rust graph reproduces the spike's layout picture
+  byte for byte, outside-box pixels are identical, inside the box changes. No UI.
+- **R2 (done; 43/43 UI checks against the mock GPU, never on a real instance):** the Layout tab in the MOSS
+  panel: `app/src/layout.ts` + `layout.css` (boxes as divs over an SVG grid; draw, move, resize
+  by mouse; arrow / Alt+arrow / `[` `]` / Delete by keyboard; box list with reorder; position
+  fields; kind, description, words, LoRA, strength, change amount), small hooks in `main.ts` and
+  `index.html`, `app/dev/layout-preview.html` (stub page) and `app/dev/layout-ui-check.mjs`
+  (real window, mock GPU, real mouse and key events). Per-box LoRAs come from the panel's own
+  uploads; the editor's "Add a LoRA file…" button clicks that flow.
+- **R3 (done, unit-tested; never on a real instance):** the upload path itself (`/__lora/` endpoint,
+  `user/` names, header check) came from the Kromoss LoRA session. R3 added `moss/probe.rs`, which
+  reads a LoRA's tensor names before the upload and checks them against ComfyUI's MOSS key map
+  (kohya `lora_unet_layers_N_proj_*` and generic `diffusion_model.layers.N.proj.*`): a LoRA for
+  another model or an empty file is refused (ComfyUI would load it as a silent no-op), a partial fit
+  is added with a note. Checked against every real Kohaku export on the PC and lodestones' DMD2. Also
+  the 8-LoRAs-per-session cap, in the app before the upload (`MAX_LORAS_PER_GPU`) and in the sidecar
+  (`LORA_MAX_FILES`, was 20). The instance bundle changed again and is re-pinned. Still unverified:
+  whether ComfyUI lists a newly added LoRA without a restart (R4's local test decides).
+- **R4 (local part done 2026-10-28; live part and user-guide pending):** 12 pictures on the laptop (3-box,
+  6-box with two LoRAs, busy-background seam scene): layout 12/12, nothing outside a box changes (diff 0.0),
+  LoRA look clear, no visible seam at feather 48; a LoRA added while ComfyUI runs is usable at once
+  (`docs/findings.md`, "R4 local acceptance"). It found and fixed a bug in R1's graph: the feather never
+  reached the box edges (ComfyUI's FeatherMask feathers the mask image's border). Still to do: one live
+  run on a rented 24 GB card with the user's approval of GPU, $/hr, duration and cap (on-demand only),
+  and `docs/user-guide.md`.
+Invariants: nothing here rents anything; uploads are data only (safetensors, never pickle),
+named and rooted by the sidecar, size-capped and hash-verified; ComfyUI stays on 127.0.0.1.
 
 ## 5. Security checklist
 - Vast key and CivitAI key only in Credential Manager; never logged, never in
@@ -390,5 +445,5 @@ becomes a general MOSS preset are open (§9).
 7. **KohakuMoss licence naming.** It asks for "Kohaku" in the name of works
    built on it. The spike reads SlopTweak as outside this (the trainer is
    fetched at run time, never vendored); the user decides.
-8. **Kromoss caption default** (`mix` or `nl`; evidence is thin: 2 seeds, by
-   eye) and **scope** (Kromoss only, or a MOSS preset that also takes Base/SFT).
+8. ~~Kromoss caption default and scope~~ Settled 2026-10-28: **`mix` is the default**
+   caption mode, and the trainer is **Kromoss-only** for now (no Base/SFT preset).

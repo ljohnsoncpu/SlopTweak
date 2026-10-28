@@ -119,6 +119,38 @@ def test_names_come_from_the_model_lines() -> None:
         w.names_from_model_lines("", TIME)
 
 
+def test_fast_chain_without_a_delta_is_just_the_lora() -> None:
+    wf = w.build(UNET, CLIP, VAE, LORA, None, True)
+    assert [n["widgets_values"][0] for n in _by_type(wf, "LoraLoaderModelOnly")] == [LORA]
+    (sampler,) = _by_type(wf, "KSampler")
+    nodes = {n["id"]: n for n in wf["nodes"]}
+    links = {link[0]: link for link in wf["links"]}
+    model_in = next(i for i in sampler["inputs"] if i["name"] == "model")
+    assert nodes[links[model_in["link"]][1]]["widgets_values"][0] == LORA
+    # Full quality has no LoRA either way.
+    assert not _by_type(w.build(UNET, CLIP, VAE, LORA, None, False), "LoraLoaderModelOnly")
+
+
+def test_kromoss_lines_write_workflows_with_no_patch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lines = "\n".join(
+        "\t".join([f"https://x/{n}", "0" * 64, "1", n, "0", dest])
+        for n, dest in [
+            ("kromoss_bf16.safetensors", "diffusion_models"),
+            (CLIP, "text_encoders"),
+            ("flux2-vae_small.safetensors", "vae"),
+            ("kromoss-8-steps-dmd2-lora.safetensors", "loras"),
+        ]
+    )
+    monkeypatch.setenv("MODEL_LINES", lines)
+    assert w.main(["x", str(tmp_path / "wf"), DELTA, TIME]) == 0
+    fast = json.loads((tmp_path / "wf" / w.FAST_TITLE).read_text(encoding="utf-8"))
+    names = [n["widgets_values"][0] for n in _by_type(fast, "LoraLoaderModelOnly")]
+    assert names == ["kromoss-8-steps-dmd2-lora.safetensors"]
+    assert DELTA not in json.dumps(fast)
+
+
 def test_write_makes_both_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MODEL_LINES", LINES)
     assert w.main(["x", str(tmp_path / "wf"), DELTA, TIME]) == 0

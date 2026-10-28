@@ -1,0 +1,170 @@
+/* Layout mode of the MOSS panel (src/layout.ts). Uses the app's theme variables. */
+
+.lay-canvas {
+  position: relative;
+  margin: 8px 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--card) 85%, var(--line));
+  touch-action: none;
+  user-select: none;
+  cursor: crosshair;
+  overflow: hidden;
+}
+
+.lay-canvas.busy {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.lay-grid {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.lay-grid line {
+  stroke: var(--line);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.lay-box {
+  position: absolute;
+  border: 2px solid var(--muted);
+  background: color-mix(in srgb, var(--muted) 14%, transparent);
+  cursor: move;
+  outline: none;
+}
+
+.lay-box.lay-character {
+  border-color: #3b8f5a;
+  background: color-mix(in srgb, #3b8f5a 18%, transparent);
+}
+
+.lay-box.lay-text {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.lay-box.has-lora {
+  border-style: dashed;
+}
+
+.lay-box.sel,
+.lay-box:focus-visible {
+  border-width: 3px;
+  box-shadow: 0 0 0 2px var(--card), 0 0 0 4px var(--text);
+  z-index: 2;
+}
+
+.lay-ghost {
+  pointer-events: none;
+  border-style: dotted;
+  z-index: 3;
+}
+
+.lay-ghost.tiny {
+  border-color: var(--danger);
+}
+
+.lay-tag {
+  position: absolute;
+  top: 0;
+  left: 0;
+  max-width: 100%;
+  padding: 1px 6px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  background: color-mix(in srgb, var(--card) 85%, transparent);
+  pointer-events: none;
+}
+
+.lay-h {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  background: var(--text);
+  border: 2px solid var(--card);
+  border-radius: 3px;
+}
+
+.lay-h-nw { left: -7px; top: -7px; cursor: nwse-resize; }
+.lay-h-n { left: calc(50% - 6px); top: -7px; cursor: ns-resize; }
+.lay-h-ne { right: -7px; top: -7px; cursor: nesw-resize; }
+.lay-h-e { right: -7px; top: calc(50% - 6px); cursor: ew-resize; }
+.lay-h-se { right: -7px; bottom: -7px; cursor: nwse-resize; }
+.lay-h-s { left: calc(50% - 6px); bottom: -7px; cursor: ns-resize; }
+.lay-h-sw { left: -7px; bottom: -7px; cursor: nesw-resize; }
+.lay-h-w { left: -7px; top: calc(50% - 6px); cursor: ew-resize; }
+
+.lay-list {
+  margin: 8px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.lay-list li {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  margin: 2px 0;
+}
+
+.lay-list li.sel .lay-pick {
+  font-weight: 700;
+}
+
+.lay-pick {
+  flex: 1;
+  text-align: left;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.lay-form textarea,
+.lay-form input[type="text"] {
+  flex: 1;
+  min-width: 12em;
+}
+
+.lay-pos {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.lay-edge {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.lay-edge input {
+  width: 5.5em;
+  color: var(--text);
+}
+
+.lay-rowlabel {
+  min-width: 5em;
+}
+
+/* The Prompt / Layout switch: the active one is marked. */
+#moss-input-row button[aria-pressed="true"] {
+  font-weight: 700;
+  border-color: var(--accent);
+  box-shadow: inset 0 -3px 0 var(--accent);
+}
+
+.lay-pick[aria-pressed="true"] {
+  border-color: var(--accent);
+}

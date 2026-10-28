@@ -79,7 +79,8 @@ PASSIVE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # provision.sh links LORA_DIR into ComfyUI's loras folder as ``user/``.
 LORA_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.safetensors")
 LORA_MAX_BYTES = 1024 * 1024 * 1024
-LORA_MAX_FILES = 20
+# Phase R's limit: 8 LoRAs per GPU session (the app checks it first: moss.rs MAX_LORAS_PER_GPU).
+LORA_MAX_FILES = 8
 LORA_MAX_HEADER_BYTES = 64 * 1024 * 1024
 
 # Training backend: what the launcher may upload and read.

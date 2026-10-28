@@ -1449,7 +1449,9 @@ async fn identity_edit_needs_an_identity_edit_gpu() {
 // ----- MOSS-Image LoRA evaluation against the fake ComfyUI -------------------------
 
 fn lora_file(name: &str, extra: &[u8]) -> std::path::PathBuf {
-    let header = br#"{"__metadata__":{}}"#;
+    // One real-looking module (a Kohaku export's naming), so the app's key check accepts it.
+    let header =
+        br#"{"lora_unet_layers_0_proj_o.lora_down.weight":{"dtype":"F32","shape":[4,8],"data_offsets":[0,0]}}"#;
     let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
     bytes.extend_from_slice(header);
     bytes.extend_from_slice(extra);
@@ -1474,6 +1476,7 @@ fn moss_request(lora: Option<String>, control: bool) -> crate::moss::Request {
         lora,
         lora_strength: Some(0.75),
         control,
+        layout: None,
     }
 }
 
@@ -1483,7 +1486,7 @@ async fn a_trained_lora_is_uploaded_and_compared_with_a_base_control() {
     let h = harness(vec![]);
     let kromoss = catalog::bundled()
         .into_iter()
-        .find(|m| m.id == "moss-image-dmd")
+        .find(|m| m.id == "kromoss")
         .unwrap();
     h.mgr
         .start(kromoss.clone(), comfy_settings(), None)
@@ -1565,6 +1568,21 @@ async fn a_trained_lora_is_uploaded_and_compared_with_a_base_control() {
     let err = svc.add_lora(&target, &bad).await.unwrap_err();
     assert!(err.contains("can't take LoRAs"), "{err}");
     assert_eq!(svc.view().loras.len(), 1);
+
+    // A LoRA of which only some modules fit is added, and the panel says how much.
+    h.mock.with_comfy(id, |c| c.reject_lora = None);
+    let partial_header = br#"{"lora_unet_layers_0_proj_o.lora_down.weight":{"dtype":"F32","shape":[4,8],"data_offsets":[0,0]},"lora_te_x_y.lora_down.weight":{"dtype":"F32","shape":[4,8],"data_offsets":[0,0]}}"#;
+    let mut partial = (partial_header.len() as u64).to_le_bytes().to_vec();
+    partial.extend_from_slice(partial_header);
+    let partial_path = std::env::temp_dir().join(format!(
+        "sloptweak-e2e-partial-{}.safetensors",
+        std::process::id()
+    ));
+    std::fs::write(&partial_path, partial).unwrap();
+    svc.add_lora(&target, &partial_path).await.unwrap();
+    let v = svc.view();
+    assert_eq!(v.loras.len(), 2);
+    assert!(v.message.contains("only 1 of the 2 parts"), "{}", v.message);
 
     assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
     assert!(h.mock.live_ids().is_empty());

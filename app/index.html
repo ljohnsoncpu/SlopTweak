@@ -163,9 +163,14 @@
             can look rough; Full quality uses the base model and takes longer. Small text in
             pictures often comes out garbled.
           </p>
-          <label for="moss-prompt">What should it draw?</label>
+          <div class="row" id="moss-input-row" role="group" aria-label="How to describe the picture">
+            <button id="moss-tab-prompt" type="button" class="ghost" aria-pressed="true">Prompt</button>
+            <button id="moss-tab-layout" type="button" class="ghost" aria-pressed="false">Layout (boxes)</button>
+          </div>
+          <label id="moss-prompt-label" for="moss-prompt">What should it draw?</label>
           <textarea id="moss-prompt" rows="3" maxlength="4000" spellcheck="true"
             placeholder="A red fox sitting in a snowy forest at dusk, soft light."></textarea>
+          <div id="moss-layout" hidden></div>
           <div class="row">
             <label for="moss-mode">Mode</label>
             <select id="moss-mode">
@@ -218,6 +223,10 @@
             <div class="row">
               <button id="moss-lora-add" type="button">Add a LoRA file…</button>
               <select id="moss-lora" aria-label="LoRA" disabled></select>
+            </div>
+            <div class="row" id="moss-lora-recent-row" hidden>
+              <select id="moss-lora-recent" aria-label="LoRA from a training run"></select>
+              <button id="moss-lora-use-recent" type="button">Use this one</button>
             </div>
             <div class="row" id="moss-lora-strength-row" hidden>
               <label for="moss-lora-strength">Strength</label>

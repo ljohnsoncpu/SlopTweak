@@ -38,8 +38,11 @@ COMFY_MOSS_DIR=/opt/sloptweak/ComfyUI-moss
 COMFY_MOSS_VENV=/opt/sloptweak/comfy-moss-venv
 # Must match the sidecar's SLOPTWEAK_LORA_DIR default.
 USER_LORA_DIR=/opt/sloptweak/user-loras
-# Catalog file names of the MOSS-Image entry (must match catalog.json and moss.rs).
+# Catalog file names of the MOSS-Image entries (must match catalog.json and moss.rs).
+# Either main file makes a MOSS instance; only the original distillation has a
+# time-embedding file (and so a delta); Kromoss's DMD2 LoRA needs none.
 MOSS_BASE_FILE="moss_image_base_bf16.safetensors"
+KROMOSS_BASE_FILE="kromoss_bf16.safetensors"
 MOSS_TIME_FILE="moss-image-8-step-dmd-time-embedding.safetensors"
 MOSS_TIME_DELTA="moss-image-8-step-dmd-time-delta.safetensors"
 CLOUDFLARED_VERSION=2026.9.3
@@ -369,14 +372,17 @@ PY
 }
 
 finish_comfy() {
-  local moss=0 run_dir="$COMFY_DIR" run_python="$COMFY_PYTHON" probe=Krea2EditModelPatch
-  if grep -qF "$MOSS_TIME_FILE" <<<"$MODEL_LINES"; then
+  local moss=0 delta=0 run_dir="$COMFY_DIR" run_python="$COMFY_PYTHON" probe=Krea2EditModelPatch
+  if grep -qF "$MOSS_BASE_FILE" <<<"$MODEL_LINES" || grep -qF "$KROMOSS_BASE_FILE" <<<"$MODEL_LINES"; then
     moss=1
     run_dir="$COMFY_MOSS_DIR"
     run_python="$COMFY_MOSS_VENV/bin/python"
     probe=MOSSImageLayoutPrompt
     setup_moss_comfy
-    build_moss_delta
+    if grep -qF "$MOSS_TIME_FILE" <<<"$MODEL_LINES"; then
+      delta=1
+      build_moss_delta
+    fi
   fi
 
   local models="$run_dir/models" name dest
@@ -396,7 +402,9 @@ finish_comfy() {
     # LoRAs the app uploads for evaluation (sidecar /__lora/) show up as user/<file>.
     mkdir -p "$USER_LORA_DIR"
     ln -sfn "$USER_LORA_DIR" "$models/loras/user"
-    ln -sfn "$MODELS_DIR/$MOSS_TIME_DELTA" "$models/loras/$MOSS_TIME_DELTA"
+    if ((delta)); then
+      ln -sfn "$MODELS_DIR/$MOSS_TIME_DELTA" "$models/loras/$MOSS_TIME_DELTA"
+    fi
     # Open ComfyUI starts empty otherwise: leave the MOSS workflows in its sidebar.
     MODEL_LINES="$MODEL_LINES" "$SIDECAR_VENV/bin/python" "$ASSET_DIR/moss_workflow.py"       "$run_dir/user/default/workflows" "$MOSS_TIME_DELTA" "$MOSS_TIME_FILE"       >>"$LOG_DIR/moss-workflow.log" 2>&1 ||
       log "WARNING: could not write the MOSS workflows (see moss-workflow.log)"

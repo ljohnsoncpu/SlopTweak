@@ -797,6 +797,7 @@ mod tests {
             "wulver-identity-edit",
             "kroma-identity-edit",
             "moss-image-dmd",
+            "kromoss",
         ];
         for o in models.iter().filter(|o| !edit_ids.contains(&o.id.as_str())) {
             assert_eq!(o.backend, Backend::Invoke, "{}", o.id);
@@ -840,6 +841,62 @@ mod tests {
             assert_eq!(rev.len(), 40, "{}", f.filename);
         }
         assert!(crate::moss::ModelFiles::of(m).is_some());
+    }
+
+    #[test]
+    fn bundled_kromoss_is_a_complete_comfyui_entry_pinned_to_one_revision() {
+        let models = bundled();
+        let k = models.iter().find(|m| m.id == "kromoss").unwrap();
+        assert_eq!(k.backend, Backend::Comfyui);
+        assert_eq!(k.base, "moss-image");
+        assert!(!k.needs_civitai());
+        assert!(k.invoke_min_version.is_none() && k.default_settings.is_none());
+        let placed: Vec<(&str, &str)> = k
+            .files
+            .iter()
+            .map(|f| (f.kind.as_str(), f.dest.as_deref().unwrap()))
+            .collect();
+        // No time-embedding file: the DMD2 LoRA needs no delta.
+        assert_eq!(
+            placed,
+            [
+                ("main", "diffusion_models"),
+                ("text_encoder", "text_encoders"),
+                ("vae", "vae"),
+                ("lora", "loras"),
+            ]
+        );
+        // The Kromoss repo's files share one pinned revision (the repo is
+        // republished as training continues); the encoder is the same pinned
+        // file the original MOSS entry uses.
+        let rev = |url: &str| {
+            url.split("/resolve/")
+                .nth(1)
+                .unwrap()
+                .split('/')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let revs: Vec<String> = k.files.iter().map(|f| rev(&f.url)).collect();
+        assert!(revs.iter().all(|r| r.len() == 40));
+        assert_eq!(revs[0], revs[2]);
+        assert_eq!(revs[0], revs[3]);
+        assert_eq!(
+            k.page_url().map(|u| u.to_string()).as_deref(),
+            Some("https://huggingface.co/lodestones/Kromoss")
+        );
+        let moss = models.iter().find(|m| m.id == "moss-image-dmd").unwrap();
+        assert_eq!(k.files[1], moss.files[1]);
+        // Hash and size of the 10 GB transformer, verified against the Hub.
+        assert_eq!(k.files[0].size_bytes, 10_164_655_808);
+        assert_eq!(
+            k.files[0].sha256,
+            "54C863B9392F7B6A02F557D32A416B22765B4FFBEE322ADE9945E379F09ADABA"
+        );
+        assert!(k.min_vram_gb >= 24.0);
+        let files = crate::moss::ModelFiles::of(k).unwrap();
+        assert!(!files.time_delta);
     }
 
     #[test]

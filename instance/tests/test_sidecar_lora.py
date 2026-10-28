@@ -126,6 +126,12 @@ async def test_size_cap(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
     assert not list(rig.dir.iterdir())
 
 
+def test_default_limits_match_the_app() -> None:
+    # moss.rs: MAX_LORAS_PER_GPU = 8 and MAX_LORA_BYTES = 1 GiB.
+    assert sidecar.LORA_MAX_FILES == 8
+    assert sidecar.LORA_MAX_BYTES == 1024 * 1024 * 1024
+
+
 async def test_file_count_cap_allows_replacing(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sidecar, "LORA_MAX_FILES", 2)
     assert (await rig.put("a.safetensors", safetensors())).status == 200
