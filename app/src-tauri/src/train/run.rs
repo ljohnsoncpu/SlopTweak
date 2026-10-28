@@ -130,6 +130,28 @@ pub fn offer_query(max_dph: f64) -> OfferQuery {
     }
 }
 
+/// Offers a Kromoss run may use (2026-10-27 cloud runs, see
+/// docs/spikes/kromoss-lora-training.md): 24 GB-class, Ampere or newer, and not
+/// Blackwell (the cu126 torch wheels have no sm_120 kernels). Host CUDA must be
+/// 12.8 or newer: a 12.6 host failed with CUDA Error 804 on the 12.8 image.
+/// The trainer used up to 32 GB of host RAM, and the weights, caches and four
+/// resume states need the larger disk.
+pub fn moss_offer_query(max_dph: f64) -> OfferQuery {
+    OfferQuery {
+        min_vram_gb: 23.0,
+        min_disk_gb: 100.0,
+        min_reliability: 0.98,
+        min_inet_down_mbps: 500.0,
+        min_disk_bw_mbps: 0.0,
+        max_dph,
+        min_cuda: 12.8,
+        min_compute_cap: 800,
+        max_compute_cap: 999,
+        min_ram_gb: 48.0,
+        limit: 20,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -910,6 +932,41 @@ mod tests {
             geolocation: None,
             machine_id: Some(1040),
         }
+    }
+
+    #[test]
+    fn kromoss_offers_need_cuda_12_8_ram_and_no_blackwell() {
+        use crate::provider::offers::passes;
+        let q = moss_offer_query(1.0);
+        let good = Offer {
+            id: 1,
+            gpu_name: "RTX 4090".into(),
+            compute_cap: 890,
+            cpu_ram_mb: 128_000.0,
+            ..futures_offer(&MockProvider::new(MockTimings::default(), vec![]))
+        };
+        assert!(passes(&good, &q));
+        type Tweak = Box<dyn Fn(&mut Offer)>;
+        let tweaks: Vec<(&str, Tweak)> = vec![
+            ("host CUDA 12.6", Box::new(|o| o.cuda_max_good = 12.6)),
+            ("32 GB host RAM", Box::new(|o| o.cpu_ram_mb = 32_000.0)),
+            ("Blackwell", Box::new(|o| o.compute_cap = 1200)),
+            ("Turing", Box::new(|o| o.compute_cap = 750)),
+            ("16 GB card", Box::new(|o| o.gpu_ram_mb = 16_384.0)),
+            ("80 GB disk", Box::new(|o| o.disk_space_gb = 80.0)),
+            ("slow link", Box::new(|o| o.inet_down_mbps = 200.0)),
+            ("unreliable", Box::new(|o| o.reliability = 0.9)),
+            ("over the price cap", Box::new(|o| o.dph_total = 2.0)),
+        ];
+        for (what, tweak) in tweaks {
+            let mut o = good.clone();
+            tweak(&mut o);
+            assert!(!passes(&o, &q), "{what} should be refused");
+        }
+        // The kohya query is looser on RAM and CUDA, so a Kromoss host is a subset.
+        let kohya = offer_query(1.0);
+        assert!(q.min_cuda > kohya.min_cuda && q.min_ram_gb > kohya.min_ram_gb);
+        assert!(q.min_disk_gb > kohya.min_disk_gb);
     }
 
     struct Rig {

@@ -15,6 +15,11 @@ upload ``job.json`` and ``dataset.tar`` through the sidecar and to POST
 * train / evaluate: ``sdxl_train_network.py`` then ``sdxl_gen_img.py`` for the
   base model and every checkpoint at every strength.
 
+A job whose ``job.json`` says ``"trainer": "kohakumoss"`` runs ``MossRunner``
+instead: KohakuMossTrainer on Kromoss (docs/spikes/kromoss-lora-training.md),
+bootstrap -> prepare -> train (text and latent caches, then training, with
+progress from ``metrics.jsonl``) -> done. It has no evaluate stage yet.
+
 The manifest lists result files (checkpoints, evaluation images, loss log)
 with SHA-256 as they appear, so the launcher can fetch and verify them even if
 the run dies part-way. Only manifest paths are ever served.
@@ -41,6 +46,13 @@ PYTHON_VERSION = "3.12.12"
 TORCH_INDEX = "https://download.pytorch.org/whl/cu124"
 PYPI_INDEX = "https://pypi.org/simple"
 TRAINER_REPO = "kohya-ss/sd-scripts"
+MOSS_TRAINER_REPO = "KohakuBlueleaf/KohakuMossTrainer"
+# The cu128 index only has torch <= 2.11 and the trainer needs >= 2.13. Offers
+# need host CUDA >= 12.8 (a 12.6 host broke CUDA with Error 804).
+MOSS_TORCH_INDEX = "https://download.pytorch.org/whl/cu126"
+MOSS_TORCH = "torch==2.14.1"
+MOSS_RUN_CONFIG = "sloptweak-train.py"
+MOSS_DATA_CONFIG = "sloptweak-train_data.py"
 # Hex of a SHA-256 / a git commit.
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -348,7 +360,7 @@ class Runner:
         candidates += sorted(self.p.checkpoints.glob("*.safetensors"))
         candidates += sorted(self.p.evaluation.glob("*/*.png"))
         candidates += sorted((self.p.runtime / "logs").glob("*.log"))
-        for name in ("loss.csv", "train.toml", "dataset.toml", "eval-prompts.txt"):
+        for name in ("loss.csv", "metrics.jsonl", "train.toml", "dataset.toml", "eval-prompts.txt"):
             candidates.append(self.p.runtime / name)
         changed = False
         for path in candidates:
@@ -622,6 +634,374 @@ class Runner:
             self.set_state("failed", error=f"Unexpected error: {type(e).__name__}: {e}")
 
 
+# ----- Kromoss (KohakuMossTrainer) ---------------------------------------------
+
+
+@dataclass(frozen=True)
+class MossModel:
+    """A weight file: downloaded flat into the models dir by provision.sh, then
+    linked at ``dest`` (e.g. ``diffusion_models/x.safetensors``) in the
+    trainer's ComfyUI-style folder."""
+
+    file: str
+    dest: str
+    sha256: str
+
+
+@dataclass(frozen=True)
+class MossJob:
+    output_name: str
+    trainer_commit: str
+    trainer_tree_sha256: str
+    models: tuple[MossModel, ...]
+    files: dict[str, str]
+    total_steps: int
+    checkpoint_steps: tuple[int, ...]
+    run_config: str
+    data_config: str
+    train_jsonl: str
+
+    @classmethod
+    def parse(cls, text: str) -> MossJob:
+        try:
+            raw = json.loads(text)
+            assert isinstance(raw, dict) and raw["trainer"] == "kohakumoss"
+            job = cls(
+                output_name=str(raw["output_name"]),
+                trainer_commit=str(raw["trainer_commit"]).lower(),
+                trainer_tree_sha256=str(raw["trainer_tree_sha256"]).lower(),
+                models=tuple(
+                    MossModel(str(m["file"]), str(m["dest"]), str(m["sha256"]).lower())
+                    for m in raw["models"]
+                ),
+                files={str(f["file"]): str(f["sha256"]) for f in raw["files"]},
+                total_steps=int(raw["total_steps"]),
+                checkpoint_steps=tuple(int(s) for s in raw["checkpoint_steps"]),
+                run_config=str(raw["run_config"]),
+                data_config=str(raw["data_config"]),
+                train_jsonl=str(raw.get("train_jsonl", "")),
+            )
+        except (KeyError, TypeError, ValueError, AssertionError) as e:
+            raise RunError(f"job.json is not valid: {e!r}") from e
+        job.validate()
+        return job
+
+    def validate(self) -> None:
+        if not SAFE_NAME.match(self.output_name):
+            raise RunError("job.json: bad output name")
+        if not HEX64.match(self.trainer_tree_sha256) or not HEX40.match(self.trainer_commit):
+            raise RunError("job.json: bad trainer pin")
+        if not self.models:
+            raise RunError("job.json: no model files")
+        for m in self.models:
+            dest = Path(m.dest)
+            if (
+                not SAFE_NAME.match(m.file)
+                or dest.is_absolute()
+                or len(dest.parts) != 2
+                or not all(SAFE_NAME.match(part) for part in dest.parts)
+                or not HEX64.match(m.sha256)
+            ):
+                raise RunError(f"job.json: bad model entry {m.file!r}")
+        if not self.files or len(self.files) > MAX_DATASET_FILES:
+            raise RunError("job.json: bad dataset file list")
+        for name, digest in self.files.items():
+            if (
+                not SAFE_NAME.match(name)
+                or Path(name).suffix.lower() not in DATA_EXTS
+                or not HEX64.match(digest)
+            ):
+                raise RunError(f"job.json: bad dataset file entry {name!r}")
+        if self.total_steps < 1 or not self.checkpoint_steps:
+            raise RunError("job.json: bad step counts")
+        if self.checkpoint_steps[-1] != self.total_steps:
+            raise RunError("job.json: the last checkpoint must be the final step")
+        if not self.run_config.strip() or not self.data_config.strip():
+            raise RunError("job.json: missing trainer config")
+
+    def checkpoint_file(self, step: int) -> str:
+        return f"{self.output_name}-step{step:08d}.safetensors"
+
+
+def parse_moss_progress(metrics_tail: str) -> tuple[int, float | None] | None:
+    """Latest (step, loss) from the tail of the trainer's ``metrics.jsonl``. The
+    first line of a tail read may be cut off, so unparseable lines are skipped."""
+    for line in reversed(metrics_tail.splitlines()):
+        try:
+            row = json.loads(line)
+            step = int(row["step"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        loss = row.get("loss")
+        return step, float(loss) if isinstance(loss, int | float) else None
+    return None
+
+
+class MossRunner(Runner):
+    """Runs a ``MossJob``. Shares the state, manifest and command plumbing with
+    ``Runner``; the kohya stages are not used."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.moss: MossJob | None = None
+
+    @property
+    def weights(self) -> Path:
+        return self.p.work / "models"
+
+    @property
+    def run_dir(self) -> Path:
+        assert self.moss is not None
+        return self.p.trainer / "runs" / "moss" / self.moss.output_name
+
+    def command(
+        self,
+        cmd: Sequence[str],
+        log: Path,
+        tick: Callable[[], None],
+        cwd: Path | None = None,
+        extra_env: Mapping[str, str] | None = None,
+    ) -> None:
+        # Unlike kohya, the Qwen tokenizer config may be looked up on first
+        # use (the proven cloud run was online), and the venv's console
+        # scripts must be on PATH.
+        env = {
+            "HF_HUB_OFFLINE": "0",
+            "TRANSFORMERS_OFFLINE": "0",
+            "PATH": f"{self.p.venv / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
+            **(extra_env or {}),
+        }
+        super().command(cmd, log, tick, cwd=cwd, extra_env=env)
+
+    def bootstrap(self) -> None:
+        assert self.moss is not None
+        self.set_state("bootstrap", detail="installing the training environment")
+        logs = self.p.runtime / "logs"
+        venv_python = str(self.p.python)
+        uv = str(self.p.uv)
+        steps: list[tuple[str, list[str]]] = [
+            (
+                "tooling",
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--target",
+                    str(self.p.toolchain / "uv"),
+                    "--require-hashes",
+                    "-r",
+                    str(self.asset_dir / "train_bootstrap.lock"),
+                ],
+            ),
+            ("python", [uv, "python", "install", PYTHON_VERSION]),
+            ("venv", [uv, "venv", "--python", PYTHON_VERSION, str(self.p.venv)]),
+            (
+                "torch",
+                [
+                    uv,
+                    "pip",
+                    "install",
+                    "--python",
+                    venv_python,
+                    MOSS_TORCH,
+                    "--index-url",
+                    MOSS_TORCH_INDEX,
+                ],
+            ),
+        ]
+        for name, cmd in steps:
+            self.check_cancel()
+            self.set_state("bootstrap", detail=f"installing: {name}")
+            self.command(
+                cmd,
+                logs / f"bootstrap-{name}.log",
+                self.check_cancel,
+                extra_env={"UV_PYTHON_INSTALL_DIR": str(self.p.toolchain / "python")},
+            )
+
+        self.check_cancel()
+        self.set_state("bootstrap", detail="fetching the trainer")
+        archive = self.fetch_trainer(self.p.work / "trainer.tar.gz", self.moss.trainer_commit)
+        if tree_digest(archive) != self.moss.trainer_tree_sha256:
+            raise RunError("The trainer source does not match its pinned digest.")
+        if self.p.trainer.exists():
+            shutil.rmtree(self.p.trainer)
+        extract = self.p.work / "trainer-extract"
+        if extract.exists():
+            shutil.rmtree(extract)
+        with tarfile.open(archive) as tar:
+            tar.extractall(extract, filter="data")
+        (root,) = [d for d in extract.iterdir() if d.is_dir()]
+        root.rename(self.p.trainer)
+
+        # The trainer's own dependencies (torch is already satisfied by the
+        # pinned wheel), then a CUDA probe so a host whose driver is too old
+        # fails here and not after the caches.
+        self.check_cancel()
+        self.set_state("bootstrap", detail="installing: trainer")
+        self.command(
+            [
+                *(uv, "pip", "install", "--python", venv_python, "-e", f"{self.p.trainer}[cuda]"),
+                *("--extra-index-url", MOSS_TORCH_INDEX, "--index-strategy", "unsafe-best-match"),
+            ],
+            logs / "bootstrap-trainer.log",
+            self.check_cancel,
+            cwd=self.p.trainer,
+        )
+        self.set_state("bootstrap", detail="checking the GPU")
+        probe = (
+            "import torch; assert torch.cuda.is_available(); "
+            "print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))"
+        )
+        self.command([venv_python, "-c", probe], logs / "bootstrap-cuda.log", self.check_cancel)
+        # Informational: the doctor may warn about optional extras.
+        self.run(
+            [str(self.p.venv / "bin" / "kohakumoss-doctor")],
+            self.p.trainer,
+            logs / "bootstrap-doctor.log",
+            os.environ,
+            self.check_cancel,
+        )
+
+    def prepare(self) -> None:
+        assert self.moss is not None
+        job = self.moss
+        self.set_state("prepare", detail="checking the models")
+        for m in job.models:
+            src = self.models_dir / m.file
+            if not src.is_file() or sha256_file(src) != m.sha256:
+                raise RunError(f"{m.file} is missing or its checksum is wrong.")
+            link = self.weights / m.dest
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.unlink(missing_ok=True)
+            try:
+                link.symlink_to(src)
+            except OSError:  # no symlink right (Windows dev boxes): same-disk hardlink
+                os.link(src, link)
+        self.set_state("prepare", detail="unpacking the dataset")
+        if self.p.data.exists():
+            shutil.rmtree(self.p.data)
+        nl = self.p.data / "nl"
+        nl.mkdir(parents=True)
+        extract_dataset(self.p.incoming / "dataset.tar", nl, job.files)
+        if job.train_jsonl:
+            atomic_write(self.p.data / "mix" / "train.jsonl", job.train_jsonl)
+        cfg_dir = self.p.trainer / "configs" / "user"
+        atomic_write(cfg_dir / MOSS_RUN_CONFIG, job.run_config)
+        atomic_write(cfg_dir / MOSS_DATA_CONFIG, job.data_config)
+        atomic_write(self.p.runtime / "train.py", job.run_config)
+        self.command(
+            [
+                str(self.p.venv / "bin" / "kohakumoss-config"),
+                "check",
+                f"configs/user/{MOSS_RUN_CONFIG}",
+            ],
+            self.p.runtime / "logs" / "config-check.log",
+            self.check_cancel,
+            cwd=self.p.trainer,
+        )
+
+    def sync_results(self) -> None:
+        """Expose the trainer's per-step ComfyUI exports under the names the
+        launcher fetches, and its metrics log; then refresh the manifest."""
+        assert self.moss is not None
+        job = self.moss
+        for step in job.checkpoint_steps:
+            src = (
+                self.run_dir
+                / "checkpoints"
+                / f"step_{step:08d}"
+                / "export"
+                / f"{job.output_name}-comfy.safetensors"
+            )
+            dst = self.p.checkpoints / job.checkpoint_file(step)
+            if src.is_file() and not dst.exists() and self.clock() - src.stat().st_mtime >= 3:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                tmp = dst.with_name(dst.name + ".part")
+                shutil.copyfile(src, tmp)
+                tmp.replace(dst)
+        metrics = self.run_dir / "metrics.jsonl"
+        if metrics.is_file():
+            shutil.copyfile(metrics, self.p.runtime / "metrics.jsonl")
+        self.refresh_manifest()
+
+    def tick_train(self) -> None:
+        self.check_cancel()
+        assert self.moss is not None
+        progress = parse_moss_progress(tail(self.run_dir / "metrics.jsonl", 65536))
+        if progress:
+            step, loss = progress
+            self.set_state("train", step=step, total=self.moss.total_steps, loss=loss)
+        self.sync_results()
+
+    def train(self) -> None:
+        assert self.moss is not None
+        job = self.moss
+        logs = self.p.runtime / "logs"
+        kogine = str(self.p.venv / "bin" / "kogine")
+        # The sidecar's idle watchdog counts "train" as active; caching can take
+        # several minutes.
+        self.set_state("train", step=0, total=job.total_steps, loss=None, detail="caching")
+        for script, name in (("cache_text", "cache-text"), ("cache_latents", "cache-latents")):
+            self.check_cancel()
+            self.command(
+                [
+                    kogine,
+                    "run",
+                    f"scripts/data/{script}.py",
+                    "--config",
+                    f"configs/user/{MOSS_DATA_CONFIG}",
+                ],
+                logs / f"{name}.log",
+                self.check_cancel,
+                cwd=self.p.trainer,
+            )
+        self.set_state("train", step=0, total=job.total_steps, loss=None)
+        self.command(
+            [kogine, "run", "scripts/train/moss.py", "--config", f"configs/user/{MOSS_RUN_CONFIG}"],
+            logs / "train.log",
+            self.tick_train,
+            cwd=self.p.trainer,
+        )
+        final = self.p.checkpoints / job.checkpoint_file(job.total_steps)
+        self.sync_results()
+        if not final.is_file():
+            # The last export may be younger than the mid-write guard.
+            self.sleep(3.5)
+            self.sync_results()
+        if not final.is_file():
+            raise RunError("Training ended without writing the final checkpoint.")
+
+    def execute(self) -> None:
+        try:
+            self.moss = MossJob.parse((self.p.incoming / "job.json").read_text(encoding="utf-8"))
+            self.bootstrap()
+            self.check_cancel()
+            self.prepare()
+            self.check_cancel()
+            self.train()
+            self.sleep(3.5)  # let the last files age past the mid-write guard
+            self.sync_results()
+            self.set_state("done")
+        except Cancelled:
+            self.sync_results_quietly()
+            self.set_state("cancelled")
+        except RunError as e:
+            self.sync_results_quietly()
+            self.set_state("failed", error=str(e))
+        except Exception as e:
+            self.sync_results_quietly()
+            self.set_state("failed", error=f"Unexpected error: {type(e).__name__}: {e}")
+
+    def sync_results_quietly(self) -> None:
+        if self.moss is not None:
+            try:
+                self.sync_results()
+            except OSError:
+                pass
+
+
 def extract_dataset(archive: Path, dest: Path, expected: Mapping[str, str]) -> None:
     """Unpack a flat tar of images and captions, accepting only the files named
     in the job, each with its expected hash."""
@@ -653,9 +1033,13 @@ def download_url(url: str, dest: Path) -> None:
         shutil.copyfileobj(resp, out)
 
 
-def download_trainer(dest: Path, commit: str) -> Path:
-    download_url(f"https://codeload.github.com/{TRAINER_REPO}/tar.gz/{commit}", dest)
+def download_trainer(dest: Path, commit: str, repo: str = TRAINER_REPO) -> Path:
+    download_url(f"https://codeload.github.com/{repo}/tar.gz/{commit}", dest)
     return dest
+
+
+def download_moss_trainer(dest: Path, commit: str) -> Path:
+    return download_trainer(dest, commit, MOSS_TRAINER_REPO)
 
 
 def fetch_tokenizers(lock: Path, dest: Path, fetch: Callable[[str, Path], None]) -> None:
@@ -685,8 +1069,16 @@ def main() -> None:
     work = Path(os.environ.get("TRAIN_WORK", "/opt/sloptweak/train"))
     asset_dir = Path(__file__).resolve().parent
     models_dir = Path(os.environ.get("TRAIN_MODELS_DIR", "/opt/sloptweak/models"))
-    runner = Runner(Paths(work), asset_dir, models_dir)
+    paths = Paths(work)
+    runner = Runner(paths, asset_dir, models_dir)
     runner.wait_for_start()
+    try:  # job.json is uploaded before the start marker
+        raw = json.loads((paths.incoming / "job.json").read_text(encoding="utf-8"))
+        kind = raw.get("trainer") if isinstance(raw, dict) else None
+    except (OSError, ValueError):
+        kind = None
+    if kind == "kohakumoss":
+        runner = MossRunner(paths, asset_dir, models_dir, fetch_trainer=download_moss_trainer)
     runner.execute()
 
 

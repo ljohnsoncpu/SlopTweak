@@ -42,6 +42,18 @@ pub fn plan(settings: &TrainSettings, images: u32, prompts: usize) -> Plan {
     }
 }
 
+/// The plan for a Kromoss run. Warm-up is the trainer's own (100 steps, or 2
+/// for runs under 200); there are no test images yet.
+pub fn moss_plan(settings: &super::moss::MossSettings, images: u32) -> Plan {
+    Plan {
+        images,
+        total_steps: settings.steps,
+        warmup_steps: if settings.steps < 200 { 2 } else { 100 },
+        checkpoint_steps: settings.checkpoint_steps(),
+        eval_images: 0,
+    }
+}
+
 pub fn audit_view(
     dir: &std::path::Path,
     settings: TrainSettings,
@@ -135,6 +147,69 @@ pub async fn train_audit(dir: String, settings: TrainSettings) -> Result<AuditVi
     .map_err(|e| e.to_string())?
 }
 
+/// What a Kromoss dataset folder and settings add up to.
+#[derive(Debug, Serialize)]
+pub struct MossAuditView {
+    pub images: u32,
+    /// The dataset can't be used (missing captions and the like).
+    pub error: Option<String>,
+    pub settings_error: Option<String>,
+    /// First tag of the first image, for naming the LoRA.
+    pub trigger: String,
+    pub plan: Option<Plan>,
+}
+
+pub fn moss_audit_view(
+    dir: &std::path::Path,
+    settings: &super::moss::MossSettings,
+) -> MossAuditView {
+    let settings_error = settings.validate().err();
+    match super::moss::collect(dir, settings.caption_mode) {
+        Err(error) => MossAuditView {
+            images: 0,
+            error: Some(error),
+            settings_error,
+            trigger: String::new(),
+            plan: None,
+        },
+        Ok(images) => {
+            let trigger = images
+                .first()
+                .and_then(|i| {
+                    i.tags
+                        .first()
+                        .cloned()
+                        .or_else(|| i.nl.split(',').next().map(|t| t.trim().to_owned()))
+                })
+                .unwrap_or_default();
+            let n = images.len() as u32;
+            MossAuditView {
+                images: n,
+                error: None,
+                trigger,
+                plan: settings_error.is_none().then(|| moss_plan(settings, n)),
+                settings_error,
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn train_moss_defaults() -> super::moss::MossSettings {
+    super::moss::MossSettings::default()
+}
+
+#[tauri::command]
+pub async fn train_moss_audit(
+    dir: String,
+    settings: super::moss::MossSettings,
+) -> Result<MossAuditView, String> {
+    let path = PathBuf::from(dir);
+    tokio::task::spawn_blocking(move || moss_audit_view(&path, &settings))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +295,30 @@ mod tests {
             preset_prompts(&t, "x").len(),
             DEFAULT_PROMPT_TEMPLATES.len()
         );
+    }
+
+    #[test]
+    fn a_kromoss_folder_gets_a_plan_or_a_reason() {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..3 {
+            std::fs::write(d.path().join(format!("i{i}.png")), png(i)).unwrap();
+            std::fs::write(d.path().join(format!("i{i}.nl.txt")), "roka, a woman.").unwrap();
+            std::fs::write(d.path().join(format!("i{i}.e621.txt")), "roka, solo").unwrap();
+        }
+        let s = super::super::moss::MossSettings::default();
+        let v = moss_audit_view(d.path(), &s);
+        assert!(v.error.is_none() && v.settings_error.is_none());
+        assert_eq!((v.images, v.trigger.as_str()), (3, "roka"));
+        let p = v.plan.unwrap();
+        assert_eq!(p.total_steps, 800);
+        assert_eq!(p.checkpoint_steps, vec![200, 400, 600, 800]);
+        assert_eq!((p.eval_images, p.warmup_steps), (0, 100));
+
+        std::fs::remove_file(d.path().join("i1.e621.txt")).unwrap();
+        let v = moss_audit_view(d.path(), &s);
+        assert!(v.error.unwrap().contains("i1.e621.txt") && v.plan.is_none());
+
+        let bad = super::super::moss::MossSettings { rank: 0, ..s };
+        assert!(moss_audit_view(d.path(), &bad).settings_error.is_some());
     }
 }

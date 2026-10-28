@@ -1129,8 +1129,15 @@ struct TrainQuoteArgs {
     settings: train::settings::TrainSettings,
     /// The dataset's trigger word (first caption tag), for the test prompts.
     trigger: String,
-    /// A CivitAI link to an SDXL-family checkpoint.
+    /// A CivitAI link to an SDXL-family checkpoint (not used for Kromoss).
+    #[serde(default)]
     base_link: String,
+    /// `sdxl` (default) or `kromoss`.
+    #[serde(default)]
+    trainer: String,
+    /// The Kromoss settings, when `trainer` is `kromoss`.
+    #[serde(default)]
+    moss: Option<train::moss::MossSettings>,
     max_minutes: u64,
     max_usd: f64,
 }
@@ -1155,17 +1162,29 @@ async fn train_quote(
     st: State<'_, AppState>,
     args: TrainQuoteArgs,
 ) -> Result<train::manager::QuoteView, String> {
-    let key = st.secret(secrets::CIVITAI_TOKEN);
-    let model = civitai::resolve_checkpoint(st.civitai.as_ref(), &args.base_link, key.as_deref())
-        .await
-        .map_err(|e| e.to_string())?;
-    let prompts = train::commands::preset_prompts(&args.settings, &args.trigger);
+    let trainer = match args.trainer.as_str() {
+        "kromoss" => train::manager::Trainer::Kromoss {
+            settings: args.moss.ok_or("Missing the Kromoss settings.")?,
+        },
+        "" | "sdxl" => {
+            let key = st.secret(secrets::CIVITAI_TOKEN);
+            let model =
+                civitai::resolve_checkpoint(st.civitai.as_ref(), &args.base_link, key.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let prompts = train::commands::preset_prompts(&args.settings, &args.trigger);
+            train::manager::Trainer::Kohya {
+                settings: args.settings,
+                prompts,
+                model,
+            }
+        }
+        other => return Err(format!("Unknown trainer {other:?}.")),
+    };
     st.train_manager()?
         .quote(train::manager::QuoteRequest {
             dir: args.dir.into(),
-            settings: args.settings,
-            prompts,
-            model,
+            trainer,
             max_minutes: args.max_minutes,
             max_usd: args.max_usd,
             max_dph: 1.0,
@@ -1959,6 +1978,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             train::commands::train_defaults,
             train::commands::train_audit,
+            train::commands::train_moss_defaults,
+            train::commands::train_moss_audit,
             train_pick_dataset,
             train_quote,
             train_start,

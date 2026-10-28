@@ -21,6 +21,30 @@ interface TrainSettings {
   eval_preset: "quick" | "thorough";
 }
 
+interface MossSettings {
+  output_name: string;
+  rank: number;
+  alpha: number;
+  steps: number;
+  save_every: number;
+  caption_mode: "nl" | "mix";
+  p_nl: number;
+  tag_dropout: number;
+  int8_compute: boolean;
+  seed: number;
+  sample_prompt: string;
+}
+
+interface MossAudit {
+  images: number;
+  error: string | null;
+  settings_error: string | null;
+  trigger: string;
+  plan: Plan | null;
+}
+
+type TrainerKind = "sdxl" | "kromoss";
+
 interface ImageInfo {
   id: string;
   width: number;
@@ -50,6 +74,7 @@ interface AuditView {
 
 interface QuoteView {
   plan_id: string;
+  trainer: TrainerKind;
   gpu_name: string;
   gpu_location: string | null;
   hourly: number;
@@ -132,6 +157,9 @@ const DEFAULT_BASE = "https://civitai.com/models/1261882?modelVersionId=3407912"
 
 export function mountTrain(root: HTMLElement): { show: () => void; hide: () => void } {
   let settings: TrainSettings | null = null;
+  let moss: MossSettings | null = null;
+  let mossAudit: MossAudit | null = null;
+  let trainer: TrainerKind = "sdxl";
   let dir = "";
   let audit: AuditView | null = null;
   let quote: QuoteView | null = null;
@@ -147,11 +175,14 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
   let logScroll = 0;
   let logStick = true;
 
-  const trigger = () => audit?.report.images[0]?.first_tag ?? "";
+  const trigger = () => (trainer === "kromoss" ? mossAudit?.trigger : audit?.report.images[0]?.first_tag) ?? "";
+  const activePlan = () => (trainer === "kromoss" ? mossAudit?.plan : audit?.plan) ?? null;
+  const activeSettingsError = () => (trainer === "kromoss" ? mossAudit?.settings_error : audit?.settings_error) ?? null;
 
   async function load(): Promise<void> {
     const d = await invoke<{ settings: TrainSettings }>("train_defaults");
     settings = d.settings;
+    moss = await invoke<MossSettings>("train_moss_defaults");
     status = await invoke<Status>("train_status");
     render();
   }
@@ -178,7 +209,18 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
   }
 
   async function runAudit(): Promise<void> {
-    if (!settings || !dir) return;
+    if (!settings || !moss || !dir) return;
+    if (trainer === "kromoss") {
+      await act(
+        invoke<MossAudit>("train_moss_audit", { dir, settings: moss }).then((a) => {
+          mossAudit = a;
+          if (moss && a.trigger && moss.output_name === "lora") {
+            moss.output_name = a.trigger.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 48) || "lora";
+          }
+        }),
+      );
+      return;
+    }
     await act(
       invoke<AuditView>("train_audit", { dir, settings }).then((a) => {
         audit = a;
@@ -190,12 +232,14 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
   }
 
   async function getQuote(): Promise<void> {
-    if (!settings) return;
+    if (!settings || !moss) return;
     await act(
       invoke<QuoteView>("train_quote", {
         args: {
           dir,
           settings,
+          trainer,
+          moss: trainer === "kromoss" ? moss : null,
           trigger: trigger(),
           base_link: baseLink.trim(),
           max_minutes: maxMinutes,
@@ -254,7 +298,7 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
       h(
         "p",
         { class: "muted" },
-        "Teach a model a character or style from a folder of images, each with a caption file of the same name. SlopTweak rents a GPU, trains, downloads the result, and destroys the GPU.",
+        "Teach a model a character or style from a folder of images, each with caption files of the same name. SlopTweak rents a GPU, trains, downloads the result, and destroys the GPU.",
       ),
     );
     card.append(
@@ -266,13 +310,113 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
         h("button", { onclick: () => void pick(), disabled: busy }, dir ? "Change…" : "Pick folder…"),
       ),
     );
-    if (audit) card.append(...renderAudit(audit));
-    if (audit?.plan) {
-      card.append(renderSettings(s));
-      card.append(renderLimits());
+    card.append(renderTrainerPicker());
+    if (trainer === "kromoss") {
+      if (mossAudit) card.append(...renderMossAudit(mossAudit));
+      if (mossAudit?.plan) {
+        card.append(renderMossSettings(moss!));
+        card.append(renderLimits());
+      }
+    } else {
+      if (audit) card.append(...renderAudit(audit));
+      if (audit?.plan) {
+        card.append(renderSettings(s));
+        card.append(renderLimits());
+      }
     }
     if (error) card.append(h("p", { class: "error" }, error));
     return card;
+  }
+
+  function renderTrainerPicker(): Node {
+    const pick = h("select", {});
+    for (const [value, label] of [
+      ["sdxl", "Illustrious / SDXL checkpoint (your CivitAI link)"],
+      ["kromoss", "Kromoss (MOSS-Image, natural language and tags)"],
+    ]) {
+      const o = h("option", { value }, label);
+      if (trainer === value) o.selected = true;
+      pick.append(o);
+    }
+    pick.addEventListener("change", () => {
+      trainer = pick.value === "kromoss" ? "kromoss" : "sdxl";
+      quote = null;
+      error = "";
+      if (dir) void runAudit();
+      else render();
+    });
+    return h(
+      "div",
+      { class: "row" },
+      h("label", {}, "Trains"),
+      pick,
+      trainer === "kromoss" &&
+        h(
+          "span",
+          { class: "muted small hint" },
+          "Each image needs name.nl.txt (a sentence caption) and, for mixed captions, name.e621.txt (tags, trigger word first). About 15 GB of model files are downloaded to the GPU.",
+        ),
+    );
+  }
+
+  function renderMossAudit(a: MossAudit): Node[] {
+    const out: Node[] = [];
+    if (a.error) out.push(h("p", { class: "error small" }, `Problem: ${a.error}`));
+    else {
+      out.push(
+        h(
+          "p",
+          {},
+          `${a.images} usable image${a.images === 1 ? "" : "s"}`,
+          a.trigger ? " · trigger word: " : "",
+          a.trigger ? h("b", {}, a.trigger) : "",
+        ),
+      );
+    }
+    if (a.settings_error) out.push(h("p", { class: "error small" }, a.settings_error));
+    return out;
+  }
+
+  function renderMossSettings(m: MossSettings): Node {
+    const d = h("details", {});
+    d.append(h("summary", {}, "Training settings"));
+    const form = h("div", { class: "form" });
+    const name = h("input", { type: "text", maxlength: "48" });
+    name.value = m.output_name;
+    name.addEventListener("change", () => {
+      m.output_name = name.value.trim();
+      quote = null;
+    });
+    const mode = h("select", {});
+    for (const [value, label] of [
+      ["mix", "Sentences and tags, mixed"],
+      ["nl", "Sentences only"],
+    ]) {
+      const o = h("option", { value }, label);
+      if (m.caption_mode === value) o.selected = true;
+      mode.append(o);
+    }
+    mode.addEventListener("change", () => {
+      m.caption_mode = mode.value === "nl" ? "nl" : "mix";
+      quote = null;
+      if (dir) void runAudit();
+    });
+    const int8 = h("input", { type: "checkbox" });
+    int8.checked = m.int8_compute;
+    int8.addEventListener("change", () => {
+      m.int8_compute = int8.checked;
+      quote = null;
+    });
+    form.append(
+      ...field("LoRA name", name),
+      ...field("Captions", mode, "Mixed showed steadier outfits and rear views in the first tests; sentences-only needs no tag files"),
+      ...field("Steps", num(m.steps, (v) => ((m.steps = v), (m.save_every = Math.min(m.save_every, v))), { min: "10", max: "4000" }), "800 worked for about 20 images"),
+      ...field("Checkpoint every", num(m.save_every, (v) => (m.save_every = v), { min: "1", max: "4000" }), "steps; compare them to pick the best"),
+      ...field("Rank", num(m.rank, (v) => ((m.rank = v), (m.alpha = Math.min(m.alpha, v))), { min: "1", max: "128" }), "capacity; 32 was used for one character"),
+      ...field("Faster math (int8)", int8, "about 1.3x faster on a 4090; slightly changes the numbers"),
+    );
+    d.append(form);
+    return d;
   }
 
   function renderAudit(a: AuditView): Node[] {
@@ -343,7 +487,7 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
       quote = null;
     });
     box.append(
-      h("div", { class: "row" }, h("label", {}, "Base model"), link),
+      ...(trainer === "sdxl" ? [h("div", { class: "row" }, h("label", {}, "Base model"), link)] : []),
       h(
         "div",
         { class: "row" },
@@ -353,12 +497,12 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
         num(maxUsd, (v) => (maxUsd = v), { step: "0.25", min: "0.25", max: "5" }),
       ),
     );
-    const p = audit!.plan!;
+    const p = activePlan()!;
     box.append(
       h(
         "p",
         { class: "muted small" },
-        `${p.total_steps} training steps, ${p.checkpoint_steps.length} saved checkpoints, ${p.eval_images} test images. The run stops at whichever limit comes first.`,
+        `${p.total_steps} training steps, ${p.checkpoint_steps.length} saved checkpoints${trainer === "kromoss" ? "" : `, ${p.eval_images} test images`}. The run stops at whichever limit comes first.`,
       ),
     );
     if (quote) box.append(renderQuote(quote));
@@ -367,7 +511,7 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
         h(
           "div",
           { class: "actions" },
-          h("button", { class: "primary", onclick: () => void getQuote(), disabled: busy || !!audit?.settings_error }, busy ? "Checking…" : "Get a quote"),
+          h("button", { class: "primary", onclick: () => void getQuote(), disabled: busy || !!activeSettingsError() }, busy ? "Checking…" : "Get a quote"),
           h("span", { class: "muted small" }, "Nothing is rented until you approve the quote."),
         ),
       );
