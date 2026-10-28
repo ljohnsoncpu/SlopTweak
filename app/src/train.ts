@@ -168,6 +168,8 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
   let error = "";
   let baseLink = DEFAULT_BASE;
   let maxMinutes = 120;
+  /** Kromoss only: "" = the cheapest GPU that fits, or a model to insist on. */
+  let gpuModel = "";
   let maxUsd = 1.5;
   let timer: number | undefined;
   // The machine log is rebuilt on every poll: remember how the user left it.
@@ -244,6 +246,7 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
           base_link: baseLink.trim(),
           max_minutes: maxMinutes,
           max_usd: maxUsd,
+          gpu_model: trainer === "kromoss" ? gpuModel : "",
         },
       }).then((q) => {
         quote = q;
@@ -497,6 +500,22 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
         num(maxUsd, (v) => (maxUsd = v), { step: "0.25", min: "0.25", max: "5" }),
       ),
     );
+    if (trainer === "kromoss") {
+      const gpu = h("select", {});
+      for (const [value, label] of [
+        ["", "Cheapest that fits"],
+        ["4090", "RTX 4090 only (faster, costs more per hour)"],
+      ]) {
+        const o = h("option", { value }, label);
+        if (gpuModel === value) o.selected = true;
+        gpu.append(o);
+      }
+      gpu.addEventListener("change", () => {
+        gpuModel = gpu.value;
+        quote = null;
+      });
+      box.append(h("div", { class: "row" }, h("label", {}, "GPU"), gpu));
+    }
     const p = activePlan()!;
     box.append(
       h(

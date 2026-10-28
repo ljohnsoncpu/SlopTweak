@@ -25,6 +25,8 @@ FILES = {
     "moss_workflow.py": 0o644,
     "requirements.txt": 0o644,
     "train_runner.py": 0o644,
+    "kernel_cache.py": 0o644,
+    "moss_kernel_cache.tgz": 0o644,
     "moss_requirements.lock": 0o644,
     "train_requirements.lock": 0o644,
     "train_bootstrap.lock": 0o644,
@@ -39,7 +41,9 @@ def build(out: Path) -> str:
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
         for name, mode in sorted(FILES.items()):
-            data = (HERE / name).read_bytes().replace(b"\r\n", b"\n")
+            data = (HERE / name).read_bytes()
+            if not name.endswith(".tgz"):  # archives are binary; text files get LF
+                data = data.replace(b"\r\n", b"\n")
             info = tarfile.TarInfo(name)
             info.size = len(data)
             info.mode = mode

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-moss-add-recent-lora"
+description = "Enables the moss_add_recent_lora command without any pre-configured scope."
+commands.allow = ["moss_add_recent_lora"]
+
+[[permission]]
+identifier = "deny-moss-add-recent-lora"
+description = "Denies the moss_add_recent_lora command without any pre-configured scope."
+commands.deny = ["moss_add_recent_lora"]

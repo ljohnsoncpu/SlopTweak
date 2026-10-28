@@ -10,6 +10,8 @@ mod diagnostics;
 mod identity;
 mod library;
 mod moss;
+#[cfg(test)]
+mod permissions_tests;
 mod persist;
 mod provider;
 mod redact;
@@ -978,6 +980,30 @@ async fn moss_add_lora(
     st.moss.add_lora(&target, &path).await.map(Some)
 }
 
+/// The LoRAs of the latest finished Kromoss training runs, for the panel's
+/// "from a training run" list.
+#[tauri::command]
+async fn train_recent_loras(
+    st: State<'_, AppState>,
+) -> Result<Vec<train::recent::RecentLora>, String> {
+    let root = output_dir(&st.config_dir, &st.default_output_dir).join("LoRAs");
+    Ok(train::recent::list(&root, train::recent::MAX_RUNS))
+}
+
+/// Put one of those LoRAs on the GPU. The window names it by run and file; the
+/// path is looked up here, and only listed checkpoints resolve.
+#[tauri::command]
+async fn moss_add_recent_lora(
+    st: State<'_, AppState>,
+    run: String,
+    file: String,
+) -> Result<moss::MossLora, String> {
+    let target = moss_target(&st)?;
+    let root = output_dir(&st.config_dir, &st.default_output_dir).join("LoRAs");
+    let path = train::recent::resolve(&root, &run, &file)?;
+    st.moss.add_lora(&target, &path).await
+}
+
 /// Copy a finished MOSS-Image picture into the Downloads folder.
 #[tauri::command]
 async fn moss_save_result(
@@ -1175,10 +1201,18 @@ struct TrainQuoteArgs {
     moss: Option<train::moss::MossSettings>,
     max_minutes: u64,
     max_usd: f64,
+    /// Only offer cards with this in their name (`4090`); blank = the cheapest.
+    #[serde(default)]
+    gpu_model: Option<String>,
 }
 
 #[tauri::command]
 async fn train_pick_dataset(app: AppHandle) -> Result<Option<String>, String> {
+    // Debug builds only: the UI check can't drive a native folder dialog.
+    #[cfg(debug_assertions)]
+    if let Ok(dir) = std::env::var("SLOPTWEAK_DEV_PICK_DATASET") {
+        return Ok(Some(dir));
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
@@ -1223,6 +1257,7 @@ async fn train_quote(
             max_minutes: args.max_minutes,
             max_usd: args.max_usd,
             max_dph: 1.0,
+            gpu_model: args.gpu_model,
         })
         .await
 }
@@ -2037,6 +2072,8 @@ pub fn run() {
             moss_generate,
             moss_cancel,
             moss_add_lora,
+            moss_add_recent_lora,
+            train_recent_loras,
             moss_save_result,
             get_snapshot,
             refresh_catalog,

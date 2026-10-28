@@ -42,6 +42,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import kernel_cache
+
 PYTHON_VERSION = "3.12.12"
 TORCH_INDEX = "https://download.pytorch.org/whl/cu124"
 PYPI_INDEX = "https://pypi.org/simple"
@@ -53,6 +55,9 @@ MOSS_TORCH_INDEX = "https://download.pytorch.org/whl/cu126"
 # Every package of the trainer's environment (torch included, from the cu126
 # index) with hashes: uv pip compile trainer pyproject --extra cuda + torch==2.14.1.
 MOSS_LOCK = "moss_requirements.lock"
+# Tuned-kernel tables shipped in the asset bundle, and the ones a run hands back.
+MOSS_KERNEL_CACHE = "moss_kernel_cache.tgz"
+MOSS_KERNEL_EXPORT = "kernel-cache.tgz"
 MOSS_RUN_CONFIG = "sloptweak-train.py"
 MOSS_DATA_CONFIG = "sloptweak-train_data.py"
 # Hex of a SHA-256 / a git commit.
@@ -344,6 +349,8 @@ class Runner:
         self.state: dict[str, Any] = {"stage": "waiting"}
         self._hashes: dict[tuple[str, int, int], str] = {}
         self._files: dict[str, dict[str, Any]] = {}
+        # Result files besides the checkpoints and logs (names under runtime/).
+        self.extra_results: tuple[str, ...] = ()
 
     # ----- reporting ---------------------------------------------------------
 
@@ -364,6 +371,7 @@ class Runner:
         candidates += sorted((self.p.runtime / "logs").glob("*.log"))
         for name in ("loss.csv", "metrics.jsonl", "train.toml", "dataset.toml", "eval-prompts.txt"):
             candidates.append(self.p.runtime / name)
+        candidates += [self.p.runtime / name for name in self.extra_results]
         changed = False
         for path in candidates:
             try:
@@ -409,7 +417,10 @@ class Runner:
         code = self.run(cmd, cwd or self.p.work, log, env, tick)
         if code != 0:
             script = cmd[1] if len(cmd) > 1 and cmd[1].endswith(".py") else cmd[0]
-            raise RunError(f"{Path(script).name} failed (exit {code}); see {log.name}")
+            # The cause is usually in the log's last lines; show them, not just a name.
+            last = " / ".join(ln.strip() for ln in tail(log, 1500).splitlines() if ln.strip())
+            cause = f": {last[-400:]}" if last else ""
+            raise RunError(f"{Path(script).name} failed (exit {code}); see {log.name}{cause}")
 
     def bootstrap(self) -> None:
         self.set_state("bootstrap", detail="installing the training environment")
@@ -626,12 +637,15 @@ class Runner:
             self.refresh_manifest()
             self.set_state("done")
         except Cancelled:
+            self.sleep(3.5)  # the last log must age past the mid-write guard to be saved
             self.refresh_manifest()
             self.set_state("cancelled")
         except RunError as e:
+            self.sleep(3.5)
             self.refresh_manifest()
             self.set_state("failed", error=str(e))
         except Exception as e:
+            self.sleep(3.5)
             self.refresh_manifest()
             self.set_state("failed", error=f"Unexpected error: {type(e).__name__}: {e}")
 
@@ -746,6 +760,10 @@ class MossRunner(Runner):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.moss: MossJob | None = None
+        self.extra_results = (MOSS_KERNEL_EXPORT,)
+        # Where the trainer keeps its tuning tables (``Path.home() / .cache``).
+        self.cache_home = Path.home()
+        self._kernel_signature: tuple[tuple[str, int], ...] = ()
 
     @property
     def weights(self) -> Path:
@@ -862,6 +880,7 @@ class MossRunner(Runner):
             "print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))"
         )
         self.command([venv_python, "-c", probe], logs / "bootstrap-cuda.log", self.check_cancel)
+        self.restore_kernels()
         # Informational: the doctor may warn about optional extras.
         self.run(
             [str(self.p.venv / "bin" / "kohakumoss-doctor")],
@@ -870,6 +889,34 @@ class MossRunner(Runner):
             os.environ,
             self.check_cancel,
         )
+
+    def restore_kernels(self) -> None:
+        """Unpack the bundled tuning tables so the first steps don't pay for the
+        timing runs. Tables for another card are never read, so this is harmless
+        there; any problem is logged and the trainer just tunes as before."""
+        archive = self.asset_dir / MOSS_KERNEL_CACHE
+        log = self.p.runtime / "logs" / "kernel-cache.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        if not archive.is_file():
+            log.write_text("no bundled tuning tables\n", encoding="utf-8")
+            return
+        try:
+            n = kernel_cache.restore(archive, self.cache_home)
+            log.write_text(f"restored {n} tuning table files\n", encoding="utf-8")
+        except (kernel_cache.CacheError, OSError) as e:
+            log.write_text(f"could not restore tuning tables: {e}\n", encoding="utf-8")
+
+    def export_kernels(self) -> None:
+        """Pack the tuning tables as a result file, once they have changed, so a
+        run on a card the bundle doesn't cover can add it (kernel_cache.py merge)."""
+        try:
+            sig = kernel_cache.signature(self.cache_home)
+            if not sig or sig == self._kernel_signature:
+                return
+            kernel_cache.pack(self.cache_home, self.p.runtime / MOSS_KERNEL_EXPORT)
+            self._kernel_signature = sig
+        except OSError:
+            pass
 
     def prepare(self) -> None:
         assert self.moss is not None
@@ -929,8 +976,16 @@ class MossRunner(Runner):
                 shutil.copyfile(src, tmp)
                 tmp.replace(dst)
         metrics = self.run_dir / "metrics.jsonl"
+        copy = self.p.runtime / "metrics.jsonl"
         if metrics.is_file():
-            shutil.copyfile(metrics, self.p.runtime / "metrics.jsonl")
+            # Only when the trainer wrote more, and keeping its time: a copy that is
+            # always fresh would never age past the manifest's mid-write guard.
+            old, new = (copy.stat() if copy.exists() else None), metrics.stat()
+            if old is None or (old.st_size, int(old.st_mtime)) != (new.st_size, int(new.st_mtime)):
+                tmp = copy.with_name(copy.name + ".part")
+                shutil.copy2(metrics, tmp)
+                tmp.replace(copy)
+        self.export_kernels()
         self.refresh_manifest()
 
     def tick_train(self) -> None:
@@ -1003,6 +1058,8 @@ class MossRunner(Runner):
 
     def sync_results_quietly(self) -> None:
         if self.moss is not None:
+            # The failing step's log is seconds old; let it pass the mid-write guard.
+            self.sleep(3.5)
             try:
                 self.sync_results()
             except OSError:

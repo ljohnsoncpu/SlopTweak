@@ -208,8 +208,15 @@ pub fn render_train_config(s: &MossSettings) -> String {
             drop = s.tag_dropout,
         ),
     };
+    // `kohakumoss-config check` finds the script a config drives from its
+    // docstring, so the docstring must name one.
     let mut out = format!(
-        "from kohakuengine import use_config\n\
+        "\"\"\"SlopTweak Kromoss LoRA. Drives scripts/train/moss.py.\n\
+         \n\
+         \x20   kogine run scripts/train/moss.py --config configs/user/sloptweak-train.py\n\
+         \"\"\"\n\
+         \n\
+         from kohakuengine import use_config\n\
          \n\
          use_config(\"../moss/recipes/recipes_lora_24g_bf16.py\")\n\
          \n\
@@ -300,9 +307,17 @@ pub fn render_jsonl(rows: &[MixRow]) -> Result<String, String> {
     Ok(out)
 }
 
-/// Split a `name.e621.txt` line ("a, b_c, d") into tags.
+/// Split a `name.e621.txt` line into tags. Commas separate them ("a, b_c, d");
+/// a line without any comma is e621's own form, separated by spaces ("a b_c d"),
+/// since e621 tags use underscores and never contain a space.
 pub fn parse_tags(line: &str) -> Vec<String> {
-    line.split(',')
+    let parts: Vec<&str> = if line.contains(',') {
+        line.split(',').collect()
+    } else {
+        line.split_whitespace().collect()
+    };
+    parts
+        .into_iter()
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(str::to_owned)
@@ -381,7 +396,9 @@ pub fn collect(dir: &std::path::Path, mode: CaptionMode) -> Result<Vec<MossImage
                 .map_err(|_| format!("{file}: mixed captions need the tag caption {f}."))?;
             let text =
                 String::from_utf8(bytes.clone()).map_err(|_| format!("{f} is not UTF-8 text."))?;
-            let tags = parse_tags(&text.replace('\n', ","));
+            // Line by line: a file's trailing newline must not turn a
+            // space-separated line into a comma-separated one.
+            let tags: Vec<String> = text.lines().flat_map(parse_tags).collect();
             if tags.is_empty() {
                 return Err(format!("{f} has no tags."));
             }
@@ -406,6 +423,39 @@ pub fn collect(dir: &std::path::Path, mode: CaptionMode) -> Result<Vec<MossImage
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tags_split_on_commas_or_on_e621_spaces() {
+        let want = ["thales_miletus", "solo", "multicolored_hair"];
+        assert_eq!(
+            parse_tags("thales_miletus, solo,  multicolored_hair ,"),
+            want
+        );
+        assert_eq!(
+            parse_tags(
+                "thales_miletus solo  multicolored_hair
+"
+            ),
+            want
+        );
+        // A line with commas keeps spaces inside a tag.
+        assert_eq!(parse_tags("a b, c"), ["a b", "c"]);
+        assert_eq!(parse_tags("trigger"), ["trigger"]);
+        // What `collect` does with a real file: lines parsed one by one, so a
+        // trailing newline can't make a space-separated line look comma-separated.
+        let from_file = |text: &str| -> Vec<String> { text.lines().flat_map(parse_tags).collect() };
+        assert_eq!(from_file("thales_miletus solo multicolored_hair\n"), want);
+        assert_eq!(
+            from_file("thales_miletus, solo, multicolored_hair\r\n"),
+            want
+        );
+        assert_eq!(from_file("thales_miletus solo\nmulticolored_hair\n"), want);
+        assert!(parse_tags(
+            " 
+ "
+        )
+        .is_empty());
+    }
 
     #[test]
     fn defaults_are_the_proven_run() {
@@ -592,6 +642,32 @@ mod tests {
         assert_eq!(imgs[0].tags, ["roka", "solo", "smile"]);
         assert_eq!(imgs[0].sha256, sha_hex(b"img-a"));
         assert_eq!(imgs[0].tags_file.as_deref(), Some("a.e621.txt"));
+    }
+
+    #[test]
+    fn collect_reads_e621_style_space_separated_tags() {
+        let d = folder(true);
+        // As the charset pipeline writes them: one line, spaces, trailing newline.
+        std::fs::write(
+            d.path().join("a.e621.txt"),
+            "roka_soldier solo smile multicolored_hair
+",
+        )
+        .unwrap();
+        let imgs = collect(d.path(), CaptionMode::Mix).unwrap();
+        assert_eq!(
+            imgs[0].tags,
+            ["roka_soldier", "solo", "smile", "multicolored_hair"]
+        );
+        // The comma form with CRLF line endings still works.
+        std::fs::write(
+            d.path().join("a.e621.txt"),
+            "roka_soldier, solo
+",
+        )
+        .unwrap();
+        let imgs = collect(d.path(), CaptionMode::Mix).unwrap();
+        assert_eq!(imgs[0].tags, ["roka_soldier", "solo"]);
     }
 
     #[test]

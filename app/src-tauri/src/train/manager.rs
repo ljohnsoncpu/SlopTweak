@@ -154,6 +154,39 @@ pub struct QuoteRequest {
     pub max_usd: f64,
     /// Hourly price ceiling for the GPU search.
     pub max_dph: f64,
+    /// Only offer cards whose name contains this (a model such as `4090`, in any
+    /// case); `None` = the cheapest card that fits. Checked by [`gpu_matches`].
+    pub gpu_model: Option<String>,
+}
+
+/// Longest model preference accepted.
+pub const MAX_GPU_MODEL_CHARS: usize = 24;
+
+/// A model preference as typed: trimmed, plain characters only, `None` when blank.
+pub fn clean_gpu_model(raw: Option<&str>) -> Result<Option<String>, String> {
+    let m = raw.map_or("", str::trim);
+    if m.is_empty() {
+        return Ok(None);
+    }
+    if m.chars().count() > MAX_GPU_MODEL_CHARS
+        || !m
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+    {
+        return Err("The GPU model must be a short name such as 4090.".into());
+    }
+    Ok(Some(m.to_string()))
+}
+
+/// Whether a card's name contains the model, ignoring case and spacing.
+pub fn gpu_matches(gpu_name: &str, model: &str) -> bool {
+    let squash = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase()
+    };
+    squash(gpu_name).contains(&squash(model))
 }
 
 /// What the user is shown before approving. Starting needs this `plan_id`.
@@ -444,13 +477,23 @@ impl TrainManager {
         .await
         .map_err(tokio_spawn_blocking_err)??;
 
+        let gpu_model = clean_gpu_model(req.gpu_model.as_deref())?;
         let query = req.trainer.offer_query(req.max_dph);
-        let found = self
+        let mut found = self
             .deps
             .provider
             .search_offers(&query)
             .await
             .map_err(|e| e.to_string())?;
+        if let Some(model) = &gpu_model {
+            found.retain(|o| gpu_matches(&o.gpu_name, model));
+            if found.is_empty() {
+                return Err(format!(
+                    "No {model} is available right now that fits this run. Try again later \
+                     or choose the cheapest GPU."
+                ));
+            }
+        }
         let inputs = CostInputs {
             expected_hours: req.trainer.rank_hours(&plan),
             model_bytes: req.trainer.model_bytes(),
@@ -1009,6 +1052,7 @@ mod tests {
             max_minutes: 120,
             max_usd: 2.0,
             max_dph: 1.0,
+            gpu_model: None,
         }
     }
 
@@ -1066,6 +1110,39 @@ mod tests {
         let mut req = request(&r);
         req.max_minutes = 24 * 60;
         assert!(r.mgr.quote(req).await.is_err());
+    }
+
+    #[test]
+    fn gpu_models_match_by_name_ignoring_case_and_spacing() {
+        assert!(gpu_matches("RTX 4090", "4090"));
+        assert!(gpu_matches("NVIDIA GeForce RTX 4090", "rtx 4090"));
+        assert!(gpu_matches("RTX 4090", "RTX4090"));
+        assert!(!gpu_matches("RTX 3090", "4090"));
+        assert!(!gpu_matches("RTX 4090 Ti", "4090 Ti Super"));
+        assert_eq!(clean_gpu_model(None), Ok(None));
+        assert_eq!(clean_gpu_model(Some("  ")), Ok(None));
+        assert_eq!(clean_gpu_model(Some(" 4090 ")), Ok(Some("4090".into())));
+        for bad in ["4090; drop", "../x", &"9".repeat(25), "4090\n5090"] {
+            assert!(clean_gpu_model(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_gpu_model_narrows_the_quote_and_says_when_none_is_there() {
+        let r = rig(vec![Progress::Done]);
+        let mut req = request(&r);
+        req.gpu_model = Some("a6000".into());
+        let q = r.mgr.quote(req).await.unwrap();
+        assert_eq!(q.gpu_name, "RTX A6000");
+        let mut req = request(&r);
+        req.gpu_model = Some("4090".into());
+        let e = r.mgr.quote(req).await.unwrap_err();
+        assert!(e.contains("No 4090 is available"), "{e}");
+        let mut req = request(&r);
+        req.gpu_model = Some("4090; rm".into());
+        assert!(r.mgr.quote(req).await.unwrap_err().contains("short name"));
+        // Quoting rents nothing, preference or not.
+        assert!(r.provider.created_offers().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

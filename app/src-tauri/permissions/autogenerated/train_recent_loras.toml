@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-train-recent-loras"
+description = "Enables the train_recent_loras command without any pre-configured scope."
+commands.allow = ["train_recent_loras"]
+
+[[permission]]
+identifier = "deny-train-recent-loras"
+description = "Denies the train_recent_loras command without any pre-configured scope."
+commands.deny = ["train_recent_loras"]

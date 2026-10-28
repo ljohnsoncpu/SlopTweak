@@ -10,6 +10,7 @@ pub mod diag;
 pub mod job;
 pub mod manager;
 pub mod moss;
+pub mod recent;
 pub mod run;
 pub mod settings;
 pub mod sim;

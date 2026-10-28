@@ -28,6 +28,8 @@ class MossRig:
         self.commands: list[list[str]] = []
         self.envs: list[Mapping[str, str]] = []
         self.fail_on: str | None = None
+        self.fail_log = "boom\n"
+        self.sleeps: list[float] = []
         self.cancel_on: str | None = None
         self.weights = {
             "kromoss.safetensors": (b"dit", "diffusion_models/kromoss_int8_convrot.safetensors"),
@@ -67,7 +69,7 @@ class MossRig:
             executor=self.fake,
             fetch_trainer=self.fetch,
             clock=lambda: CLOCK,
-            sleep=lambda _s: None,
+            sleep=self.sleeps.append,
         )
 
     def write_job(self) -> None:
@@ -102,8 +104,9 @@ class MossRig:
         self.envs.append(env)
         joined = " ".join(cmd)
         log.parent.mkdir(parents=True, exist_ok=True)
-        log.write_text("log\n")
-        if self.fail_on and self.fail_on in joined:
+        failing = bool(self.fail_on and self.fail_on in joined)
+        log.write_text(self.fail_log if failing else "log\n")
+        if failing:
             return 3
         if "scripts/train/moss.py" in joined:
             assert cwd == self.paths.trainer
@@ -111,6 +114,8 @@ class MossRig:
             (self.run_dir / "metrics.jsonl").write_text(
                 '{"step": 1, "loss": 0.34, "step1_wall": 17.5}\n{"step": 2, "loss": 0.30}\n'
             )
+            # Written long ago, as far as the manifest's mid-write guard can tell.
+            os.utime(self.run_dir / "metrics.jsonl", (0, 0))
             self.export(STEPS[0])
             on_tick()
             if self.cancel_on == "mid-train":
@@ -282,3 +287,34 @@ def test_good_job_parses(rig: MossRig) -> None:
     job = tr.MossJob.parse(json.dumps(rig.job))
     assert job.checkpoint_file(2) == "lora-step00000002.safetensors"
     assert len(job.models) == 2
+
+
+def test_a_failing_step_reports_its_cause_and_lets_its_log_age_before_the_final_sync(
+    rig: MossRig,
+) -> None:
+    rig.fail_on = "kohakumoss-config"
+    rig.fail_log = "warming up\nValueError: the docstring names no scripts/<...>.py\n"
+    rig.runner.execute()
+    st = state(rig)
+    assert st["stage"] == "failed"
+    assert "kohakumoss-config failed (exit 3); see config-check.log" in st["error"]
+    assert "the docstring names no scripts/<...>.py" in st["error"]
+    assert "warming up / ValueError" in st["error"]
+    # The last log is seconds old: the runner waits past the 3 s mid-write guard.
+    assert 3.5 in rig.sleeps
+
+
+def test_metrics_reach_the_manifest_when_the_clock_is_real(rig: MossRig) -> None:
+    """With a real clock a copy that is always fresh would be skipped as 'mid-write'
+    forever (the first real run came back without metrics.jsonl)."""
+    import time
+
+    rig.runner.clock = time.time
+    rig.runner.execute()
+    assert state(rig)["stage"] == "done", state(rig)
+    assert "metrics.jsonl" in manifest_paths(rig)
+    copy = rig.paths.runtime / "metrics.jsonl"
+    # Unchanged source: no recopy (its time stays the source's).
+    before = copy.stat().st_mtime_ns
+    rig.runner.sync_results()
+    assert copy.stat().st_mtime_ns == before
