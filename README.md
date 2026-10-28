@@ -123,3 +123,10 @@ See [app/README.md](app/README.md) (launcher) and [instance/](instance/)
 
 [MIT](LICENSE). SlopTweak isn't affiliated with Vast.ai, CivitAI, Invoke, or
 Cloudflare. Models you download have their own licenses, shown in the app.
+
+**Credits.** The Kromoss training option uses
+[KohakuMossTrainer](https://github.com/KohakuBlueleaf/KohakuMossTrainer) by
+KohakuBlueLeaf, under the KohakuMoss License 1.0 (Apache-2.0 plus a naming term).
+SlopTweak neither includes nor modifies it: the rented GPU downloads a pinned
+version of it (commit and source digest are fixed in the app) and runs it as a
+separate program. The LoRAs it produces are yours.

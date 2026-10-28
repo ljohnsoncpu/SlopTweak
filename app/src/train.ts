@@ -357,7 +357,7 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
         h(
           "span",
           { class: "muted small hint" },
-          "Each image needs name.nl.txt (a sentence caption) and, for mixed captions, name.e621.txt (tags, trigger word first). About 15 GB of model files are downloaded to the GPU.",
+          "Each image needs name.nl.txt (a sentence caption) and, for mixed captions, name.e621.txt (tags, trigger word first). About 15 GB of model files are downloaded to the GPU. Training uses KohakuMossTrainer by KohakuBlueLeaf (KohakuMoss License 1.0), which the GPU downloads; it is not part of SlopTweak.",
         ),
     );
   }
