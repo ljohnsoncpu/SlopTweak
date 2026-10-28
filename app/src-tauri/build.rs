@@ -43,6 +43,7 @@ fn main() {
             "moss_state",
             "moss_generate",
             "moss_cancel",
+            "moss_add_lora",
             "moss_save_result",
             "train_defaults",
             "train_audit",

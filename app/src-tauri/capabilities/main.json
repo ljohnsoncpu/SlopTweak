@@ -46,6 +46,7 @@
     "allow-moss-state",
     "allow-moss-generate",
     "allow-moss-cancel",
+    "allow-moss-add-lora",
     "allow-moss-save-result",
     "allow-train-defaults",
     "allow-train-audit",
