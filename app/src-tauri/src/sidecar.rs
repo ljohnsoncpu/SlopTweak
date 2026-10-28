@@ -178,6 +178,18 @@ pub trait SidecarApi: Send + Sync {
         fields: &[(&str, String)],
         file: (&str, &str, Vec<u8>),
     ) -> Result<serde_json::Value, SidecarError>;
+
+    /// Put a LoRA into the ComfyUI GPU's `loras/user/` folder (`PUT /__lora/<name>`,
+    /// bearer only). `sha256` is the hex digest the sidecar checks; the answer's
+    /// `name` is what a `LoraLoaderModelOnly` node takes.
+    async fn lora_upload(
+        &self,
+        base: &Url,
+        secret: &str,
+        name: &str,
+        sha256: &str,
+        bytes: Vec<u8>,
+    ) -> Result<serde_json::Value, SidecarError>;
 }
 
 /// `<base>/<path…>?<query>`: ComfyUI's routes, each segment encoded.
@@ -505,6 +517,25 @@ impl SidecarApi for HttpSidecar {
             .multipart(form.part(field.to_string(), part))
             // Two reference sheets are a few MB each over a tunnel.
             .timeout(Duration::from_secs(120));
+        self.send_json(req).await
+    }
+
+    async fn lora_upload(
+        &self,
+        base: &Url,
+        secret: &str,
+        name: &str,
+        sha256: &str,
+        bytes: Vec<u8>,
+    ) -> Result<serde_json::Value, SidecarError> {
+        let req = self
+            .http
+            .put(api_url(base, &["__lora", name]))
+            .bearer_auth(secret)
+            .header("X-Sha256", sha256)
+            .body(bytes)
+            // A few hundred MB through a quick tunnel.
+            .timeout(Duration::from_secs(900));
         self.send_json(req).await
     }
 }

@@ -10,6 +10,7 @@
 //! layer 22 skipped in the negative branch (ComfyUI's SkipLayerGuidanceDiTSimple,
 //! as in the official and ostris workflows).
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -43,6 +44,15 @@ pub const MAX_CFG: f64 = 10.0;
 pub const FULL_DEFAULT_CFG: f64 = 3.0;
 /// The layer the card skips in the negative branch.
 pub const SKIP_LAYER: &str = "22";
+
+/// A user LoRA's strength in the graph (negative values are not offered).
+pub const MIN_LORA_STRENGTH: f64 = 0.0;
+pub const MAX_LORA_STRENGTH: f64 = 2.0;
+pub const DEFAULT_LORA_STRENGTH: f64 = 1.0;
+/// The sidecar's cap (`LORA_MAX_BYTES`); a rank-32 export is about 200 MB.
+pub const MAX_LORA_BYTES: u64 = 1024 * 1024 * 1024;
+/// Where the sidecar puts uploaded LoRAs, as ComfyUI names them.
+pub const USER_LORA_DIR: &str = "user/";
 
 /// Samplers offered in the panel (ComfyUI's own names). Euler is what the
 /// distillation was made for; the others are there to try.
@@ -127,6 +137,15 @@ pub struct Request {
     /// Blank = a random one.
     #[serde(default)]
     pub seed: Option<u64>,
+    /// A LoRA already put on the GPU (`MossLora::name`), applied on top of the model.
+    #[serde(default)]
+    pub lora: Option<String>,
+    /// Blank = 1.0.
+    #[serde(default)]
+    pub lora_strength: Option<f64>,
+    /// With a LoRA: also make the same picture without it (same seed), first.
+    #[serde(default)]
+    pub control: bool,
 }
 
 /// A checked [`Request`]: every value is one the graph can use.
@@ -140,6 +159,12 @@ pub struct Params {
     pub cfg: f64,
     pub fast: bool,
     pub seed: u64,
+    /// A user LoRA and its strength.
+    pub lora: Option<(String, f64)>,
+    /// Make the picture without the LoRA as well, before the one with it.
+    pub control: bool,
+    /// This is that control picture (only for the caption).
+    pub is_control: bool,
 }
 
 /// ComfyUI takes 64-bit seeds; keep them in what a JS number holds exactly.
@@ -180,6 +205,21 @@ impl Params {
             }
             cfg
         };
+        let lora = match &r.lora {
+            None => None,
+            Some(name) => {
+                if !valid_lora_name(name) {
+                    return Err("That LoRA isn't one of the files on this GPU.".into());
+                }
+                let strength = r.lora_strength.unwrap_or(DEFAULT_LORA_STRENGTH);
+                if !(MIN_LORA_STRENGTH..=MAX_LORA_STRENGTH).contains(&strength) {
+                    return Err(format!(
+                        "The LoRA strength must be between {MIN_LORA_STRENGTH} and {MAX_LORA_STRENGTH}."
+                    ));
+                }
+                Some((name.clone(), strength))
+            }
+        };
         Ok(Self {
             prompt,
             size,
@@ -189,7 +229,20 @@ impl Params {
             cfg,
             fast: r.fast,
             seed: r.seed.unwrap_or(random_seed) & SEED_MASK,
+            control: r.control && lora.is_some(),
+            lora,
+            is_control: false,
         })
+    }
+
+    /// The same picture without the LoRA.
+    pub fn control_variant(&self) -> Self {
+        Self {
+            lora: None,
+            control: false,
+            is_control: true,
+            ..self.clone()
+        }
     }
 
     /// One line for the picture's caption: what made it.
@@ -199,10 +252,82 @@ impl Params {
         } else {
             format!("Full quality, CFG {}", self.cfg)
         };
+        let lora = match (&self.lora, self.is_control) {
+            (Some((name, s)), _) => format!(" · LoRA {} ×{s}", lora_label(name)),
+            (None, true) => " · base control (no LoRA)".to_string(),
+            (None, false) => String::new(),
+        };
         format!(
-            "{}×{} · {} · {} steps · {}/{} · seed {}",
+            "{}×{} · {} · {} steps · {}/{} · seed {}{lora}",
             self.size.0, self.size.1, mode, self.steps, self.sampler, self.scheduler, self.seed
         )
+    }
+}
+
+/// `user/<file>.safetensors` with a plain file name, as the sidecar stores it.
+pub fn valid_lora_name(name: &str) -> bool {
+    let Some(file) = name.strip_prefix(USER_LORA_DIR) else {
+        return false;
+    };
+    let Some(stem) = file.strip_suffix(".safetensors") else {
+        return false;
+    };
+    let mut chars = stem.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && file.len() <= 96 + ".safetensors".len()
+        && stem
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// The file name shown for a LoRA: no folder, no extension.
+fn lora_label(name: &str) -> &str {
+    let file = name.strip_prefix(USER_LORA_DIR).unwrap_or(name);
+    file.strip_suffix(".safetensors").unwrap_or(file)
+}
+
+/// A LoRA file name the sidecar accepts: the user's own name, made plain, and
+/// the checksum's start so two different files never share a name.
+pub fn lora_file_name(stem: &str, sha256: &str) -> String {
+    let plain: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let mut plain: String = plain
+        .trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
+        .chars()
+        .take(60)
+        .collect();
+    if plain.is_empty() {
+        plain = "lora".into();
+    }
+    format!("{plain}-{}.safetensors", &sha256[..8])
+}
+
+/// A safetensors file starts with its header's length (8 bytes, little endian)
+/// and a JSON object of that length. This is a sanity check, not a safety proof:
+/// the sidecar repeats it and the loader reads tensors, never code.
+pub fn check_safetensors(bytes: &[u8]) -> Result<(), String> {
+    let bad = || "That doesn't look like a LoRA file (.safetensors).".to_string();
+    let len: [u8; 8] = bytes
+        .get(..8)
+        .ok_or_else(bad)?
+        .try_into()
+        .map_err(|_| bad())?;
+    let n = usize::try_from(u64::from_le_bytes(len)).map_err(|_| bad())?;
+    if !(2..=64 * 1024 * 1024).contains(&n) {
+        return Err(bad());
+    }
+    let header = bytes.get(8..8 + n).ok_or_else(bad)?;
+    match serde_json::from_slice::<Value>(header) {
+        Ok(Value::Object(_)) => Ok(()),
+        _ => Err(bad()),
     }
 }
 
@@ -248,17 +373,26 @@ pub fn build_graph(files: &ModelFiles, p: &Params) -> Value {
         "9": {"class_type": "SaveImage",
               "inputs": {"filename_prefix": "SlopTweak", "images": ["8", 0]}},
     });
+    // A user LoRA goes straight on the base model, under the distillation.
+    let base = match &p.lora {
+        Some((name, strength)) => {
+            g["13"] = json!({"class_type": "LoraLoaderModelOnly",
+                "inputs": {"model": ["1", 0], "lora_name": name, "strength_model": strength}});
+            json!(["13", 0])
+        }
+        None => json!(["1", 0]),
+    };
     // Fast: base -> distillation LoRA -> time-embedding delta. Full: the base, with
     // layer 22 skipped in the negative branch (only matters above CFG 1).
     let model = if p.fast {
         g["10"] = json!({"class_type": "LoraLoaderModelOnly",
-            "inputs": {"model": ["1", 0], "lora_name": files.lora, "strength_model": 1.0}});
+            "inputs": {"model": base, "lora_name": files.lora, "strength_model": 1.0}});
         g["11"] = json!({"class_type": "LoraLoaderModelOnly",
             "inputs": {"model": ["10", 0], "lora_name": TIME_DELTA_NAME, "strength_model": 1.0}});
         json!(["11", 0])
     } else {
         g["12"] = json!({"class_type": "SkipLayerGuidanceDiTSimple", "inputs": {
-            "model": ["1", 0], "double_layers": "", "single_layers": SKIP_LAYER,
+            "model": base, "double_layers": "", "single_layers": SKIP_LAYER,
             "start_percent": 0.0, "end_percent": 1.0}});
         json!(["12", 0])
     };
@@ -368,11 +502,22 @@ pub struct MossImage {
     pub info: String,
 }
 
+/// A LoRA the app put on this GPU.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MossLora {
+    /// What `Request::lora` takes (`user/<file>`).
+    pub name: String,
+    /// What the panel shows.
+    pub label: String,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MossView {
     pub results: Vec<MossImage>,
     pub phase: Phase,
     pub message: String,
+    pub loras: Vec<MossLora>,
 }
 
 #[derive(Default)]
@@ -383,6 +528,8 @@ struct Inner {
     message: String,
     cancel: Option<Arc<AtomicBool>>,
     prompt_id: Option<String>,
+    /// LoRAs uploaded to the current GPU, oldest first.
+    loras: Vec<MossLora>,
 }
 
 /// Where one run goes: the instance's tunnel, the launch secret, and the
@@ -396,7 +543,8 @@ pub struct Target {
 
 /// A checked request, ready to run.
 pub struct Begun {
-    params: Params,
+    /// The pictures to make, in order (a base control comes first).
+    runs: Vec<Params>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -433,6 +581,7 @@ impl MossService {
                 .collect(),
             phase: i.phase,
             message: i.message.clone(),
+            loras: i.loras.clone(),
         }
     }
 
@@ -444,6 +593,8 @@ impl MossService {
             i.message.clear();
             i.cancel = None;
             i.prompt_id = None;
+            // A new GPU starts without the old one's uploads.
+            i.loras.clear();
         }
         (self.notify)();
     }
@@ -458,6 +609,11 @@ impl MossService {
             if i.phase.busy() {
                 return Err("An image is already being made.".into());
             }
+            if let Some((name, _)) = &params.lora {
+                if !i.loras.iter().any(|l| &l.name == name) {
+                    return Err("Add that LoRA to this GPU first.".into());
+                }
+            }
             i.phase = Phase::Running;
             i.message =
                 "Making your image (the first one takes longer while the model loads)…".into();
@@ -465,42 +621,126 @@ impl MossService {
             i.prompt_id = None;
         }
         (self.notify)();
-        Ok(Begun { params, cancel })
+        let mut runs = Vec::new();
+        if params.control {
+            runs.push(params.control_variant());
+        }
+        runs.push(params);
+        Ok(Begun { runs, cancel })
+    }
+
+    /// Put a LoRA file from the user's disk onto the GPU so a picture can use it.
+    /// The file is checked here (a safetensors header, a size cap) and again by
+    /// the sidecar, which also verifies the checksum.
+    pub async fn add_lora(&self, t: &Target, path: &Path) -> Result<MossLora, String> {
+        let meta = std::fs::metadata(path).map_err(|_| "Couldn't read that file.".to_string())?;
+        if meta.len() > MAX_LORA_BYTES {
+            return Err("That file is too big for a LoRA (the limit is 1 GB).".into());
+        }
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let is_st = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
+        if !is_st {
+            return Err("Choose a .safetensors LoRA file.".into());
+        }
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|_| "Couldn't read that file.".to_string())?;
+        check_safetensors(&bytes)?;
+        let sha = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(&bytes))
+        };
+        let file = lora_file_name(&stem, &sha);
+        let size = bytes.len() as u64;
+        let answer = t
+            .sidecar
+            .lora_upload(&t.base, &t.secret, &file, &sha, bytes)
+            .await
+            .map_err(|e| match e {
+                SidecarError::Unauthorized => {
+                    "The GPU rejected this app's login. Stop it and start again.".to_string()
+                }
+                SidecarError::Http(404) => {
+                    "This GPU can't take LoRAs. Stop it and start a new one.".to_string()
+                }
+                SidecarError::Http(409) => {
+                    "This GPU already holds as many LoRAs as it takes.".to_string()
+                }
+                SidecarError::Http(413) => "That file is too big for a LoRA.".to_string(),
+                SidecarError::Http(422) => {
+                    "The GPU says that file isn't a valid LoRA, or it was damaged on the way."
+                        .to_string()
+                }
+                e => format!("Couldn't reach the GPU: {e}"),
+            })?;
+        let name = answer["name"].as_str().unwrap_or_default().to_string();
+        if !valid_lora_name(&name) {
+            return Err("The GPU named that file in a way this app doesn't accept.".into());
+        }
+        let lora = MossLora {
+            label: lora_label(&name).to_string(),
+            name,
+            bytes: size,
+        };
+        {
+            let mut i = self.inner.lock().unwrap();
+            i.loras.retain(|l| l.name != lora.name);
+            i.loras.push(lora.clone());
+        }
+        (self.notify)();
+        Ok(lora)
     }
 
     /// Run a request [`begin`](Self::begin) accepted, and record how it ended.
     pub async fn finish(self: &Arc<Self>, t: &Target, b: Begun) {
-        let graph = build_graph(&t.files, &b.params);
-        let me = self.clone();
-        let on_queued = move |id: &str| {
-            me.inner.lock().unwrap().prompt_id = Some(id.to_string());
-        };
-        let outcome = run(
-            t.sidecar.as_ref(),
-            &t.base,
-            &t.secret,
-            &graph,
-            &b.cancel,
-            &on_queued,
-        )
-        .await;
-        match outcome {
-            Ok(Some((id, name, bytes))) => {
-                {
+        let total = b.runs.len();
+        for (n, params) in b.runs.iter().enumerate() {
+            if n > 0 {
+                let mut i = self.inner.lock().unwrap();
+                i.prompt_id = None;
+                i.message = format!("Making image {} of {total}…", n + 1);
+                drop(i);
+                (self.notify)();
+            }
+            let graph = build_graph(&t.files, params);
+            let me = self.clone();
+            let on_queued = move |id: &str| {
+                me.inner.lock().unwrap().prompt_id = Some(id.to_string());
+            };
+            let outcome = run(
+                t.sidecar.as_ref(),
+                &t.base,
+                &t.secret,
+                &graph,
+                &b.cancel,
+                &on_queued,
+            )
+            .await;
+            match outcome {
+                Ok(Some((id, name, bytes))) => {
                     let mut i = self.inner.lock().unwrap();
-                    i.results
-                        .push((Kept { id, name, bytes }, b.params.summary()));
+                    i.results.push((Kept { id, name, bytes }, params.summary()));
                     let extra = i.results.len().saturating_sub(MAX_RESULTS);
                     i.results.drain(..extra);
                 }
-                self.set_phase(
-                    Phase::Done,
-                    "Done. The image is saved to your output folder.",
-                );
+                Ok(None) => return self.set_phase(Phase::Cancelled, "Cancelled."),
+                Err(e) => return self.set_phase(Phase::Failed, e),
             }
-            Ok(None) => self.set_phase(Phase::Cancelled, "Cancelled."),
-            Err(e) => self.set_phase(Phase::Failed, e),
         }
+        self.set_phase(
+            Phase::Done,
+            if total > 1 {
+                "Done. Both images are saved to your output folder; the one without the LoRA \
+                 is the base control."
+            } else {
+                "Done. The image is saved to your output folder."
+            },
+        );
     }
 
     /// Stop the current image: flag the wait loop, and tell ComfyUI.
@@ -580,6 +820,9 @@ mod tests {
             cfg: None,
             fast: true,
             seed: Some(42),
+            lora: None,
+            lora_strength: None,
+            control: false,
         }
     }
 
@@ -798,7 +1041,7 @@ mod tests {
         let mut r = request();
         r.prompt = "  a fox ".into();
         let b = svc.begin(&r, 1).unwrap();
-        assert_eq!(b.params.prompt, "a fox");
+        assert_eq!(b.runs[0].prompt, "a fox");
         assert_eq!(svc.view().phase, Phase::Running);
         assert!(notified.load(Ordering::SeqCst) >= 1);
         let again = svc.begin(&request(), 1);
@@ -864,5 +1107,243 @@ mod tests {
         assert!(std::fs::read(&first).unwrap().starts_with(b"\x89PNG"));
         assert!(svc.save_result("nope", &dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const LORA: &str = "user/km-mix-800-0a1b2c3d.safetensors";
+
+    fn lora_request(fast: bool) -> Request {
+        Request {
+            fast,
+            steps: if fast { 8 } else { 30 },
+            lora: Some(LORA.into()),
+            lora_strength: Some(0.8),
+            ..request()
+        }
+    }
+
+    fn safetensors_bytes() -> Vec<u8> {
+        let header = br#"{"__metadata__":{}}"#;
+        let mut v = (header.len() as u64).to_le_bytes().to_vec();
+        v.extend_from_slice(header);
+        v.extend_from_slice(b"weights");
+        v
+    }
+
+    #[test]
+    fn a_user_lora_goes_on_the_base_model_under_the_distillation() {
+        let g = build_graph(&files(), &params(&lora_request(true)));
+        assert_eq!(g["13"]["class_type"], "LoraLoaderModelOnly");
+        assert_eq!(g["13"]["inputs"]["lora_name"], LORA);
+        assert_eq!(g["13"]["inputs"]["strength_model"], 0.8);
+        assert_eq!(g["13"]["inputs"]["model"], json!(["1", 0]));
+        // base -> user LoRA -> distillation LoRA -> time-embedding delta -> sampler
+        assert_eq!(g["10"]["inputs"]["model"], json!(["13", 0]));
+        assert_eq!(g["11"]["inputs"]["model"], json!(["10", 0]));
+        assert_eq!(g["7"]["inputs"]["model"], json!(["11", 0]));
+    }
+
+    #[test]
+    fn full_quality_applies_the_user_lora_before_layer_skipping() {
+        let g = build_graph(&files(), &params(&lora_request(false)));
+        assert_eq!(g["13"]["inputs"]["model"], json!(["1", 0]));
+        assert_eq!(g["12"]["inputs"]["model"], json!(["13", 0]));
+        assert_eq!(g["7"]["inputs"]["model"], json!(["12", 0]));
+    }
+
+    #[test]
+    fn without_a_lora_the_graph_is_unchanged() {
+        for fast in [true, false] {
+            let mut r = request();
+            r.fast = fast;
+            r.steps = 8;
+            let g = build_graph(&files(), &params(&r));
+            assert!(g.get("13").is_none());
+            assert!(!g.to_string().contains(USER_LORA_DIR));
+        }
+    }
+
+    #[test]
+    fn lora_links_resolve_in_every_mode() {
+        for files in [files()] {
+            for fast in [true, false] {
+                let g = build_graph(&files, &params(&lora_request(fast)));
+                for (id, node) in g.as_object().unwrap() {
+                    for (name, v) in node["inputs"].as_object().unwrap() {
+                        if let Some([src, _]) = v.as_array().map(Vec::as_slice) {
+                            assert!(g.get(src.as_str().unwrap()).is_some(), "{id}.{name}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lora_names_and_strengths_are_checked() {
+        for bad in [
+            "x.safetensors",
+            "user/x.ckpt",
+            "user/../x.safetensors",
+            "user/a/b.safetensors",
+            "user/.hidden.safetensors",
+            "user/a b.safetensors",
+            "user/.safetensors",
+            "../user/x.safetensors",
+        ] {
+            let mut r = lora_request(true);
+            r.lora = Some(bad.into());
+            assert!(Params::check(&r, 1).is_err(), "{bad}");
+        }
+        for bad in [-0.1, 2.5, f64::NAN] {
+            let mut r = lora_request(true);
+            r.lora_strength = Some(bad);
+            assert!(Params::check(&r, 1).is_err(), "{bad}");
+        }
+        let mut r = lora_request(true);
+        r.lora_strength = None;
+        assert_eq!(params(&r).lora, Some((LORA.into(), 1.0)));
+        r.lora_strength = Some(0.0);
+        assert_eq!(params(&r).lora, Some((LORA.into(), 0.0)));
+    }
+
+    #[test]
+    fn the_control_is_the_same_picture_without_the_lora() {
+        let mut r = lora_request(true);
+        r.control = true;
+        let p = params(&r);
+        let c = p.control_variant();
+        assert_eq!(
+            (c.seed, c.prompt.clone(), c.size),
+            (p.seed, p.prompt.clone(), p.size)
+        );
+        assert_eq!(c.lora, None);
+        assert!(p.summary().contains("LoRA km-mix-800-0a1b2c3d ×0.8"));
+        assert!(c.summary().contains("base control (no LoRA)"));
+        assert!(!c.summary().contains("LoRA km"));
+        // A control without a LoRA means nothing.
+        let mut r = request();
+        r.control = true;
+        assert!(!params(&r).control);
+    }
+
+    #[test]
+    fn begin_needs_the_lora_to_be_on_the_gpu_and_queues_the_control_first() {
+        let (svc, _) = service();
+        let mut r = lora_request(true);
+        r.control = true;
+        let err = svc.begin(&r, 1).err().unwrap();
+        assert!(err.contains("Add that LoRA"), "{err}");
+        assert_eq!(svc.view().phase, Phase::Idle);
+        svc.inner.lock().unwrap().loras.push(MossLora {
+            name: LORA.into(),
+            label: "km-mix-800-0a1b2c3d".into(),
+            bytes: 7,
+        });
+        let b = svc.begin(&r, 1).unwrap();
+        assert_eq!(b.runs.len(), 2);
+        assert!(b.runs[0].is_control && b.runs[0].lora.is_none());
+        assert!(b.runs[1].lora.is_some() && !b.runs[1].is_control);
+        assert_eq!(b.runs[0].seed, b.runs[1].seed);
+        // Without the control box: one picture.
+        svc.reset_run();
+        svc.inner.lock().unwrap().loras.push(MossLora {
+            name: LORA.into(),
+            label: String::new(),
+            bytes: 0,
+        });
+        r.control = false;
+        assert_eq!(svc.begin(&r, 1).unwrap().runs.len(), 1);
+    }
+
+    #[test]
+    fn a_new_gpu_forgets_the_uploaded_loras() {
+        let (svc, _) = service();
+        svc.inner.lock().unwrap().loras.push(MossLora {
+            name: LORA.into(),
+            label: "x".into(),
+            bytes: 1,
+        });
+        assert_eq!(svc.view().loras.len(), 1);
+        svc.reset_run();
+        assert!(svc.view().loras.is_empty());
+    }
+
+    #[test]
+    fn upload_names_are_plain_and_unique_per_content() {
+        let sha = "0a1b2c3d".repeat(8);
+        assert_eq!(
+            lora_file_name("My LoRA (final) v2", &sha),
+            "My-LoRA--final--v2-0a1b2c3d.safetensors"
+        );
+        assert_eq!(lora_file_name("___", &sha), "lora-0a1b2c3d.safetensors");
+        assert_eq!(lora_file_name("", &sha), "lora-0a1b2c3d.safetensors");
+        let long = lora_file_name(&"a".repeat(200), &sha);
+        assert!(valid_lora_name(&format!("user/{long}")), "{long}");
+        // Non-ASCII letters are replaced, not passed through.
+        assert!(valid_lora_name(&format!(
+            "user/{}",
+            lora_file_name("角色", &sha)
+        )));
+    }
+
+    #[test]
+    fn only_a_safetensors_header_passes_the_local_check() {
+        assert!(check_safetensors(&safetensors_bytes()).is_ok());
+        let mut huge = u64::MAX.to_le_bytes().to_vec();
+        huge.extend_from_slice(b"{}");
+        let mut short = 100u64.to_le_bytes().to_vec();
+        short.extend_from_slice(b"{}");
+        let mut array = 2u64.to_le_bytes().to_vec();
+        array.extend_from_slice(b"[]");
+        for bad in [&b""[..], b"GGUF....", &huge, &short, &array] {
+            assert!(check_safetensors(bad).is_err());
+        }
+    }
+
+    fn lora_target(mock: &crate::provider::mock::MockSidecar, secret: &str) -> (Target, Url) {
+        let base = Url::parse("https://example.trycloudflare.com").unwrap();
+        (
+            Target {
+                sidecar: Arc::new(mock.clone()),
+                base: base.clone(),
+                secret: secret.into(),
+                files: files(),
+            },
+            base,
+        )
+    }
+
+    fn temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sloptweak-lora-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn add_lora_refuses_other_files_before_any_upload() {
+        let mock = crate::provider::mock::MockProvider::new(
+            crate::provider::mock::MockTimings::default(),
+            vec![],
+        )
+        .sidecar();
+        let (t, _) = lora_target(&mock, "s");
+        let (svc, _) = service();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cases = [
+            ("a.ckpt", safetensors_bytes()),
+            ("b.safetensors", b"not a model".to_vec()),
+        ];
+        for (name, bytes) in cases {
+            let p = temp_file(name, &bytes);
+            assert!(rt.block_on(svc.add_lora(&t, &p)).is_err(), "{name}");
+        }
+        let missing = std::env::temp_dir().join("sloptweak-lora-nope.safetensors");
+        assert!(rt.block_on(svc.add_lora(&t, &missing)).is_err());
+        assert!(svc.view().loras.is_empty());
     }
 }

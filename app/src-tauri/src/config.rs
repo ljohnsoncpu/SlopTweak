@@ -25,7 +25,7 @@ pub const ASSETS_URL: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "/instance-assets.tar.gz"
 );
-pub const ASSETS_SHA256: &str = "255a25af99e8ae3ee9f1540ace8ab1ad3c1a975e5b6f2073d7947c326df34e29";
+pub const ASSETS_SHA256: &str = "59e080c4a7308c18da304c32e5f399472844432d760fe285547b0634bf60fd49";
 /// Debug builds fetch the same release as a shipped build: the pinned
 /// [`ASSETS_SHA256`] is the hash of that release's bundle. (A dev pre-release
 /// holds older bytes and fails the hash, so every instance would start no

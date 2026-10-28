@@ -132,6 +132,17 @@ impl SidecarApi for FakeInvoke {
     ) -> Result<Value, SidecarError> {
         unimplemented!()
     }
+
+    async fn lora_upload(
+        &self,
+        _: &Url,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Vec<u8>,
+    ) -> Result<Value, SidecarError> {
+        unimplemented!()
+    }
 }
 
 const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F'];

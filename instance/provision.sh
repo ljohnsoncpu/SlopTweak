@@ -36,6 +36,8 @@ COMFY_MOSS_REPO=https://github.com/comfyanonymous/ComfyUI.git
 COMFY_MOSS_SHA=a639f187a9f6abfecbda9673034f2045148b6d85
 COMFY_MOSS_DIR=/opt/sloptweak/ComfyUI-moss
 COMFY_MOSS_VENV=/opt/sloptweak/comfy-moss-venv
+# Must match the sidecar's SLOPTWEAK_LORA_DIR default.
+USER_LORA_DIR=/opt/sloptweak/user-loras
 # Catalog file names of the MOSS-Image entry (must match catalog.json and moss.rs).
 MOSS_BASE_FILE="moss_image_base_bf16.safetensors"
 MOSS_TIME_FILE="moss-image-8-step-dmd-time-embedding.safetensors"
@@ -391,6 +393,9 @@ finish_comfy() {
   done <<<"$MODEL_LINES"
   if ((moss)); then
     mkdir -p "$models/loras"
+    # LoRAs the app uploads for evaluation (sidecar /__lora/) show up as user/<file>.
+    mkdir -p "$USER_LORA_DIR"
+    ln -sfn "$USER_LORA_DIR" "$models/loras/user"
     ln -sfn "$MODELS_DIR/$MOSS_TIME_DELTA" "$models/loras/$MOSS_TIME_DELTA"
     # Open ComfyUI starts empty otherwise: leave the MOSS workflows in its sidebar.
     MODEL_LINES="$MODEL_LINES" "$SIDECAR_VENV/bin/python" "$ASSET_DIR/moss_workflow.py"       "$run_dir/user/default/workflows" "$MOSS_TIME_DELTA" "$MOSS_TIME_FILE"       >>"$LOG_DIR/moss-workflow.log" 2>&1 ||

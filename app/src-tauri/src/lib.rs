@@ -943,6 +943,41 @@ async fn moss_cancel(st: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Ask for a LoRA file (a Kromoss training export, say) and put it on the GPU
+/// so pictures can use it. `None` when the dialog was cancelled.
+#[tauri::command]
+async fn moss_add_lora(
+    app: AppHandle,
+    st: State<'_, AppState>,
+) -> Result<Option<moss::MossLora>, String> {
+    let target = moss_target(&st)?;
+    // Debug builds only: the UI check can't drive a native file dialog.
+    #[cfg(debug_assertions)]
+    if let Ok(path) = std::env::var("SLOPTWEAK_DEV_PICK_LORA") {
+        return st
+            .moss
+            .add_lora(&target, std::path::Path::new(&path))
+            .await
+            .map(Some);
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Choose a LoRA file")
+        .add_filter("LoRA (.safetensors)", &["safetensors"])
+        .pick_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(path) = rx
+        .await
+        .map_err(|e| e.to_string())?
+        .and_then(|p| p.into_path().ok())
+    else {
+        return Ok(None);
+    };
+    st.moss.add_lora(&target, &path).await.map(Some)
+}
+
 /// Copy a finished MOSS-Image picture into the Downloads folder.
 #[tauri::command]
 async fn moss_save_result(
@@ -2001,6 +2036,7 @@ pub fn run() {
             moss_state,
             moss_generate,
             moss_cancel,
+            moss_add_lora,
             moss_save_result,
             get_snapshot,
             refresh_catalog,

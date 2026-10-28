@@ -2956,3 +2956,18 @@ the pinned trainer's `pyproject.toml` (`--extra cuda`) plus `torch==2.14.1` with
 destroyed): install 1m25s, `uv pip check` clean, torch 2.14.1+cu126 sees the GPU, the trainer's
 imports load, `kohakumoss-doctor` lists triton/tilelang kernels. Training was not run. The offer
 originally quoted (42023445) was gone at create time (`no_such_ask`); the next cheapest was used.
+
+### MOSS panel: trained-LoRA evaluation (2026-10-28) ✅ unit and mock tested, not run on a GPU
+
+The panel's "Try a LoRA" section sends a local `.safetensors` to the ComfyUI GPU and applies it on top
+of the model, with an optional base control (same seed and prompt, no LoRA, made first).
+
+- Sidecar `PUT /__lora/<name>` (bearer only, `BACKEND=comfyui` only): name regex, SHA-256 header,
+  safetensors header check, 1 GiB and 20-file caps, atomic write into `/opt/sloptweak/user-loras`.
+  `provision.sh` links that folder into ComfyUI's `loras/` as `user/`, so the node takes `user/<file>`.
+  UNVERIFIED on a real instance: that ComfyUI lists a symlinked `loras/user/` folder and picks up a file
+  added after start (its folder cache is keyed on directory mtime).
+- Graph: `LoraLoaderModelOnly` (node 13) straight on the UNet, under the distillation LoRA (Fast) or
+  before layer skipping (Full). Local A/Bs used the int8 Kromoss; the catalog entry is the bf16 file, so a
+  LoRA trained on int8 meeting bf16 weights is UNVERIFIED.
+- The asset bundle changed again (`sidecar.py`, `provision.sh`), so `ASSETS_SHA256` is re-pinned.
