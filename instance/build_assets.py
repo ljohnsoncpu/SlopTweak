@@ -25,6 +25,7 @@ FILES = {
     "moss_workflow.py": 0o644,
     "requirements.txt": 0o644,
     "train_runner.py": 0o644,
+    "moss_requirements.lock": 0o644,
     "train_requirements.lock": 0o644,
     "train_bootstrap.lock": 0o644,
     "train_tokenizers.json": 0o644,

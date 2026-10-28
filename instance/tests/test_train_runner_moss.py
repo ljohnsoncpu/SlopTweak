@@ -145,8 +145,8 @@ def test_full_run(rig: MossRig) -> None:
     idx = {
         key: next(i for i, j in enumerate(joined) if key in j)
         for key in (
-            "torch==2.14.1",
-            "[cuda]",
+            "moss_requirements.lock",
+            "--no-deps -e",
             "torch.cuda.is_available",
             "kohakumoss-config",
             "cache_text.py",
@@ -155,8 +155,9 @@ def test_full_run(rig: MossRig) -> None:
         )
     }
     assert list(idx.values()) == sorted(idx.values()), (idx, names)
-    torch_cmd = next(j for j in joined if "torch==2.14.1" in j)
-    assert "--index-url https://download.pytorch.org/whl/cu126" in torch_cmd
+    lock_cmd = next(j for j in joined if "moss_requirements.lock" in j)
+    assert "--require-hashes" in lock_cmd and "--no-deps" in lock_cmd
+    assert "--extra-index-url https://download.pytorch.org/whl/cu126" in lock_cmd
 
     # Files laid out for the trainer.
     trainer = rig.paths.trainer

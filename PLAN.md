@@ -311,6 +311,28 @@ limits; the record is saved before the create call; results are synced and
 hash-verified before destroy unless under two minutes remain; destroy runs on
 every exit path.
 
+### Phase K — Kromoss (MOSS-Image) LoRA trainer (user decision 2026-10-27)
+Goal: a second trainer in the Train tab for character LoRAs on Kromoss, the
+MOSS-Image fine-tune. Spike and run logs: `docs/spikes/kromoss-lora-training.md`;
+verified numbers: `docs/findings.md`. Trainer: KohakuMossTrainer, fetched at run
+time at a pinned commit and tree digest, never vendored.
+- **K0 (done):** desk research, a local smoke test and three Vast runs (3090,
+  4090 benchmark, 4090 `mix` run, about $0.42). Settled: on-demand rentals only
+  (a `price` field makes an interruptible bid), host CUDA >= 12.8, an output
+  watchdog, checkpoints synced as they appear.
+- **K1 (done in mock mode, commit 8a5cd30):** `train/moss.rs` (pins, settings,
+  config, jsonl, `collect`), `moss_launch_spec` and `moss_offer_query`, the
+  `Trainer` enum in `manager.rs`, `train_moss_*` commands, the trainer picker in
+  `train.ts`, and `MossRunner` in `train_runner.py`. Never run on a real instance.
+- **K2 (pending):** one small character set on a 24 GB card, with the user's
+  approval of GPU, $/hr, duration and cap. The MOSS venv is hash-locked (`instance/moss_requirements.lock`, installed on a real instance 2026-10-27); 
+  next is the run itself, recorded in `findings.md`.
+- **K3 (pending):** evaluation images (MOSS ComfyUI graph with the exported LoRA
+  against a base control, or the trainer's sampler), the saved per-card
+  kernel-tuning cache, and a `kromoss` catalog entry for the MOSS panel.
+Invariants are Phase T's. Caption default (`mix` or `nl`) and whether this
+becomes a general MOSS preset are open (§9).
+
 ## 5. Security checklist
 - Vast key and CivitAI key only in Credential Manager; never logged, never in
   diagnostics, never in URLs.
@@ -365,3 +387,8 @@ every exit path.
 4. **Starting model set** for `catalog.json`, and their licenses.
 5. **App name** and GitHub org/repo for releases and the catalog.
 6. **Signing identity** (individual vs. business) and budget.
+7. **KohakuMoss licence naming.** It asks for "Kohaku" in the name of works
+   built on it. The spike reads SlopTweak as outside this (the trainer is
+   fetched at run time, never vendored); the user decides.
+8. **Kromoss caption default** (`mix` or `nl`; evidence is thin: 2 seeds, by
+   eye) and **scope** (Kromoss only, or a MOSS preset that also takes Base/SFT).

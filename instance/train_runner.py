@@ -50,7 +50,9 @@ MOSS_TRAINER_REPO = "KohakuBlueleaf/KohakuMossTrainer"
 # The cu128 index only has torch <= 2.11 and the trainer needs >= 2.13. Offers
 # need host CUDA >= 12.8 (a 12.6 host broke CUDA with Error 804).
 MOSS_TORCH_INDEX = "https://download.pytorch.org/whl/cu126"
-MOSS_TORCH = "torch==2.14.1"
+# Every package of the trainer's environment (torch included, from the cu126
+# index) with hashes: uv pip compile trainer pyproject --extra cuda + torch==2.14.1.
+MOSS_LOCK = "moss_requirements.lock"
 MOSS_RUN_CONFIG = "sloptweak-train.py"
 MOSS_DATA_CONFIG = "sloptweak-train_data.py"
 # Hex of a SHA-256 / a git commit.
@@ -804,9 +806,14 @@ class MossRunner(Runner):
                     "install",
                     "--python",
                     venv_python,
-                    MOSS_TORCH,
-                    "--index-url",
+                    "--require-hashes",
+                    "--no-deps",
+                    "-r",
+                    str(self.asset_dir / MOSS_LOCK),
+                    "--extra-index-url",
                     MOSS_TORCH_INDEX,
+                    "--index-strategy",
+                    "unsafe-best-match",
                 ],
             ),
         ]
@@ -835,15 +842,15 @@ class MossRunner(Runner):
         (root,) = [d for d in extract.iterdir() if d.is_dir()]
         root.rename(self.p.trainer)
 
-        # The trainer's own dependencies (torch is already satisfied by the
-        # pinned wheel), then a CUDA probe so a host whose driver is too old
-        # fails here and not after the caches.
+        # The trainer itself, without dependencies (the hash-locked set above
+        # already holds them), then a CUDA probe so a host whose driver is too
+        # old fails here and not after the caches.
         self.check_cancel()
         self.set_state("bootstrap", detail="installing: trainer")
         self.command(
             [
-                *(uv, "pip", "install", "--python", venv_python, "-e", f"{self.p.trainer}[cuda]"),
-                *("--extra-index-url", MOSS_TORCH_INDEX, "--index-strategy", "unsafe-best-match"),
+                *(uv, "pip", "install", "--python", venv_python, "--no-deps"),
+                *("-e", str(self.p.trainer)),
             ],
             logs / "bootstrap-trainer.log",
             self.check_cancel,
