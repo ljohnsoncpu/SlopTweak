@@ -138,6 +138,10 @@ pub struct MockComfy {
     pub done: Vec<(String, Vec<String>)>,
     /// Uploaded reference images by name.
     pub uploads: HashMap<String, Vec<u8>>,
+    /// LoRAs put into `loras/user/` (by file name).
+    pub loras: HashMap<String, Vec<u8>>,
+    /// Make a LoRA upload fail with this HTTP status.
+    pub reject_lora: Option<u16>,
     /// Every prompt graph that was queued.
     pub prompts: Vec<serde_json::Value>,
     /// Prompt ids still running (when `hold_prompts` is set).
@@ -1153,6 +1157,28 @@ impl SidecarApi for MockSidecar {
         file: (&str, &str, Vec<u8>),
     ) -> Result<serde_json::Value, SidecarError> {
         self.with_instance(secret, |inst, _| inst.comfy.upload(path, file))
+    }
+
+    async fn lora_upload(
+        &self,
+        _base: &Url,
+        secret: &str,
+        name: &str,
+        sha256: &str,
+        bytes: Vec<u8>,
+    ) -> Result<serde_json::Value, SidecarError> {
+        self.with_instance(secret, |inst, _| {
+            if let Some(code) = inst.comfy.reject_lora {
+                return Err(SidecarError::Http(code));
+            }
+            use sha2::{Digest, Sha256};
+            if format!("{:x}", Sha256::digest(&bytes)) != sha256 {
+                return Err(SidecarError::Http(422));
+            }
+            let size = bytes.len();
+            inst.comfy.loras.insert(name.to_string(), bytes);
+            Ok(serde_json::json!({"name": format!("user/{name}"), "bytes": size}))
+        })
     }
 }
 

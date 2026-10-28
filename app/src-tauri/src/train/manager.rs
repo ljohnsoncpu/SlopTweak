@@ -14,14 +14,16 @@ use super::commands::{self, Plan};
 use super::dataset;
 use super::diag::{self, StageView};
 use super::job::{self, BaseModel, JobBundle};
+use super::moss::{self, MossSettings};
 use super::run::{
-    destroy_all, offer_query, Approval, Limits, Live, Outcome, Phase, Plan as RunPlan, Progress,
-    Quote, RemoteTrain, RunFile, RunRecord, RunResult, Runner, STUCK_SETUP_BLAME_SECS,
+    destroy_all, moss_offer_query, offer_query, Approval, Limits, Live, Outcome, Phase,
+    Plan as RunPlan, Progress, Quote, RemoteTrain, RunFile, RunRecord, RunResult, Runner,
+    STUCK_SETUP_BLAME_SECS,
 };
 use super::settings::{EvalPrompt, TrainSettings};
 use crate::provider::machines::MachineFile;
 use crate::provider::offers::{self, CostInputs, Tried};
-use crate::provider::{attempt_label, GpuProvider, Offer};
+use crate::provider::{attempt_label, GpuProvider, Offer, OfferQuery};
 
 /// A quote stays valid this long; after that the GPU price may have changed.
 pub const QUOTE_TTL_SECS: u64 = 10 * 60;
@@ -31,6 +33,14 @@ pub const STOP_BUDGET: Duration = Duration::from_secs(5 * 60);
 /// Where the app's own estimate of a run's length starts: environment setup and
 /// model download before the first training step.
 const SETUP_MINUTES: u64 = 12;
+/// The same for Kromoss: image pull and boot, the 15 GB of weights, the
+/// trainer's environment, the caches and the first-run kernel tuning (about
+/// 24 min on the 2026-10-27 runs).
+const MOSS_SETUP_MINUTES: u64 = 25;
+/// Measured seconds per step: an RTX 4090 with INT8_COMPUTE, and an RTX 3090
+/// (also the guess for any other card, so the estimate errs long).
+const MOSS_STEP_SECS_4090: f64 = 2.0;
+const MOSS_STEP_SECS_OTHER: f64 = 5.7;
 
 pub type RemoteFactory =
     Arc<dyn Fn(String, PathBuf, Arc<JobBundle>) -> Arc<dyn RemoteTrain> + Send + Sync>;
@@ -50,22 +60,141 @@ pub struct Deps {
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
+/// Which trainer a run uses, with everything only that trainer needs.
+#[derive(Debug, Clone)]
+pub enum Trainer {
+    /// kohya sd-scripts on an SDXL-family checkpoint.
+    Kohya {
+        settings: TrainSettings,
+        prompts: Vec<EvalPrompt>,
+        model: BaseModel,
+    },
+    /// KohakuMossTrainer on Kromoss; the weights are pinned in `moss.rs`.
+    Kromoss { settings: MossSettings },
+}
+
+impl Trainer {
+    /// What the UI calls it.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Kohya { .. } => "sdxl",
+            Self::Kromoss { .. } => "kromoss",
+        }
+    }
+
+    fn output_name(&self) -> &str {
+        match self {
+            Self::Kohya { settings, .. } => &settings.output_name,
+            Self::Kromoss { settings } => &settings.output_name,
+        }
+    }
+
+    fn download_gb(&self) -> f64 {
+        match self {
+            Self::Kohya { model, .. } => job::download_gb(model),
+            Self::Kromoss { .. } => job::moss_download_gb(),
+        }
+    }
+
+    fn disk_gb(&self) -> u32 {
+        match self {
+            Self::Kohya { .. } => job::TRAIN_DISK_GB,
+            Self::Kromoss { .. } => job::MOSS_DISK_GB,
+        }
+    }
+
+    fn model_bytes(&self) -> u64 {
+        match self {
+            Self::Kohya { model, .. } => model.bytes,
+            Self::Kromoss { .. } => moss::MOSS_FILES.iter().map(|f| f.bytes).sum(),
+        }
+    }
+
+    fn offer_query(&self, max_dph: f64) -> OfferQuery {
+        match self {
+            Self::Kohya { .. } => offer_query(max_dph),
+            Self::Kromoss { .. } => moss_offer_query(max_dph),
+        }
+    }
+
+    /// Hours a run is expected to occupy a GPU, for ranking offers by cost.
+    fn rank_hours(&self, plan: &Plan) -> f64 {
+        match self {
+            Self::Kohya { .. } => (SETUP_MINUTES + 30) as f64 / 60.0,
+            // The slower measured rate, since the card isn't chosen yet.
+            Self::Kromoss { .. } => {
+                (MOSS_SETUP_MINUTES as f64 * 60.0
+                    + f64::from(plan.total_steps) * MOSS_STEP_SECS_OTHER)
+                    / 3600.0
+            }
+        }
+    }
+
+    /// A rough guide shown before approval, never a limit.
+    fn expected_minutes(&self, plan: &Plan, gpu: &str) -> u64 {
+        match self {
+            Self::Kohya { .. } => SETUP_MINUTES + expected_train_minutes(plan),
+            Self::Kromoss { .. } => {
+                let per_step = if gpu.contains("4090") {
+                    MOSS_STEP_SECS_4090
+                } else {
+                    MOSS_STEP_SECS_OTHER
+                };
+                MOSS_SETUP_MINUTES + (f64::from(plan.total_steps) * per_step / 60.0).ceil() as u64
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QuoteRequest {
     pub dir: PathBuf,
-    pub settings: TrainSettings,
-    pub prompts: Vec<EvalPrompt>,
-    pub model: BaseModel,
+    pub trainer: Trainer,
     pub max_minutes: u64,
     pub max_usd: f64,
     /// Hourly price ceiling for the GPU search.
     pub max_dph: f64,
+    /// Only offer cards whose name contains this (a model such as `4090`, in any
+    /// case); `None` = the cheapest card that fits. Checked by [`gpu_matches`].
+    pub gpu_model: Option<String>,
+}
+
+/// Longest model preference accepted.
+pub const MAX_GPU_MODEL_CHARS: usize = 24;
+
+/// A model preference as typed: trimmed, plain characters only, `None` when blank.
+pub fn clean_gpu_model(raw: Option<&str>) -> Result<Option<String>, String> {
+    let m = raw.map_or("", str::trim);
+    if m.is_empty() {
+        return Ok(None);
+    }
+    if m.chars().count() > MAX_GPU_MODEL_CHARS
+        || !m
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+    {
+        return Err("The GPU model must be a short name such as 4090.".into());
+    }
+    Ok(Some(m.to_string()))
+}
+
+/// Whether a card's name contains the model, ignoring case and spacing.
+pub fn gpu_matches(gpu_name: &str, model: &str) -> bool {
+    let squash = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase()
+    };
+    squash(gpu_name).contains(&squash(model))
 }
 
 /// What the user is shown before approving. Starting needs this `plan_id`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct QuoteView {
     pub plan_id: String,
+    /// `sdxl` or `kromoss`.
+    pub trainer: String,
     pub gpu_name: String,
     pub gpu_location: Option<String>,
     pub hourly: f64,
@@ -83,8 +212,7 @@ struct Pending {
     view: QuoteView,
     offer: Offer,
     limits: Limits,
-    settings: TrainSettings,
-    model: BaseModel,
+    trainer: Trainer,
     bundle: Arc<JobBundle>,
 }
 
@@ -323,36 +451,53 @@ impl TrainManager {
         let limits = Limits {
             max_seconds: req.max_minutes * 60,
             max_usd: req.max_usd,
-            download_gb: job::download_gb(&req.model),
+            download_gb: req.trainer.download_gb(),
         };
         limits.validate().map_err(|e| e.0)?;
 
         // The dataset is read and hashed off the async threads.
-        let (dir, settings, prompts, model) = (
-            req.dir.clone(),
-            req.settings.clone(),
-            req.prompts.clone(),
-            req.model.clone(),
-        );
-        let (report, bundle) = tokio::task::spawn_blocking(move || {
-            let report = dataset::audit(&dir, settings.resolution)?;
-            let bundle = job::build(&dir, &settings, &report, &model, &prompts)?;
-            Ok::<_, String>((report, bundle))
+        let (dir, trainer) = (req.dir.clone(), req.trainer.clone());
+        let (plan, bundle) = tokio::task::spawn_blocking(move || match &trainer {
+            Trainer::Kohya {
+                settings,
+                prompts,
+                model,
+            } => {
+                let report = dataset::audit(&dir, settings.resolution)?;
+                let bundle = job::build(&dir, settings, &report, model, prompts)?;
+                let images = report.images.len() as u32;
+                Ok::<_, String>((commands::plan(settings, images, prompts.len()), bundle))
+            }
+            Trainer::Kromoss { settings } => {
+                let images = moss::collect(&dir, settings.caption_mode)?;
+                let bundle = job::build_moss(&dir, settings, &images)?;
+                Ok((commands::moss_plan(settings, images.len() as u32), bundle))
+            }
         })
         .await
         .map_err(tokio_spawn_blocking_err)??;
 
-        let query = offer_query(req.max_dph);
-        let found = self
+        let gpu_model = clean_gpu_model(req.gpu_model.as_deref())?;
+        let query = req.trainer.offer_query(req.max_dph);
+        let mut found = self
             .deps
             .provider
             .search_offers(&query)
             .await
             .map_err(|e| e.to_string())?;
+        if let Some(model) = &gpu_model {
+            found.retain(|o| gpu_matches(&o.gpu_name, model));
+            if found.is_empty() {
+                return Err(format!(
+                    "No {model} is available right now that fits this run. Try again later \
+                     or choose the cheapest GPU."
+                ));
+            }
+        }
         let inputs = CostInputs {
-            expected_hours: (SETUP_MINUTES + 30) as f64 / 60.0,
-            model_bytes: req.model.bytes,
-            disk_gb: f64::from(job::TRAIN_DISK_GB),
+            expected_hours: req.trainer.rank_hours(&plan),
+            model_bytes: req.trainer.model_bytes(),
+            disk_gb: f64::from(req.trainer.disk_gb()),
         };
         let memory = MachineFile::new(&self.deps.machines_dir).load();
         let ranked = offers::rank(
@@ -366,7 +511,7 @@ impl TrainManager {
             .map(|r| {
                 (
                     r.offer.clone(),
-                    Quote::new(&r.offer, job::TRAIN_DISK_GB, &limits),
+                    Quote::new(&r.offer, req.trainer.disk_gb(), &limits),
                 )
             })
             .find(|(_, q)| q.worst_usd <= limits.max_usd)
@@ -378,17 +523,16 @@ impl TrainManager {
                 )
             })?;
 
-        let images = report.images.len() as u32;
-        let plan = commands::plan(&req.settings, images, req.prompts.len());
         let view = QuoteView {
             plan_id: crate::session::new_nonce(),
+            trainer: req.trainer.kind().into(),
             gpu_name: offer.gpu_name.clone(),
             gpu_location: offer.geolocation.clone(),
             hourly: quote.hourly,
             max_minutes: req.max_minutes,
             max_usd: limits.max_usd,
             worst_usd: quote.worst_usd,
-            expected_minutes: SETUP_MINUTES + expected_train_minutes(&plan),
+            expected_minutes: req.trainer.expected_minutes(&plan, &offer.gpu_name),
             plan,
             expires_unix: self.now() + QUOTE_TTL_SECS,
         };
@@ -396,8 +540,7 @@ impl TrainManager {
             view: view.clone(),
             offer,
             limits,
-            settings: req.settings,
-            model: req.model,
+            trainer: req.trainer,
             bundle: Arc::new(bundle),
         });
         Ok(view)
@@ -428,18 +571,26 @@ impl TrainManager {
         let hash = crate::session::sha256_hex(&secret);
         // Everything fetched from the instance is masked against these.
         let mut secrets = vec![secret.clone()];
-        secrets.extend((self.deps.civitai_token)());
         let label = attempt_label(&crate::session::new_nonce());
-        let spec = job::launch_spec(
-            &label,
-            &hash,
-            &pending.model,
-            pending.limits.max_seconds,
-            (self.deps.civitai_token)().as_deref(),
-        )?;
+        let spec = match &pending.trainer {
+            Trainer::Kohya { model, .. } => {
+                secrets.extend((self.deps.civitai_token)());
+                job::launch_spec(
+                    &label,
+                    &hash,
+                    model,
+                    pending.limits.max_seconds,
+                    (self.deps.civitai_token)().as_deref(),
+                )?
+            }
+            // The Kromoss weights are public: no key goes to the instance.
+            Trainer::Kromoss { .. } => {
+                job::moss_launch_spec(&label, &hash, pending.limits.max_seconds)?
+            }
+        };
         let stamp = self.now();
         let results_dir =
-            (self.deps.results_root)().join(format!("{}-{stamp}", pending.settings.output_name));
+            (self.deps.results_root)().join(format!("{}-{stamp}", pending.trainer.output_name()));
         std::fs::create_dir_all(&results_dir)
             .map_err(|e| format!("Couldn't create the results folder: {e}"))?;
 
@@ -884,21 +1035,24 @@ mod tests {
     fn request(r: &Rig) -> QuoteRequest {
         QuoteRequest {
             dir: r.data.path().into(),
-            settings: TrainSettings {
-                output_name: "lora".into(),
-                ..Default::default()
-            },
-            prompts: commands::default_prompts("trig"),
-            model: BaseModel {
-                file: "m.safetensors".into(),
-                sha256: "ab".repeat(32),
-                bytes: 6_938_043_446,
-                url: "https://civitai.com/api/download/models/1".into(),
-                requires_civitai_token: true,
+            trainer: Trainer::Kohya {
+                settings: TrainSettings {
+                    output_name: "lora".into(),
+                    ..Default::default()
+                },
+                prompts: commands::default_prompts("trig"),
+                model: BaseModel {
+                    file: "m.safetensors".into(),
+                    sha256: "ab".repeat(32),
+                    bytes: 6_938_043_446,
+                    url: "https://civitai.com/api/download/models/1".into(),
+                    requires_civitai_token: true,
+                },
             },
             max_minutes: 120,
             max_usd: 2.0,
             max_dph: 1.0,
+            gpu_model: None,
         }
     }
 
@@ -958,6 +1112,39 @@ mod tests {
         assert!(r.mgr.quote(req).await.is_err());
     }
 
+    #[test]
+    fn gpu_models_match_by_name_ignoring_case_and_spacing() {
+        assert!(gpu_matches("RTX 4090", "4090"));
+        assert!(gpu_matches("NVIDIA GeForce RTX 4090", "rtx 4090"));
+        assert!(gpu_matches("RTX 4090", "RTX4090"));
+        assert!(!gpu_matches("RTX 3090", "4090"));
+        assert!(!gpu_matches("RTX 4090 Ti", "4090 Ti Super"));
+        assert_eq!(clean_gpu_model(None), Ok(None));
+        assert_eq!(clean_gpu_model(Some("  ")), Ok(None));
+        assert_eq!(clean_gpu_model(Some(" 4090 ")), Ok(Some("4090".into())));
+        for bad in ["4090; drop", "../x", &"9".repeat(25), "4090\n5090"] {
+            assert!(clean_gpu_model(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_gpu_model_narrows_the_quote_and_says_when_none_is_there() {
+        let r = rig(vec![Progress::Done]);
+        let mut req = request(&r);
+        req.gpu_model = Some("a6000".into());
+        let q = r.mgr.quote(req).await.unwrap();
+        assert_eq!(q.gpu_name, "RTX A6000");
+        let mut req = request(&r);
+        req.gpu_model = Some("4090".into());
+        let e = r.mgr.quote(req).await.unwrap_err();
+        assert!(e.contains("No 4090 is available"), "{e}");
+        let mut req = request(&r);
+        req.gpu_model = Some("4090; rm".into());
+        assert!(r.mgr.quote(req).await.unwrap_err().contains("short name"));
+        // Quoting rents nothing, preference or not.
+        assert!(r.provider.created_offers().is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn start_needs_the_exact_live_quote() {
         let r = rig(vec![Progress::Done]);
@@ -969,6 +1156,78 @@ mod tests {
         let e = r.mgr.start(&q.plan_id).unwrap_err();
         assert!(e.contains("expired"), "{e}");
         assert!(r.provider.created_offers().is_empty());
+    }
+
+    fn kromoss_request(r: &Rig) -> (tempfile::TempDir, QuoteRequest) {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..4u8 {
+            std::fs::write(d.path().join(format!("i{i}.png")), png(i)).unwrap();
+            std::fs::write(d.path().join(format!("i{i}.nl.txt")), "roka, a woman.").unwrap();
+            std::fs::write(d.path().join(format!("i{i}.e621.txt")), "roka, solo").unwrap();
+        }
+        let req = QuoteRequest {
+            dir: d.path().into(),
+            trainer: Trainer::Kromoss {
+                settings: MossSettings {
+                    output_name: "roka".into(),
+                    ..Default::default()
+                },
+            },
+            ..request(r)
+        };
+        (d, req)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_kromoss_quote_uses_its_own_disk_plan_and_estimate() {
+        let r = rig(vec![Progress::Done]);
+        let (_d, req) = kromoss_request(&r);
+        let q = r.mgr.quote(req).await.unwrap();
+        assert_eq!(q.trainer, "kromoss");
+        assert_eq!(q.gpu_name, "RTX A6000");
+        // Storage is priced for the larger Kromoss disk.
+        let hourly = 0.5420 + 0.2 * f64::from(job::MOSS_DISK_GB) / 720.0;
+        assert!((q.hourly - hourly).abs() < 1e-9, "{}", q.hourly);
+        assert_eq!((q.plan.images, q.plan.total_steps), (4, 800));
+        assert_eq!(q.plan.eval_images, 0);
+        // 25 min of setup plus 800 steps at the slower measured rate.
+        assert_eq!(q.expected_minutes, MOSS_SETUP_MINUTES + 76);
+        assert!(r.provider.created_offers().is_empty());
+        // The kohya quote is unchanged.
+        assert_eq!(r.mgr.quote(request(&r)).await.unwrap().trainer, "sdxl");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_kromoss_dataset_missing_tags_is_refused_before_any_search() {
+        let r = rig(vec![Progress::Done]);
+        let (d, req) = kromoss_request(&r);
+        std::fs::remove_file(d.path().join("i2.e621.txt")).unwrap();
+        let e = r.mgr.quote(req).await.unwrap_err();
+        assert!(e.contains("i2.e621.txt"), "{e}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_kromoss_run_completes_without_a_civitai_key() {
+        let r = rig(vec![
+            Progress::Training {
+                step: 200,
+                total: 800,
+            },
+            Progress::Done,
+        ]);
+        let (_d, req) = kromoss_request(&r);
+        let q = r.mgr.quote(req).await.unwrap();
+        r.mgr.start(&q.plan_id).unwrap();
+        let s = finish(&r.mgr).await;
+        assert_eq!(s.outcome.as_deref(), Some("completed"));
+        assert!(s.synced && s.destroyed, "{s:?}");
+        assert!(r.provider.live_ids().is_empty());
+        let dir = r.mgr.results_dir().unwrap();
+        assert!(dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("roka-"));
     }
 
     #[tokio::test(start_paused = true)]

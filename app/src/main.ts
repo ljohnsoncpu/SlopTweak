@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { mountTrain } from "./train";
+import { mountLayout } from "./layout";
 
 // ----- types mirrored from src-tauri/src (session.rs, lib.rs, cost.rs) --------
 
@@ -249,6 +250,11 @@ const ui = {
   idResults: el("id-results"),
   moss: el("moss"),
   mossPrompt: el<HTMLTextAreaElement>("moss-prompt"),
+  mossPromptLabel: el("moss-prompt-label"),
+  mossTabPrompt: el<HTMLButtonElement>("moss-tab-prompt"),
+  mossTabLayout: el<HTMLButtonElement>("moss-tab-layout"),
+  mossLayoutBox: el("moss-layout"),
+  mossLoraBox: el("moss-lora-box"),
   mossMode: el<HTMLSelectElement>("moss-mode"),
   mossModeHint: el("moss-mode-hint"),
   mossWidth: el<HTMLInputElement>("moss-width"),
@@ -263,6 +269,16 @@ const ui = {
   mossCfg: el<HTMLInputElement>("moss-cfg"),
   mossCfgVal: el("moss-cfg-val"),
   mossSeed: el<HTMLInputElement>("moss-seed"),
+  mossLoraAdd: el<HTMLButtonElement>("moss-lora-add"),
+  mossLora: el<HTMLSelectElement>("moss-lora"),
+  mossLoraRecentRow: el("moss-lora-recent-row"),
+  mossLoraRecent: el<HTMLSelectElement>("moss-lora-recent"),
+  mossLoraUseRecent: el<HTMLButtonElement>("moss-lora-use-recent"),
+  mossLoraStrengthRow: el("moss-lora-strength-row"),
+  mossLoraStrength: el<HTMLInputElement>("moss-lora-strength"),
+  mossLoraStrengthVal: el("moss-lora-strength-val"),
+  mossLoraControlRow: el("moss-lora-control-row"),
+  mossLoraControl: el<HTMLInputElement>("moss-lora-control"),
   mossGo: el<HTMLButtonElement>("moss-go"),
   mossCancel: el<HTMLButtonElement>("moss-cancel"),
   mossMsg: el("moss-msg"),
@@ -1424,10 +1440,18 @@ interface MossImage {
   info: string;
 }
 
+/** A LoRA put on the GPU: `name` is what a request takes. */
+interface MossLora {
+  name: string;
+  label: string;
+  bytes: number;
+}
+
 interface MossView {
   results: MossImage[];
   phase: IdentityView["phase"];
   message: string;
+  loras: MossLora[];
 }
 
 /** Samplers and schedulers the panel offers (ComfyUI's names; the backend checks them too). */
@@ -1455,7 +1479,7 @@ const MOSS_MODES = {
 } as const;
 const MOSS_CFG_DEFAULT = 3;
 
-let moss: MossView = { results: [], phase: "idle", message: "" };
+let moss: MossView = { results: [], phase: "idle", message: "", loras: [] };
 /** An error from the last click (a bad request), shown until the next state change. */
 let mossError = "";
 
@@ -2023,6 +2047,33 @@ async function refreshMoss(): Promise<void> {
 const mossFast = () => ui.mossMode.value === "fast";
 const mossMode = () => MOSS_MODES[mossFast() ? "fast" : "full"];
 
+/** Layout (boxes, each with its own LoRA) is chosen with the tab; it only works in Fast mode. */
+let mossLayoutTab = false;
+const layoutOn = () => mossLayoutTab && mossFast();
+const layoutEditor = mountLayout(ui.mossLayoutBox, {
+  onChange: () => renderMossGate(mossBusy()),
+  // The panel's own LoRA flow does the work; the new file then shows up in `moss.loras`.
+  onAddLora: () => ui.mossLoraAdd.click(),
+});
+
+function renderMossLayout(busy: boolean): void {
+  const on = layoutOn();
+  ui.mossTabPrompt.setAttribute("aria-pressed", String(!on));
+  ui.mossTabLayout.setAttribute("aria-pressed", String(on));
+  ui.mossTabLayout.disabled = !mossFast();
+  ui.mossTabLayout.title = mossFast() ? "" : "Layout needs Fast mode.";
+  ui.mossLayoutBox.hidden = !on;
+  // In Layout mode each box has its own LoRA, so the single-LoRA block steps aside.
+  ui.mossLoraBox.hidden = on;
+  ui.mossPromptLabel.textContent = on ? "Describe the whole picture" : "What should it draw?";
+  layoutEditor.update({
+    width: snapSide(ui.mossWidth.value, 1024),
+    height: snapSide(ui.mossHeight.value, 1024),
+    busy,
+    loras: moss.loras.map((l) => ({ name: l.name, label: l.label })),
+  });
+}
+
 /** A side as typed: whole, a multiple of 16, inside the allowed range. */
 function snapSide(v: string, fallback: number): number {
   const n = Math.round(Number(v) / 16) * 16;
@@ -2038,9 +2089,69 @@ function mossSeedValue(): number | null {
   return /^\d+$/.test(t) && Number.isSafeInteger(n) ? n : Number.NaN;
 }
 
+/** A checkpoint of a finished Kromoss training run on this PC. */
+interface RecentLora {
+  run: string;
+  file: string;
+  step: number;
+  bytes: number;
+}
+
+let mossRecent: RecentLora[] = [];
+
+/** Re-read the training results folder; the list is only shown when it has something. */
+async function refreshMossRecent(): Promise<void> {
+  try {
+    mossRecent = await invoke<RecentLora[]>("train_recent_loras");
+  } catch (e) {
+    console.error(e);
+    mossRecent = [];
+  }
+  const keep = ui.mossLoraRecent.value;
+  ui.mossLoraRecent.replaceChildren(
+    ...mossRecent.map((r) => new Option(`${r.run} · step ${r.step} (${(r.bytes / 1e6).toFixed(0)} MB)`, `${r.run}/${r.file}`)),
+  );
+  if (mossRecent.some((r) => `${r.run}/${r.file}` === keep)) ui.mossLoraRecent.value = keep;
+  ui.mossLoraRecentRow.hidden = mossRecent.length === 0;
+}
+
+/** The LoRA list follows the GPU's; the pick survives a refresh while that LoRA is still there. */
+function renderMossLoras(busy: boolean): void {
+  const keep = ui.mossLora.value;
+  const have = Array.from(ui.mossLora.options, (o) => o.value).slice(1);
+  const want = moss.loras.map((l) => l.name);
+  if (have.join("\n") !== want.join("\n") || ui.mossLora.options.length === 0) {
+    ui.mossLora.replaceChildren(
+      new Option("No LoRA", ""),
+      ...moss.loras.map((l) => new Option(`${l.label} (${(l.bytes / 1e6).toFixed(0)} MB)`, l.name)),
+    );
+    ui.mossLora.value = want.includes(keep) ? keep : "";
+  }
+  const chosen = ui.mossLora.value !== "";
+  ui.mossLora.disabled = busy || moss.loras.length === 0;
+  ui.mossLoraAdd.disabled = busy;
+  ui.mossLoraStrengthRow.hidden = !chosen;
+  ui.mossLoraControlRow.hidden = !chosen;
+  ui.mossLoraStrengthVal.textContent = Number(ui.mossLoraStrength.value).toFixed(2);
+}
+
+/** Make image's state and the line under it; also run when only the boxes changed. */
+function renderMossGate(busy: boolean): void {
+  const seedBad = Number.isNaN(mossSeedValue());
+  const layoutProblem = layoutOn() ? layoutEditor.problem(ui.mossPrompt.value) : null;
+  ui.mossGo.disabled = busy || ui.mossPrompt.value.trim() === "" || seedBad || layoutProblem !== null;
+  ui.mossGo.hidden = busy;
+  ui.mossCancel.hidden = !busy;
+  const hint = !busy && moss.phase !== "failed" && ui.mossPrompt.value.trim() !== "" ? (layoutProblem ?? "") : "";
+  ui.mossMsg.textContent = mossError || (seedBad ? "The seed must be a whole number, or blank for a random one." : hint || moss.message);
+  ui.mossMsg.className = moss.phase === "failed" || mossError || seedBad ? "notice" : "muted";
+}
+
 function renderMoss(): void {
   ui.moss.hidden = !isMoss();
   const busy = mossBusy();
+  renderMossLoras(busy);
+  renderMossLayout(busy);
   const mode = MOSS_MODES[mossFast() ? "fast" : "full"];
   ui.mossModeHint.textContent = mode.hint;
   ui.mossStepsVal.textContent = ui.mossSteps.value;
@@ -2050,12 +2161,7 @@ function renderMoss(): void {
   const wpx = Number(ui.mossWidth.value);
   const hpx = Number(ui.mossHeight.value);
   ui.mossSizeHint.textContent = `${((wpx * hpx) / 1e6).toFixed(2)} megapixels. Sizes snap to a multiple of 16 (${MOSS_MIN_SIDE} to ${MOSS_MAX_SIDE}); bigger pictures take longer and need more GPU memory.`;
-  const seedBad = Number.isNaN(mossSeedValue());
-  ui.mossGo.disabled = busy || ui.mossPrompt.value.trim() === "" || seedBad;
-  ui.mossGo.hidden = busy;
-  ui.mossCancel.hidden = !busy;
-  ui.mossMsg.textContent = mossError || (seedBad ? "The seed must be a whole number, or blank for a random one." : moss.message);
-  ui.mossMsg.className = moss.phase === "failed" || mossError || seedBad ? "notice" : "muted";
+  renderMossGate(busy);
   ui.mossResults.replaceChildren(
     ...moss.results.map((r) =>
       h("figure", {}, zoomable(h("img", { src: r.data_url, alt: "Result", title: "Click to enlarge" }), r.id), h("figcaption", { class: "muted small" }, r.info)),
@@ -2101,6 +2207,14 @@ ui.mossScheduler.value = "simple";
 applyMossMode();
 
 ui.mossMode.onchange = applyMossMode;
+ui.mossTabPrompt.onclick = () => {
+  mossLayoutTab = false;
+  renderMoss();
+};
+ui.mossTabLayout.onclick = () => {
+  mossLayoutTab = true;
+  renderMoss();
+};
 for (const [id, key] of [["moss-sq", "sq"], ["moss-tall", "tall"], ["moss-wide", "wide"]] as const) {
   el<HTMLButtonElement>(id).onclick = () => {
     const [w0, h0] = mossMode().sizes[key];
@@ -2133,9 +2247,53 @@ ui.mossGo.onclick = () =>
         cfg: mossFast() ? null : Number(ui.mossCfg.value),
         fast: mossFast(),
         seed: mossSeedValue(),
+        lora: layoutOn() ? null : ui.mossLora.value || null,
+        lora_strength: !layoutOn() && ui.mossLora.value ? Number(ui.mossLoraStrength.value) : null,
+        control: !layoutOn() && ui.mossLora.value !== "" && ui.mossLoraControl.checked,
+        layout: layoutOn() ? layoutEditor.request(ui.mossPrompt.value) : null,
       },
     }),
   );
+ui.mossLoraAdd.onclick = () =>
+  void mossAct(
+    (async () => {
+      ui.mossLoraAdd.disabled = true;
+      ui.mossMsg.textContent = "Sending the LoRA to the GPU…";
+      try {
+        const added = await invoke<MossLora | null>("moss_add_lora");
+        if (added) {
+          moss.loras = [...moss.loras.filter((l) => l.name !== added.name), added];
+          renderMoss();
+          ui.mossLora.value = added.name;
+        }
+      } finally {
+        ui.mossLoraAdd.disabled = false;
+      }
+    })(),
+  );
+ui.mossLoraBox.addEventListener("toggle", () => {
+  if ((ui.mossLoraBox as HTMLDetailsElement).open) void refreshMossRecent();
+});
+ui.mossLoraUseRecent.onclick = () => {
+  const [run, file] = ui.mossLoraRecent.value.split("/");
+  if (!run || !file) return;
+  void mossAct(
+    (async () => {
+      ui.mossLoraUseRecent.disabled = true;
+      ui.mossMsg.textContent = "Sending the LoRA to the GPU…";
+      try {
+        const added = await invoke<MossLora>("moss_add_recent_lora", { run, file });
+        moss.loras = [...moss.loras.filter((l) => l.name !== added.name), added];
+        renderMoss();
+        ui.mossLora.value = added.name;
+      } finally {
+        ui.mossLoraUseRecent.disabled = false;
+      }
+    })(),
+  );
+};
+ui.mossLora.onchange = () => renderMoss();
+ui.mossLoraStrength.oninput = () => renderMoss();
 ui.mossCancel.onclick = () => void mossAct(invoke("moss_cancel"));
 await listen("moss-changed", () => void refreshMoss());
 

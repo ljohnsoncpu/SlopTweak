@@ -1445,3 +1445,145 @@ async fn identity_edit_needs_an_identity_edit_gpu() {
     );
     assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
 }
+
+// ----- MOSS-Image LoRA evaluation against the fake ComfyUI -------------------------
+
+fn lora_file(name: &str, extra: &[u8]) -> std::path::PathBuf {
+    // One real-looking module (a Kohaku export's naming), so the app's key check accepts it.
+    let header =
+        br#"{"lora_unet_layers_0_proj_o.lora_down.weight":{"dtype":"F32","shape":[4,8],"data_offsets":[0,0]}}"#;
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(header);
+    bytes.extend_from_slice(extra);
+    let dir = std::env::temp_dir().join(format!("sloptweak-e2e-lora-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+fn moss_request(lora: Option<String>, control: bool) -> crate::moss::Request {
+    crate::moss::Request {
+        prompt: "roka_soldier, jungle, rifle".into(),
+        width: 832,
+        height: 1216,
+        steps: 8,
+        sampler: "euler".into(),
+        scheduler: "simple".into(),
+        cfg: None,
+        fast: true,
+        seed: Some(101),
+        lora,
+        lora_strength: Some(0.75),
+        control,
+        layout: None,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_trained_lora_is_uploaded_and_compared_with_a_base_control() {
+    use crate::moss::{MossService, Target};
+    let h = harness(vec![]);
+    let kromoss = catalog::bundled()
+        .into_iter()
+        .find(|m| m.id == "kromoss")
+        .unwrap();
+    h.mgr
+        .start(kromoss.clone(), comfy_settings(), None)
+        .unwrap();
+    let SessionState::Ready {
+        instance_id: id, ..
+    } = wait_for(&h.mgr, is_ready).await
+    else {
+        panic!()
+    };
+    let (sidecar, base, secret, _) = h.mgr.comfy_endpoint().unwrap();
+    let target = Target {
+        sidecar,
+        base,
+        secret,
+        files: crate::moss::ModelFiles::of(&kromoss).unwrap(),
+    };
+    let svc = Arc::new(MossService::new(Arc::new(|| {})));
+
+    // The GPU takes the file under a content-derived name in loras/user/.
+    let path = lora_file("My Roka (final).safetensors", b"weights");
+    let lora = svc.add_lora(&target, &path).await.unwrap();
+    assert!(
+        lora.name.starts_with("user/My-Roka--final--"),
+        "{}",
+        lora.name
+    );
+    let stored = h.mock.with_comfy(id, |c| c.loras.clone()).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert!(lora.name.ends_with(stored.keys().next().unwrap().as_str()));
+    assert_eq!(svc.view().loras, vec![lora.clone()]);
+
+    // A picture with the LoRA and a control: two prompts, control first.
+    let begun = svc
+        .begin(&moss_request(Some(lora.name.clone()), true), 1)
+        .unwrap();
+    svc.finish(&target, begun).await;
+    let v = svc.view();
+    assert_eq!(v.phase, crate::identity::Phase::Done, "{}", v.message);
+    assert_eq!(v.results.len(), 2);
+    // Newest first: the LoRA picture, then the control.
+    assert!(
+        v.results[0].info.contains("LoRA My-Roka--final--"),
+        "{}",
+        v.results[0].info
+    );
+    assert!(v.results[0].info.contains("×0.75"));
+    assert!(v.results[1].info.contains("base control (no LoRA)"));
+    let prompts = h.mock.with_comfy(id, |c| c.prompts.clone()).unwrap();
+    assert_eq!(prompts.len(), 2);
+    let (control, with) = (&prompts[0], &prompts[1]);
+    assert!(control.get("13").is_none());
+    assert_eq!(with["13"]["inputs"]["lora_name"], lora.name);
+    assert_eq!(with["13"]["inputs"]["strength_model"], 0.75);
+    assert_eq!(with["10"]["inputs"]["model"], serde_json::json!(["13", 0]));
+    // Same seed, same prompt, same size: only the LoRA differs.
+    for k in ["seed", "steps", "cfg", "sampler_name", "scheduler"] {
+        assert_eq!(control["7"]["inputs"][k], with["7"]["inputs"][k], "{k}");
+    }
+    assert_eq!(control["4"], with["4"]);
+    assert_eq!(control["6"], with["6"]);
+
+    // A name the GPU never got is refused before anything is queued.
+    let err = svc
+        .begin(
+            &moss_request(Some("user/other-00000000.safetensors".into()), false),
+            1,
+        )
+        .err()
+        .unwrap();
+    assert!(err.contains("Add that LoRA"), "{err}");
+
+    // A GPU that refuses the upload says why, in plain words.
+    h.mock.with_comfy(id, |c| c.reject_lora = Some(422));
+    let bad = lora_file("other.safetensors", b"x");
+    let err = svc.add_lora(&target, &bad).await.unwrap_err();
+    assert!(err.contains("isn't a valid LoRA"), "{err}");
+    h.mock.with_comfy(id, |c| c.reject_lora = Some(404));
+    let err = svc.add_lora(&target, &bad).await.unwrap_err();
+    assert!(err.contains("can't take LoRAs"), "{err}");
+    assert_eq!(svc.view().loras.len(), 1);
+
+    // A LoRA of which only some modules fit is added, and the panel says how much.
+    h.mock.with_comfy(id, |c| c.reject_lora = None);
+    let partial_header = br#"{"lora_unet_layers_0_proj_o.lora_down.weight":{"dtype":"F32","shape":[4,8],"data_offsets":[0,0]},"lora_te_x_y.lora_down.weight":{"dtype":"F32","shape":[4,8],"data_offsets":[0,0]}}"#;
+    let mut partial = (partial_header.len() as u64).to_le_bytes().to_vec();
+    partial.extend_from_slice(partial_header);
+    let partial_path = std::env::temp_dir().join(format!(
+        "sloptweak-e2e-partial-{}.safetensors",
+        std::process::id()
+    ));
+    std::fs::write(&partial_path, partial).unwrap();
+    svc.add_lora(&target, &partial_path).await.unwrap();
+    let v = svc.view();
+    assert_eq!(v.loras.len(), 2);
+    assert!(v.message.contains("only 1 of the 2 parts"), "{}", v.message);
+
+    assert!(h.mgr.stop_and_wait(Duration::from_secs(300)).await);
+    assert!(h.mock.live_ids().is_empty());
+}

@@ -2796,3 +2796,302 @@ the app could tell; the app now reads `/__status`, so a slow download shows as
 `downloading <file> NN%` and a failed one ends the run with its reason.
 The container log (`request_logs`) only ever showed Vast's own boot output; it is
 useful for "did the container start" but not for provisioning detail.
+
+
+## Kromoss LoRA training speed, 3090 run (2026-10-27) ✅ verified from run logs
+
+Source: Vast instance 58007312 (RTX 3090, ~$0.29/hr, 105.9 min, ~$0.51, destroyed),
+KohakuMossTrainer `67f3bb54`, Kromoss int8 ConvRot, rank-32 LoRA, `lora_24g_bf16` recipe.
+Full write-up: `docs/spikes/kromoss-lora-training.md` ("Vast run v2").
+
+- Steady state 5.72 s/step, 1463 tok/s, 52 TFLOP/s (MFU 0.73), about 2 samples (8.4k
+  tokens) per step at `MAX_TOKENS` 12288. The laptop's 4.6 s/step is 1 sample at 6144, so
+  compare tokens/s: 3090 is 1.67x the 4080 laptop.
+- Streaming is hidden: copy engine 0.141 s busy per 1.65 s sampler step, compute never
+  waited. The `balanced` profile's cost is block checkpointing (about +33 % FLOPs), with
+  only 8 GiB of 24 GB used.
+- All training ops ran on Triton kernels; no fallback.
+- Setup was 35 % of the rental: boot 8.2 min, install and downloads 6.4, caches 8.9,
+  first-run kernel tuning 11.7 (stored per card in `~/.cache/kohakumoss_kernels`).
+- One 50-step sample is 88 s; exports about 2 s. Negligible next to training.
+- Vast: `create` again returned `success: false` with a valid `new_contract`.
+
+### Kromoss LoRA on an RTX 4090 (2026-10-27) ✅ speed measured, run not finished
+
+Quebec 4090, $0.466/hr, machine 151648. Steps 2-10 median: 2.82 s/step control
+(2.0x the 3090), 1.91 s/step with `INT8_COMPUTE` (3.0x, about $0.25 per 1000 steps vs $0.46 on
+the 3090). `nockpt-ring16` at 6144 x `GRAD_ACC 2` OOMs on 24 GB. Kernel tuning is stored
+per card: variant switches in the same instance tuned 0 to 9 s. Twice the host stopped
+the container mid-run (`exited`, intended `stopped`) with flat memory; one 16-min boot.
+Make checkpoint sync continuous: a host stop loses everything on the instance. See
+`docs/spikes/kromoss-lora-training.md`.
+
+### Kromoss `mix` LoRA on an RTX 4090 (2026-10-27) ✅ run complete
+
+Spain 4090, instance 58029400, $0.486/hr, 52.1 min, about $0.42. 800 steps at 1.985 s/step
+(4225 tok/s, 150 TFLOP/s, 8.2 GiB), `INT8_COMPUTE`. Kernel tuning 6.1 min on a fresh card;
+caches 5.0 min; boot 6.9 min. Vast lessons, all verified in this session:
+
+- A `price` field in the create call makes an interruptible bid; use on-demand only (no
+  `price`, check `is_bid`). Likely cause of three mid-run stops.
+- Consumer GPUs cannot use CUDA forward-compat libs: a host whose driver CUDA is older than
+  the image's (12.6 vs 12.8) fails with Error 804 in torch. Filter `cuda_max_good >= 12.8`
+  and probe CUDA right after SSH.
+- A dead SSH session can hang a driver for the whole cap; add an output watchdog.
+- Sync checkpoints off the instance as they appear (copied within about 30 s).
+Details: `docs/spikes/kromoss-lora-training.md`.
+
+## MOSS/Kromoss bounding-box layout + per-region LoRA (2026-10-27, desk research, no rental)
+
+Sources are web write-ups and docs; nothing here was run. Items marked UNVERIFIED need a test.
+
+- **MOSS bbox layout is trained in, not regional prompting.** Boxes go in as a JSON
+  text prompt (`summary{meta,canvas,caption}` + `items[{label,caption,bbox,text?}]`,
+  `bbox_format: "yxyx"`, `bbox_coord_space: "abs_centralized"` = pixels from canvas
+  centre, must match generation W/H). Source: github.com/OpenMOSS/MOSS-Image.
+- ComfyUI core (>= 0.42.0) has `Create Bounding Boxes` + `MOSSImageLayoutPrompt`
+  (0-1000 normalized boxes -> centred pixels; labels text/character/object; boxes
+  in draw order, background first; keep `enable_prompt_enhancer` off).
+  Source: docs.comfy.org/tutorials/image/moss-image/moss-image.
+- **Kromoss**: card never mentions layout/JSON. It is a full fine-tune of
+  MOSS-Image-Base and a drop-in for the SFT weights. `jo-nike/moss-kromoss-eval` lists
+  "JSON layout placement" as working on all three models (8 layouts only, one grader).
+  Layout adherence on Kromoss is UNVERIFIED beyond that. The 8-step LoRAs "transfer".
+- **Per-region LoRA**: ComfyUI core has hook LoRAs (`Create Hook LoRA`, `Cond Set
+  Props` with mask). Each conditioning applies its own hooks; masks gate the area.
+  Doc says "compatible with all models". UNVERIFIED for MOSS (LoRA key map exists per
+  PR 17095, but hook patching on it is untested), and for how it combines with CFG 1.
+- No published MOSS/Kromoss work combines boxes with per-box LoRAs.
+
+### Regional-LoRA spike, local results (2026-10-27, RTX 4080 Laptop 12 GB, ComfyUI a639f187)
+
+Scripts and images: `spikes/regional-lora/` (`run.py`, `out/`). Kromoss int8 ConvRot + 8-step DMD2, euler/simple, CFG 1, 1024x1024.
+
+- **E0 ✅ boxes work on Kromoss.** A 3-box JSON layout (background + two characters) put each
+  character in its box (head tops at box tops, left/right halves respected). About 19 s/image warm.
+  One image only, so this is not a reliability number. The JSON was built in Python to mirror
+  `MOSSImageLayoutPrompt`'s math, not through the node itself.
+- **Gotcha:** adding `ModelSamplingSD3` (shift 5) to a MOSS graph gives pure noise. The model already
+  defaults to shift 5; leave the node out.
+- **E1 ❌ hook LoRAs fail on the int8 model.** `CreateHookLora` + `ConditioningSetProperties`
+  (no mask) crashes in KSampler: `'Linear' object has no attribute 'weight_scale'`, same with
+  `--disable-dynamic-vram`. Cause by reading `comfy/model_patcher.py`: hooks merge the LoRA into the
+  weights and swap them per conditioning (`patch_hook_weight_to_device` casts to fp32, applies the patch,
+  stochastic-rounds back to the weight dtype, `copy_to_param`), which assumes plain weights. Ordinary
+  `LoraLoaderModelOnly` works on the same model because it patches lazily. So stock hook LoRAs
+  are out for int8 ConvRot. bf16 is untested.
+- Control: a global `km-mix-800` turns the whole scene from photoreal to flat illustration and
+  gives both characters the same look. That is the bleed baseline a regional LoRA must beat.
+- E2-E4 not run (all hook-based).
+
+### Kromoss on the `BACKEND=train` path, read-through (2026-10-27) ✅ code read, not run on an instance
+
+- `provision.sh` takes the three Kromoss files as flat `MODELS_B64` entries into
+  `/opt/sloptweak/models`; `MossRunner` reads them by file name from `TRAIN_MODELS_DIR`.
+- The sidecar manifest globs `checkpoints/*.safetensors`, evaluation PNGs, logs and the config
+  files, so Kromoss LoRA checkpoints are served; `MAX_RESULT_BYTES` is 8 GiB, so ~200 MB
+  checkpoints fit. `onstart` stays under 4048 chars (Rust test).
+- The runner change made the pinned asset bundle stale: `config.rs` `ASSETS_SHA256` is now
+  `255a25af…` (`build_assets.py --check-pin` passes). A release must ship that exact bundle
+  before any real run, or the instance refuses it.
+
+### Regional-LoRA spike on bf16 (2026-10-27, same laptop) ❌ hooks work but don't contain the LoRA
+
+`kromoss_bf16.safetensors` (rev a4fe9744, sha256 verified) added at `C:\ai\ComfyUI\models\diffusion_models`
+for this test (10.2 GB on C:). Same graphs, bf16 weights, partial GPU loading on 12 GB.
+
+- **E1/E2 ✅ mechanics.** Hook LoRA (no mask, and full-canvas mask) matches the normally patched LoRA
+  (mean abs pixel diff 5.6-5.8, against 53 for the LoRA's own effect). So hooks work on bf16, which
+  confirms the E1 crash was the int8 ConvRot weights. No weight leak: a baseline re-run after hooked runs
+  is pixel-identical (diff 0.0).
+- **E3 ❌ containment and layout.** LoRA hooked in the left box only (feathered or not; `DefaultCombine`
+  or explicit inverted masks, same result). The LoRA's illustrated style spreads over the whole scene
+  (the right box differs from plain by 30 vs 53 for a global LoRA, so partly contained, not isolated),
+  and the layout breaks: two LoRA characters appear inside the one left box. Likely cause (not proven):
+  each pass sees the whole latent, so style and composition propagate through attention; mask blending
+  only mixes noise predictions.
+- **E4 ❌.** Two hooked regions (km-mix-800 left, km-smoke-comfy right; weak test, same character at two
+  training stages): four characters instead of two, both LoRAs visible. Layout not honoured.
+- **Cost:** 8 steps, 1024x1024: no LoRA 18 s, global LoRA 11 s, one hooked cond 67-72 s, two conds
+  (E3) 120-160 s, E4 774 s. Hooks re-merge and swap the weights per conditioning per step.
+  On a 24 GB card it would be faster; unmeasured.
+- **Verdict:** stock hook LoRAs + masked conds are not a viable regional-LoRA mechanism for MOSS/Kromoss
+  (int8 crashes, bf16 leaks style, breaks layout, very slow). Fallbacks in
+  `docs/spikes/regional-lora-moss.md`: staged per-box inpaint/img2img with the LoRA (proven nodes),
+  or a custom noise-blending / attention-level node.
+
+### Regional-LoRA spike: staged per-box inpaint (2026-10-28, local, int8 Kromoss) ✅ works
+
+Pipeline (`spikes/regional-lora/run.py`, `staged()`): generate the layout image once (E0, int8 +
+DMD2, 8 steps, CFG 1), then for each box: VAE-encode the current image, `SetLatentNoiseMask` with a
+feathered box mask, KSampler (same layout JSON prompt, DMD2 + that box's LoRA via the ordinary
+`LoraLoaderModelOnly`, so int8 works), VAE-decode, `ImageCompositeMasked` back through the same mask.
+Seed 12345, 1024x1024, one scene.
+
+- **Containment:** pixels outside the box are bit-identical to the base layout (diff 0.0). By
+  construction, not luck. The other character is untouched.
+- **Layout:** preserved at denoise 0.5-0.7 (same pose, same placement). At 0.9 the character is
+  redrawn (new pose, full LoRA look) and the box background changes too.
+- **Denoise is the strength knob** (inside-box diff vs base, 59.5 for a global LoRA): 0.5 -> 18.5
+  (face/ears restyled, body unchanged), 0.7 -> 31.2 (clear LoRA look, pose kept), 0.9 -> 54.6 (full look).
+- **Seams:** none visible at 0.5-0.7. Pixel step across the box's top edge is 7.8 vs 5.6 in the base
+  and 13.5 for normal texture 20 px away, so no seam spike. Feathered (48 px) vs hard-edged masks were
+  indistinguishable here (diff 31.23 vs 31.25). **Superseded:** that was not the soft background; the
+  feather was a no-op (ComfyUI's `FeatherMask` feathers the mask image's own border, and the spike applied
+  it to the full-canvas mask). See "R4 local acceptance".
+- **Weakness:** the mask is the whole box rectangle, not the character, so the LoRA also restyles the
+  box's background (obvious at 0.9). A silhouette mask (segmentation) would fix that; not tried.
+- **Two boxes (S2):** second pass on the right box with `km-smoke-comfy` changed that character
+  subtly (ears, face) and nothing else. Weak test: same character, earlier checkpoint.
+- **Timing (4080 Laptop, int8, warm):** about 15-16 s per box pass; layout image about 19 s; two boxes
+  about 33 s of passes. Total for a 2-box piece about 50 s, against 774 s for the hook approach.
+- **Caveats:** one seed, one scene, judged by eye; no second distinct MOSS LoRA available.
+
+### Hash-locked MOSS venv (2026-10-27) ✅ installed on a real instance
+
+`instance/moss_requirements.lock` (88 packages, `torch==2.14.1+cu126`, hashes) is compiled from
+the pinned trainer's `pyproject.toml` (`--extra cuda`) plus `torch==2.14.1` with
+`uv pip compile --python-platform x86_64-manylinux_2_28 --generate-hashes`, which needs no GPU.
+`MossRunner.bootstrap` installs it with `--require-hashes --no-deps`, then the trainer with
+`--no-deps`. Checked on Vast instance 58096637 (RTX A5000, $0.23/hr base, on-demand, about 10 min,
+destroyed): install 1m25s, `uv pip check` clean, torch 2.14.1+cu126 sees the GPU, the trainer's
+imports load, `kohakumoss-doctor` lists triton/tilelang kernels. Training was not run. The offer
+originally quoted (42023445) was gone at create time (`no_such_ask`); the next cheapest was used.
+
+### MOSS panel: trained-LoRA evaluation (2026-10-28) ✅ unit and mock tested, not run on a GPU
+
+The panel's "Try a LoRA" section sends a local `.safetensors` to the ComfyUI GPU and applies it on top
+of the model, with an optional base control (same seed and prompt, no LoRA, made first).
+
+- Sidecar `PUT /__lora/<name>` (bearer only, `BACKEND=comfyui` only): name regex, SHA-256 header,
+  safetensors header check, 1 GiB and 20-file caps, atomic write into `/opt/sloptweak/user-loras`.
+  `provision.sh` links that folder into ComfyUI's `loras/` as `user/`, so the node takes `user/<file>`.
+  UNVERIFIED on a real instance: that ComfyUI lists a symlinked `loras/user/` folder and picks up a file
+  added after start (its folder cache is keyed on directory mtime).
+- Graph: `LoraLoaderModelOnly` (node 13) straight on the UNet, under the distillation LoRA (Fast) or
+  before layer skipping (Full). Local A/Bs used the int8 Kromoss; the catalog entry is the bf16 file, so a
+  LoRA trained on int8 meeting bf16 weights is UNVERIFIED.
+- The asset bundle changed again (`sidecar.py`, `provision.sh`); `ASSETS_SHA256` is now `498e79f3…`.
+
+### LoRA key-style probe (2026-10-28, local, free) ✅ real exports fit
+
+`app/src-tauri/src/moss/probe.rs` reads a LoRA's safetensors header and checks tensor names against
+ComfyUI's MOSS key map (comfy/lora.py at a639f187). Verified against the real files on this PC (headers
+only): every `km-mix-*`, `km-nl-*`, `km-smoke-comfy` (kohya names, fused qkv, 504 tensors = 42 layers x
+4 modules x 3, rank 32), `km-smoke-lycoris` (kohya names, split q/k/v, 756 tensors) and lodestones'
+`8-steps-dmd2-lora` (`diffusion_model.layers.N.proj.*`, split q/k/v, rank 128, 756 tensors): all "fits".
+The real Kromoss base has 379 tensors; every 2-D weight is a module the probe knows (layers.N.proj.{qkv,o,
+ffn_down,ffn_up_gate}, text_embedder.*, time_embedding.N, video_embedder, final_linear_video,
+shared_block_modulation, video_head_modulation). SDXL-style names (`lora_unet_input_blocks_*`, `lora_te1_*`),
+diffusers/PEFT (`transformer.*`, `base_model.model.*`) and bare `layers.N...` names are "foreign": that is
+from reading ComfyUI's source, where the MOSS block maps only the two styles above; no such file was loaded
+to confirm ComfyUI ignores it.
+
+### Kernel-tuning cache and the results shortcut (2026-10-28) ✅ unit tested, untried on an instance
+
+- `instance/moss_kernel_cache.tgz` (34 JSON files, 37 KB, the 2026-10-27 4090 tables: torch 2.14.1+cu126,
+  triton 3.8.0, tilelang 0.1.15, lycoris-lora 4.1.3, which a test checks against the lock) ships in the asset
+  bundle. `MossRunner` unpacks it into `~/.cache` after the CUDA probe, never over a file that exists. Tables
+  are named by card, CUDA and torch version, so other cards ignore them. Expected saving on a 4090: the
+  6.1 min of kernel tuning (UNVERIFIED: the tables are keyed by kernel shapes, so a run with other
+  settings than the mix run may still tune some kernels).
+- Every Kromoss run now returns its own tables as `kernel-cache.tgz` (a result file, about 40 KB); a card
+  not in the bundle is added with `python instance/kernel_cache.py merge instance/moss_kernel_cache.tgz
+  <old bundle> <downloaded files>` (later files win), then re-pin `ASSETS_SHA256`.
+- The MOSS panel's "Try a LoRA" lists the latest five Kromoss runs found under `<output>/LoRAs/`
+  (recognised by `metrics.jsonl`; kohya runs are SDXL and are skipped). The window names a run and a file;
+  only listed checkpoints resolve to a path.
+
+- Dev pre-release for the first real runs: `instance-v0.1.12` (`instance-assets.tar.gz`, SHA-256 `30ca3871…`, downloaded back and verified). The debug app needs `SLOPTWEAK_DEV_ASSETS_URL=https://github.com/ljohnsoncpu/SlopTweak/releases/download/instance-v0.1.12/instance-assets.tar.gz`; the instance still checks the pin, so any change to a bundle file needs a new pre-release and a new pin. The Train tab can ask for a 4090 (`gpu_model`).
+
+### R4 local acceptance (2026-10-28, RTX 4080 Laptop 12 GB, int8 Kromoss, ComfyUI a639f187) ✅ passes
+
+Scripts and pictures: `spikes/regional-lora/acceptance/` (`requests/` = the JSON the window sends,
+`graphs/` = dumped by `cargo test --lib dump_acceptance_graphs -- --ignored`, `acceptance.py`,
+`analyze.py`, `edge_band.py`, `hot_add.py`, `hot_use.py`). 12 pictures, each as a layout-only twin and a
+with-LoRA picture: scene A = 3 boxes at 1536x1536 (spike scene, 1 LoRA box, seeds 11/22/33/44); scene B =
+6 boxes at 1728x1344 (3 characters, text box "OPEN", an object; two LoRA boxes with two different LoRAs,
+km-mix-800 at 0.7 and km-nl-600 at 0.6, seeds 51-54); scene C = busy night-market background at
+1344x1728, 1 LoRA box, seeds 61-64. Eight steps, CFG 1, euler/simple, shared seed per picture.
+
+- **Bug found and fixed (R1's graph, and the spike's finding):** ComfyUI's `FeatherMask` softens the borders
+  of the mask *image* it is given. The first graph fed it the full-canvas mask, so the feather only touched the
+  picture's border and every box edge was hard. The earlier "feathered and hard edges look the same" was this
+  no-op. Now the box's own mask is feathered before it is composited, and not on sides on the picture's
+  border (`moss/layout.rs`, tests added).
+- **Layout holds: 12/12** (by eye): the right number of characters in their boxes, the sign reads "OPEN" in
+  all four B pictures (dim but legible in b4), the robot is there, no extra characters. The layout-only twins
+  come from the unchanged first pass, so this is the same result with and without the LoRA passes.
+- **Nothing outside a box changes: 16/16** (mean abs diff 0.0 outside every LoRA box, incl. the 4 extra).
+- **LoRA look clear in its box: 12/12 for the first LoRA box** (km-mix-800, 0.7): eyes, skin, outfit follow
+  the LoRA, pose kept (inside diff 13.2-23.3). The second LoRA in B (km-nl-600 at 0.6) is subtle (inside diff
+  7.9-10.5): same character, an earlier checkpoint, a gentler change amount.
+- **Seams:** measured as the change in the first 4 px inside a box edge, against 48-96 px inside. With
+  feather 48: 0.05-0.20 vs 10-25 deep (a soft start); no seam visible at 100 % on corner crops or on the
+  difference images (6x), in A, B or C. With feather 0 (c3, c4 and c5): 9-12 at the edge (abrupt) and a
+  visible rectangle in the dark market floor and a sign's text cut across the edge. Same seeds, feather
+  0 / 48 / 128: step 9.4-11.9 / 0.14-0.20 / 0.02; inside diff 19.5-24.7 / 15.9-20.1 / 10.9-14.2. 128 is
+  smoother still but takes about a third of the LoRA's effect in these boxes, so **48 stays the default.**
+  Faint banding in smooth skies is in the layout-only pictures too (VAE), not from the pass.
+- **Timing (this laptop, 12 GB, warm):** layout 36-43 s at 1344-1728 px sides (about 19 s at 1024), each
+  region pass 36-40 s; a 3-box picture with one LoRA about 76-80 s, six boxes with two passes about
+  120 s, the market scene about 80 s. 1536x1536 fits in 12 GB (7.5-9 GB used).
+- **A LoRA added while ComfyUI runs is usable at once: yes.** `/object_info` listed a file copied into
+  `loras/user/` on the next request (0.0 s), and also a file added to the target of a link that was already
+  listed empty (Windows junction standing in for the instance's `ln -sfn` into `loras/user`; Linux
+  symlinks use the same mtime check but this was not run on Linux). A real layout graph naming such a
+  file (hotadd-run, a copy of km-mix-600) ran: outside diff 0.0, inside 15.0. No restart or refresh needed.
+- **Not covered:** one scene family and a single character LoRA (the second one is the same character), a
+  12 GB int8 card (not the rented 24 GB bf16 one), no Linux instance. The live run (approval needed) and
+  `docs/user-guide.md` are R4's remaining parts.
+
+## First real Kromoss runs through the app (2026-10-28) ✅ setup verified, training not yet reached
+
+Three RTX 4090 on-demand rentals with the Thales set (24 images, `mix`, 400 steps, limits 75 min and $0.75),
+all destroyed, about $0.38 in total (plus one failed host start at $0.004). What they showed:
+
+- **Slow hosts exist even among 4090s that pass the filter.** Two Poland hosts downloaded the 15.5 GB at about
+  5-6 MB/s (24% in 12 min, and 7% in 3 min) although Vast listed 750+ Mbps down. A Spain host finished all three
+  files in about 1.5 min. The app cancels cleanly ("Stop and download what exists", GPU destroyed, machine marked
+  bad for 7 days). A driver should cancel when the download is under 20% three minutes in (cost about $0.07).
+  Not yet tried: parallel or ranged downloads (provision.sh fetches one file at a time with a single curl).
+- **Cheap offers vanish between quote and Start** (about 4 of 7 quotes). The app handles it ("offer no longer
+  available", nothing created); a script has to re-quote.
+- **Setup works on a real instance**: asset bundle pinned and verified, models verified, the hash-locked venv
+  installed in 55 s, the CUDA probe and doctor passed, 34 bundled kernel-tuning tables restored.
+- **Bug found: `kohakumoss-config check` needs the config's docstring to name `scripts/<...>.py`.** The rendered
+  config had none, so the run failed right after "Preparing the model and dataset". Fixed in `render_train_config`;
+  the check now passes locally, and the cache_text, cache_latents and a 4-step train run work locally on the Thales
+  set with the app's config (exports land at `checkpoints/step_N/export/<name>-comfy.safetensors`).
+- **Bug found: tags in the charset pipeline's `.e621.txt` are space-separated**; `parse_tags` only split on commas
+  (and `collect` turned the trailing newline into a comma, so the whole line became one tag). Now per line:
+  commas if the line has any, else whitespace.
+- **Bug found: the failing step's log was not saved**, because the final sync skips files under 3 s old. The runner
+  now waits 3.5 s before the failure sync and appends the log's last lines to the error message.
+- **Bug found: `train_moss_defaults`/`train_moss_audit` had no permission or capability entry**, so the Train tab
+  was blank in the real app. A test now checks every registered command.
+
+### Kromoss training and the MOSS-panel LoRA test, verified on real instances (2026-10-28) ✅
+
+**Training (instance 58132592, RTX 4090 Thailand, $0.43/hr, on-demand, destroyed).** Thales set, 24 images, `mix`,
+400 steps, rank 32, `INT8_COMPUTE`. 40 min and about $0.29 in total, with the app's quote at $0.27 and a $0.61 worst case:
+- Boot 9.5 min (long), model downloads about 6 min including checks, venv install 6.5 min (the host's
+  PyPI path was slow; 55 s on another host), prepare 0.6 min, **training 17 min**, results sync 0.8 min.
+- **Bundled kernel tables worked:** `restored 34 tuning table files`, prewarm took about 20 s (the fresh-card run spent
+  6.1 min tuning), step 1 at +20 s, then 2.0 s/step for 400 steps (13.2 min). Loss 0.51 at step 1, about 0.31-0.38 afterwards (noisy).
+- Results came back hash-verified: `checkpoints/thales_miletus-step00000200|00000400.safetensors` (198,237,688 bytes
+  each), the logs and `kernel-cache.tgz` (40 KB). **`metrics.jsonl` did not**: the runner recopied it every tick so its time was
+  always fresh and the manifest's mid-write guard skipped it. Fixed (copy only when changed, keep its time), and the
+  Train tab's "recent runs" list no longer depends on it. Both fixes need a new bundle and pin (not published yet).
+
+**MOSS-panel LoRA test (instance 58137266, RTX 4500 Ada, $0.486/hr, destroyed).** Catalog entry `kromoss`.
+- **Provisioning of the new Kromoss branch worked first time:** ready after 6.3 min (downloads about 1 min, ComfyUI install
+  under a minute). ComfyUI saw the uploaded file in the symlinked `loras/user/` folder without a restart.
+- Picked the step-400 checkpoint from the "from a training run" list (found by its config-check log), upload 198 MB in about 15 s,
+  pair generated (control first) in 26 s at 1024x1024, 8 steps, seed 101.
+- **The LoRA works on the bf16 Kromoss file** although it was trained on the int8 one. With it, the portrait matches the dataset
+  (grey and white striped tiger, pink nose, yellow eyes, black hair with a blue streak, calm closed mouth, olive sweater); the
+  control is the generic look. A new scene (library, trigger word only) kept the character; the control drew a human.
+- **Strength 0 equals the base control pixel for pixel**; strength 1 differs. One seed per prompt, judged by eye.
+- Session about 10 min, about $0.10. Account credit over the whole day: $12.88 to $11.97 (about $0.91, all rentals and the
+  cancelled and failed ones).

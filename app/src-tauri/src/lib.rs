@@ -10,6 +10,8 @@ mod diagnostics;
 mod identity;
 mod library;
 mod moss;
+#[cfg(test)]
+mod permissions_tests;
 mod persist;
 mod provider;
 mod redact;
@@ -943,6 +945,65 @@ async fn moss_cancel(st: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Ask for a LoRA file (a Kromoss training export, say) and put it on the GPU
+/// so pictures can use it. `None` when the dialog was cancelled.
+#[tauri::command]
+async fn moss_add_lora(
+    app: AppHandle,
+    st: State<'_, AppState>,
+) -> Result<Option<moss::MossLora>, String> {
+    let target = moss_target(&st)?;
+    // Debug builds only: the UI check can't drive a native file dialog.
+    #[cfg(debug_assertions)]
+    if let Ok(path) = std::env::var("SLOPTWEAK_DEV_PICK_LORA") {
+        return st
+            .moss
+            .add_lora(&target, std::path::Path::new(&path))
+            .await
+            .map(Some);
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Choose a LoRA file")
+        .add_filter("LoRA (.safetensors)", &["safetensors"])
+        .pick_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(path) = rx
+        .await
+        .map_err(|e| e.to_string())?
+        .and_then(|p| p.into_path().ok())
+    else {
+        return Ok(None);
+    };
+    st.moss.add_lora(&target, &path).await.map(Some)
+}
+
+/// The LoRAs of the latest finished Kromoss training runs, for the panel's
+/// "from a training run" list.
+#[tauri::command]
+async fn train_recent_loras(
+    st: State<'_, AppState>,
+) -> Result<Vec<train::recent::RecentLora>, String> {
+    let root = output_dir(&st.config_dir, &st.default_output_dir).join("LoRAs");
+    Ok(train::recent::list(&root, train::recent::MAX_RUNS))
+}
+
+/// Put one of those LoRAs on the GPU. The window names it by run and file; the
+/// path is looked up here, and only listed checkpoints resolve.
+#[tauri::command]
+async fn moss_add_recent_lora(
+    st: State<'_, AppState>,
+    run: String,
+    file: String,
+) -> Result<moss::MossLora, String> {
+    let target = moss_target(&st)?;
+    let root = output_dir(&st.config_dir, &st.default_output_dir).join("LoRAs");
+    let path = train::recent::resolve(&root, &run, &file)?;
+    st.moss.add_lora(&target, &path).await
+}
+
 /// Copy a finished MOSS-Image picture into the Downloads folder.
 #[tauri::command]
 async fn moss_save_result(
@@ -1129,14 +1190,29 @@ struct TrainQuoteArgs {
     settings: train::settings::TrainSettings,
     /// The dataset's trigger word (first caption tag), for the test prompts.
     trigger: String,
-    /// A CivitAI link to an SDXL-family checkpoint.
+    /// A CivitAI link to an SDXL-family checkpoint (not used for Kromoss).
+    #[serde(default)]
     base_link: String,
+    /// `sdxl` (default) or `kromoss`.
+    #[serde(default)]
+    trainer: String,
+    /// The Kromoss settings, when `trainer` is `kromoss`.
+    #[serde(default)]
+    moss: Option<train::moss::MossSettings>,
     max_minutes: u64,
     max_usd: f64,
+    /// Only offer cards with this in their name (`4090`); blank = the cheapest.
+    #[serde(default)]
+    gpu_model: Option<String>,
 }
 
 #[tauri::command]
 async fn train_pick_dataset(app: AppHandle) -> Result<Option<String>, String> {
+    // Debug builds only: the UI check can't drive a native folder dialog.
+    #[cfg(debug_assertions)]
+    if let Ok(dir) = std::env::var("SLOPTWEAK_DEV_PICK_DATASET") {
+        return Ok(Some(dir));
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
@@ -1155,20 +1231,33 @@ async fn train_quote(
     st: State<'_, AppState>,
     args: TrainQuoteArgs,
 ) -> Result<train::manager::QuoteView, String> {
-    let key = st.secret(secrets::CIVITAI_TOKEN);
-    let model = civitai::resolve_checkpoint(st.civitai.as_ref(), &args.base_link, key.as_deref())
-        .await
-        .map_err(|e| e.to_string())?;
-    let prompts = train::commands::preset_prompts(&args.settings, &args.trigger);
+    let trainer = match args.trainer.as_str() {
+        "kromoss" => train::manager::Trainer::Kromoss {
+            settings: args.moss.ok_or("Missing the Kromoss settings.")?,
+        },
+        "" | "sdxl" => {
+            let key = st.secret(secrets::CIVITAI_TOKEN);
+            let model =
+                civitai::resolve_checkpoint(st.civitai.as_ref(), &args.base_link, key.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let prompts = train::commands::preset_prompts(&args.settings, &args.trigger);
+            train::manager::Trainer::Kohya {
+                settings: args.settings,
+                prompts,
+                model,
+            }
+        }
+        other => return Err(format!("Unknown trainer {other:?}.")),
+    };
     st.train_manager()?
         .quote(train::manager::QuoteRequest {
             dir: args.dir.into(),
-            settings: args.settings,
-            prompts,
-            model,
+            trainer,
             max_minutes: args.max_minutes,
             max_usd: args.max_usd,
             max_dph: 1.0,
+            gpu_model: args.gpu_model,
         })
         .await
 }
@@ -1959,6 +2048,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             train::commands::train_defaults,
             train::commands::train_audit,
+            train::commands::train_moss_defaults,
+            train::commands::train_moss_audit,
             train_pick_dataset,
             train_quote,
             train_start,
@@ -1980,6 +2071,9 @@ pub fn run() {
             moss_state,
             moss_generate,
             moss_cancel,
+            moss_add_lora,
+            moss_add_recent_lora,
+            train_recent_loras,
             moss_save_result,
             get_snapshot,
             refresh_catalog,

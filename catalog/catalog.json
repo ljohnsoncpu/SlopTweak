@@ -566,6 +566,63 @@
       "license_note": "Apache-2.0 (MOSS-Image-Base by OpenMOSS-Team, and lodestones' distillation). Free for personal and commercial use."
     },
     {
+      "id": "kromoss",
+      "name": "Kromoss 8-step",
+      "description": "Kromoss (lodestones), a full fine-tune of MOSS-Image-Base that is still being trained, with the 8-step DMD2 LoRA from the same repo so it draws in 8 steps with no CFG. Plain-text prompts, and it follows MOSS's box layouts. Runs in SlopTweak's own MOSS panel, not Invoke. A 21 GB download (the GPU can take 20 minutes to get ready) and a GPU with 24 GB, about $0.20-0.35/hr.",
+      "good_for": "Fast text-to-image, box layouts, your own LoRAs",
+      "price_tier": 2,
+      "backend": "comfyui",
+      "base": "moss-image",
+      "source": {
+        "huggingface_repo": "lodestones/Kromoss",
+        "revision": "a4fe97449297af2e3be7841e1c18e431f3b06031",
+        "page": "https://huggingface.co/lodestones/Kromoss"
+      },
+      "files": [
+        {
+          "url": "https://huggingface.co/lodestones/Kromoss/resolve/a4fe97449297af2e3be7841e1c18e431f3b06031/diffusion_models/kromoss_bf16.safetensors",
+          "filename": "kromoss_bf16.safetensors",
+          "sha256": "54C863B9392F7B6A02F557D32A416B22765B4FFBEE322ADE9945E379F09ADABA",
+          "size_bytes": 10164655808,
+          "kind": "main",
+          "requires_civitai_token": false,
+          "dest": "diffusion_models"
+        },
+        {
+          "url": "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/f28da8f93449c16cfa7efa07dcd1303a1c0c44d1/text_encoders/qwen3.5_9b_int8_convrot.safetensors",
+          "filename": "qwen3.5_9b_int8_convrot.safetensors",
+          "sha256": "32E3787472F708FA5F83624ACBF5EF23F7FC89C439E05065EA57CFE5A97F025A",
+          "size_bytes": 9748121532,
+          "kind": "text_encoder",
+          "requires_civitai_token": false,
+          "dest": "text_encoders"
+        },
+        {
+          "url": "https://huggingface.co/lodestones/Kromoss/resolve/a4fe97449297af2e3be7841e1c18e431f3b06031/vae/flux2-vae_small.safetensors",
+          "filename": "flux2-vae_small.safetensors",
+          "sha256": "D8D52BA036475F5FB07C8B435E176D3D97EBFA82F0D1A1C317F9CC1E25BD013B",
+          "size_bytes": 249521340,
+          "kind": "vae",
+          "requires_civitai_token": false,
+          "dest": "vae"
+        },
+        {
+          "url": "https://huggingface.co/lodestones/Kromoss/resolve/a4fe97449297af2e3be7841e1c18e431f3b06031/8-steps-dmd2-lora.safetensors",
+          "filename": "kromoss-8-steps-dmd2-lora.safetensors",
+          "sha256": "7683FE1FB51F73F5D690F24DD6B7F46F31AB9A9873729A854AC5C9A420FFE6F2",
+          "size_bytes": 1189176800,
+          "kind": "lora",
+          "requires_civitai_token": false,
+          "dest": "loras"
+        }
+      ],
+      "min_vram_gb": 24,
+      "min_compute_cap": 800,
+      "min_ram_gb": 32,
+      "nsfw": false,
+      "license_note": "Apache-2.0 (Kromoss and its 8-step LoRA by lodestones, from MOSS-Image-Base by OpenMOSS-Team). Free for personal and commercial use."
+    },
+    {
       "id": "snofs-krea-2",
       "name": "SNOFS Krea 2",
       "description": "Krea 2 Raw with the SNOFS adult-content LoKR (by Ashen3, v1.4) merged in, so it doesn't depend on Invoke's LoKR support. Photoreal nudes and explicit scenes. This is the undistilled model: SlopTweak sets 52 steps and CFG 3.5 when Invoke opens. For about 8 steps, switch on the 8-step Turbo Distill LoRA in the LoRA panel at weight 1 and set 8 steps, CFG 1. A 27 GB download (the GPU can take 15+ minutes to get ready) and a GPU with 32 GB or more, about $0.50-0.65/hr, so raise the price limit in Settings to about $0.70. Needs a CivitAI key.",

@@ -29,6 +29,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from collections.abc import Callable, Coroutine, Mapping
@@ -74,6 +75,14 @@ HOP_HEADERS = frozenset(
 # Request methods that don't count as user activity for the idle timer.
 PASSIVE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
+# ComfyUI backend: LoRAs the launcher may add for the MOSS panel's evaluation.
+# provision.sh links LORA_DIR into ComfyUI's loras folder as ``user/``.
+LORA_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.safetensors")
+LORA_MAX_BYTES = 1024 * 1024 * 1024
+# Phase R's limit: 8 LoRAs per GPU session (the app checks it first: moss.rs MAX_LORAS_PER_GPU).
+LORA_MAX_FILES = 8
+LORA_MAX_HEADER_BYTES = 64 * 1024 * 1024
+
 # Training backend: what the launcher may upload and read.
 TRAIN_UPLOADS = frozenset({"job.json", "dataset.tar"})
 TRAIN_UPLOAD_MAX_BYTES = 512 * 1024 * 1024
@@ -102,6 +111,7 @@ class Config:
     vast_api_base: str = "https://console.vast.ai/api/v0"
     watchdog_interval_s: float = 15.0
     train_work: Path = Path("/opt/sloptweak/train")
+    lora_dir: Path = Path("/opt/sloptweak/user-loras")
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Config:
@@ -123,7 +133,24 @@ class Config:
             container_id=env.get("CONTAINER_ID", ""),
             container_api_key=env.get("CONTAINER_API_KEY", ""),
             train_work=Path(env.get("TRAIN_WORK", "/opt/sloptweak/train")),
+            lora_dir=Path(env.get("SLOPTWEAK_LORA_DIR", "/opt/sloptweak/user-loras")),
         )
+
+
+def _is_safetensors(path: Path, size: int) -> bool:
+    """The 8-byte header length and a JSON object that fits inside the file."""
+    try:
+        with path.open("rb") as f:
+            raw = f.read(8)
+            if len(raw) != 8:
+                return False
+            n = int.from_bytes(raw, "little")
+            if n < 2 or n > LORA_MAX_HEADER_BYTES or 8 + n > size:
+                return False
+            header = json.loads(f.read(n))
+    except (OSError, ValueError):
+        return False
+    return isinstance(header, dict)
 
 
 class Watchdog:
@@ -347,6 +374,48 @@ class Sidecar:
             "destroying": self.destroy_reason,
             "deadlines": self.watchdog.deadlines(),
         }
+
+    # ----- user LoRAs (ComfyUI backend, bearer only) --------------------------
+
+    async def handle_lora_upload(self, request: web.Request) -> web.Response:
+        if self.cfg.backend != "comfyui":
+            return web.Response(status=404, text="not found")
+        if not self.auth.check_bearer(request.headers.get("Authorization")):
+            return web.Response(status=401, text="unauthorized")
+        name = request.match_info["name"]
+        if not LORA_NAME_RE.fullmatch(name):
+            return web.Response(status=400, text="bad file name")
+        expected = request.headers.get("X-Sha256", "").lower()
+        if len(expected) != 64:
+            return web.Response(status=400, text="X-Sha256 header required")
+        directory = self.cfg.lora_dir
+        directory.mkdir(parents=True, exist_ok=True)
+        if not (directory / name).exists() and len(list(directory.glob("*.safetensors"))) >= (
+            LORA_MAX_FILES
+        ):
+            return web.Response(status=409, text="too many LoRAs on this GPU")
+        part = directory / f"{name}.part"
+        digest = hashlib.sha256()
+        size = 0
+        with part.open("wb") as out:
+            async for chunk in request.content.iter_chunked(1024 * 1024):
+                size += len(chunk)
+                if size > LORA_MAX_BYTES:
+                    break
+                digest.update(chunk)
+                out.write(chunk)
+        if size > LORA_MAX_BYTES:
+            part.unlink(missing_ok=True)
+            return web.Response(status=413, text="upload too large")
+        if digest.hexdigest() != expected:
+            part.unlink(missing_ok=True)
+            return web.Response(status=422, text="checksum mismatch")
+        if not _is_safetensors(part, size):
+            part.unlink(missing_ok=True)
+            return web.Response(status=422, text="not a safetensors file")
+        part.replace(directory / name)
+        self.watchdog.activity()
+        return web.json_response({"name": f"user/{name}", "bytes": size})
 
     # ----- training backend (bearer only) ------------------------------------
 
@@ -606,6 +675,7 @@ class Sidecar:
         app.router.add_get("/__auth", self.handle_auth)
         app.router.add_post("/__heartbeat", self.handle_heartbeat)
         app.router.add_get("/__status", self.handle_status)
+        app.router.add_put("/__lora/{name}", self.handle_lora_upload)
         app.router.add_get("/__train/state", self.handle_train_state)
         app.router.add_get("/__train/manifest", self.handle_train_manifest)
         app.router.add_get("/__train/log", self.handle_train_log)

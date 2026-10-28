@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Layout editor preview</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <header class="bar"><span class="brand">SlopTweak</span><span class="badge">PREVIEW (no backend)</span></header>
+    <main>
+      <section class="card">
+        <h2>Layout editor</h2>
+        <div class="row">
+          <label for="size">Size</label>
+          <select id="size">
+            <option value="1536x1536">1536 × 1536</option>
+            <option value="1344x1728">1344 × 1728</option>
+            <option value="1728x1344">1728 × 1344</option>
+          </select>
+          <label><input id="busy" type="checkbox" /> busy</label>
+          <button id="more" type="button">Pretend a LoRA was added</button>
+        </div>
+        <label for="scene">Describe the whole picture</label>
+        <textarea id="scene" rows="2">A rainy neon city street at night, two characters side by side.</textarea>
+        <div id="layout"></div>
+        <p id="problem" class="muted"></p>
+        <pre id="out" class="small"></pre>
+      </section>
+    </main>
+    <script type="module">
+      // Dev-only: mounts the Layout-mode editor (src/layout.ts) on its own, with a pretend
+      // LoRA list, so it can be seen and clicked without the Tauri shell.
+      import { mountLayout } from "/src/layout.ts";
+      const loras = [{ name: "user/km-mix-800-1a2b3c4d.safetensors", label: "km-mix-800-1a2b3c4d" }];
+      const $ = (id) => document.getElementById(id);
+      let added = 0;
+      const ed = mountLayout($("layout"), {
+        onChange: refresh,
+        onAddLora: () => { added += 1; loras.push({ name: `user/new-lora-${added}.safetensors`, label: `new-lora-${added}` }); refresh(); },
+      });
+      function ctx() {
+        const [w, h] = $("size").value.split("x").map(Number);
+        return { width: w, height: h, busy: $("busy").checked, loras: [...loras] };
+      }
+      function refresh() {
+        ed.update(ctx());
+        $("problem").textContent = ed.problem($("scene").value) ?? "Ready to make.";
+        $("out").textContent = JSON.stringify(ed.request($("scene").value), null, 1);
+      }
+      for (const id of ["size", "busy", "scene"]) $(id).addEventListener("input", refresh);
+      $("more").onclick = () => { loras.push({ name: `user/extra-${loras.length}.safetensors`, label: `extra-${loras.length}` }); refresh(); };
+      window.__layout = ed;
+      refresh();
+    </script>
+  </body>
+</html>

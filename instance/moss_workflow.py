@@ -24,8 +24,8 @@ FULL_TITLE = "SlopTweak MOSS-Image Full quality.json"
 
 FAST_NOTE = (
     "MOSS-Image, Fast: lodestones' 8-step distillation (work in progress).\n"
-    "Base model + distillation LoRA + time-embedding patch. Sample with euler / simple, CFG 1.\n"
-    "Trained for 4 to 8 steps. Sizes: multiples of 16."
+    "Base model + distillation LoRA (+ time-embedding patch when the model has one).\n"
+    "Sample with euler / simple, CFG 1. Trained for 4 to 8 steps. Sizes: multiples of 16."
 )
 FULL_NOTE = (
     "MOSS-Image, Full quality: the base model alone.\n"
@@ -100,8 +100,13 @@ class _Graph:
         }
 
 
-def build(unet: str, clip: str, vae: str, lora: str, delta: str, fast: bool) -> dict[str, Any]:
-    """The workflow for one mode. File names are the ones placed in ComfyUI's model folders."""
+def build(
+    unet: str, clip: str, vae: str, lora: str, delta: str | None, fast: bool
+) -> dict[str, Any]:
+    """The workflow for one mode. File names are the ones placed in ComfyUI's model folders.
+
+    `delta` is the time-embedding patch; None for a model whose distillation LoRA needs none
+    (Kromoss's DMD2 LoRA), in which case the Fast graph has just the LoRA."""
     g = _Graph()
     note = g.add(
         "Note", (20, -150), (520, 120), [], [], [FAST_NOTE if fast else FULL_NOTE], title="Read me"
@@ -123,16 +128,18 @@ def build(unet: str, clip: str, vae: str, lora: str, delta: str, fast: bool) -> 
             [lora, 1.0],
             title="Distillation LoRA",
         )
-        patch = g.add(
-            "LoraLoaderModelOnly",
-            (380, 140),
-            (330, 82),
-            [("model", "MODEL", (lora_node, 0))],
-            [("MODEL", "MODEL")],
-            [delta, 1.0],
-            title="Time-embedding patch",
-        )
-        model = (patch, 0)
+        model = (lora_node, 0)
+        if delta is not None:
+            patch = g.add(
+                "LoraLoaderModelOnly",
+                (380, 140),
+                (330, 82),
+                [("model", "MODEL", model)],
+                [("MODEL", "MODEL")],
+                [delta, 1.0],
+                title="Time-embedding patch",
+            )
+            model = (patch, 0)
     else:
         skip = g.add(
             "SkipLayerGuidanceDiTSimple",
@@ -228,7 +235,7 @@ def names_from_model_lines(lines: str, time_embedding: str) -> dict[str, str]:
     return found
 
 
-def write(out_dir: Path, names: dict[str, str], delta: str) -> list[Path]:
+def write(out_dir: Path, names: dict[str, str], delta: str | None) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     written = []
     for fast, title in ((True, FAST_TITLE), (False, FULL_TITLE)):
@@ -243,8 +250,11 @@ def main(argv: list[str]) -> int:
     if len(argv) != 4:
         print(__doc__, file=sys.stderr)
         return 2
-    names = names_from_model_lines(os.environ.get("MODEL_LINES", ""), argv[3])
-    for path in write(Path(argv[1]), names, argv[2]):
+    lines = os.environ.get("MODEL_LINES", "")
+    names = names_from_model_lines(lines, argv[3])
+    # The patch exists only when the model lists the raw time-embedding file it is built from.
+    has_time = any(line.split("\t")[3:4] == [argv[3]] for line in lines.splitlines())
+    for path in write(Path(argv[1]), names, argv[2] if has_time else None):
         print(f"wrote {path}")
     return 0
 
