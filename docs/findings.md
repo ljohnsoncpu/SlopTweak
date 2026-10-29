@@ -3095,3 +3095,62 @@ all destroyed, about $0.38 in total (plus one failed host start at $0.004). What
 - **Strength 0 equals the base control pixel for pixel**; strength 1 differs. One seed per prompt, judged by eye.
 - Session about 10 min, about $0.10. Account credit over the whole day: $12.88 to $11.97 (about $0.91, all rentals and the
   cancelled and failed ones).
+
+## Local SDXL LoRA training on the laptop (2026-10-28)
+
+RTX 4080 Laptop 12 GB, 32 GB RAM, Windows. kohya `sd-scripts` at the Phase T pin
+`11d8cedd…` in `D:\ai\sd-scripts` (venv Python 3.12.11, torch 2.6.0+cu124, requirements.txt
+unpinned beyond the repo's own), Banana Splitz XXL 1.2.1 (SHA-256 matches the catalog),
+the Thales v1 dataset (24 images, plain `.txt` tag captions), and the cloud `train.toml`
+settings: rank/alpha 16, AdamW 1e-4, bf16, gradient checkpointing, batch 1, 960 steps.
+
+- **Speed:** 0.88 s/step over the full run (14:09 for 960 steps, 14.7 min wall with startup and
+  caching); 0.82 s/step steady in a 30-step run. The cloud 3090 ran 0.95 s/step on the Thalia set
+  (23 images, 920 steps), so the laptop was no slower. Different dataset, so close, not exact.
+- **VRAM:** peak 7,839 MiB used on the whole GPU (about 450 MiB baseline), well inside 12 GB.
+  ComfyUI had to be stopped first: it held 9 GB.
+- **Loss:** final average 0.0862 (Thalia cloud: 0.0774). Different data, not comparable.
+- **Outputs:** four checkpoints plus the final, 85,426,860 B each, in `D:\ai\thales-sdxl\out`.
+  Not yet checked: image quality of the LoRA.
+- **Gotchas:** a TOML written with Windows PowerShell 5.1 `Set-Content -Encoding utf8` has a BOM
+  that hides the first key (`network_module` was None); write it without a BOM. The clone's
+  `git archive` tree digest (`b480e8e2…`, 307 files) does not equal the codeload pin
+  (`82c63720…`); cause not investigated, so the local clone is not digest-verified.
+
+### Local training mode in the app (2026-10-28)
+
+The Train tab has a third trainer, "SDXL on this PC" (`train/local.rs`, branch
+`feature/local-sdxl-training`, uncommitted). It reuses `TrainSettings`, the dataset audit and
+`render_train_toml` (minus `save_state`), and runs the user's own kohya install as a child
+process: no quote, no rental, results in the usual `LoRAs/<name>-<ts>/` with a `manifest.json`
+of checkpoint SHA-256s. The trainer folder (with `.venv`) and the base checkpoint are set in the
+tab and kept in `local-train.json` in the config dir.
+
+- **Verified:** the real trainer through `LocalManager` (ignored test `real_trainer_smoke`): 24
+  steps on the Thales set completed in 68 s including startup, checkpoints written.
+- **Guard:** it refuses to start with under 9 GB of GPU memory free (peak use was 7.8 GB), so a
+  running ComfyUI is caught with a plain message.
+- **Not done:** no test images in local mode; the base checkpoint isn't hash-checked; stopping
+  the app mid-run does not kill the trainer process; the trainer isn't pinned by digest.
+
+**Tried in the real app (debug build, 2026-10-28):** set the trainer folder and checkpoint in the
+Train tab (saved, and still there after a page reload), 48-step run on the Thales set finished in
+1 min 50 s with four checkpoints, the final LoRA, `manifest.json` and logs in
+`Pictures\SlopTweak\LoRAs\thales_miletus-<ts>`, work folder removed. A run in progress survives a
+UI reload (status comes from Rust). Stop at step 25 of 960 ended the run as "Stopped"; both
+python processes exited and GPU memory fell to idle (467 MiB). Found and fixed: the "Test
+images" setting showed in local mode. Driving gotcha: `request_access "SlopTweak"` grants the
+installed app; pass `sloptweak.exe` to get the debug build's window.
+
+**Keep training and Sample (local mode, 2026-10-28):** `LocalManager::keep_training(steps)` starts a
+new run `<name>-moreN-<ts>` from the newest checkpoint of the last run (`network_weights` +
+`dim_from_weights`, fresh optimizer, `steps_override`), and records `continued_from` with the
+source checkpoint's SHA-256 in `manifest.json`. `sample()` runs `sdxl_gen_img.py` (euler_a, 20
+steps, CFG 3.5, the same flags as the cloud test images) for one prompt through a chosen
+checkpoint or the base model alone, into `samples/<ts>-<n>/`; the page gets it as a data URL.
+Verified with the real trainer (ignored test `real_trainer_smoke`): sample in 37 s (model load
+included), a 12-step continuation from a 24-step checkpoint completed. Verified in the stubbed
+preview: controls, progress, cancel, error text, focus kept while polling. **Not verified in the
+real window:** the new buttons and the data-URL image over Tauri IPC (the window couldn't be
+brought forward without click access to the taskbar). Also fixed: a long dataset path widened the
+Train card (`grid-template-columns: minmax(0, 1fr)` on `main` and `.view`).

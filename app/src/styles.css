@@ -65,6 +65,8 @@ main {
   margin: 0 auto;
   padding: 20px;
   display: grid;
+  /* minmax(0, ...) lets a long unbroken path shrink instead of widening the page. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
 }
 
@@ -223,6 +225,7 @@ pre {
 
 .view {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
 }
 

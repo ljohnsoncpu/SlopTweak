@@ -115,6 +115,8 @@ struct AppState {
     manager: Mutex<Option<Arc<SessionManager>>>,
     /// LoRA training (the Train tab); built on first use like `manager`.
     train: Mutex<Option<Arc<train::manager::TrainManager>>>,
+    /// SDXL training on this PC's own GPU (no rental).
+    local_train: Arc<train::local::LocalManager>,
     catalog: Mutex<Catalog>,
     civitai: Arc<dyn CivitaiApi>,
     /// Last known Vast credit and when it was read.
@@ -1276,12 +1278,17 @@ async fn train_start(st: State<'_, AppState>, plan_id: String) -> Result<(), Str
 
 #[tauri::command]
 async fn train_status(st: State<'_, AppState>) -> Result<train::manager::Status, String> {
+    let local = st.local_train.status();
+    if local.state != "idle" {
+        return Ok(local);
+    }
     let m = st.train.lock().unwrap().clone();
     Ok(m.map_or_else(train::manager::Status::idle, |m| m.status()))
 }
 
 #[tauri::command]
 async fn train_cancel(st: State<'_, AppState>) -> Result<(), String> {
+    st.local_train.cancel();
     if let Some(m) = st.train.lock().unwrap().clone() {
         m.cancel();
     }
@@ -1290,10 +1297,135 @@ async fn train_cancel(st: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn train_dismiss(st: State<'_, AppState>) -> Result<(), String> {
+    st.local_train.dismiss();
     if let Some(m) = st.train.lock().unwrap().clone() {
         m.dismiss();
     }
     Ok(())
+}
+
+/// What the Train tab shows about training on this PC.
+#[derive(Debug, Serialize)]
+struct LocalSetupView {
+    trainer_dir: String,
+    base_model: String,
+    /// What is missing; empty means ready.
+    problems: Vec<String>,
+    gpu: Option<train::local::GpuInfo>,
+    /// Why the GPU can't train right now (not enough free memory).
+    gpu_problem: Option<String>,
+}
+
+fn local_setup_view(m: &train::local::LocalManager) -> LocalSetupView {
+    let setup = m.setup();
+    let gpu = m.gpu();
+    LocalSetupView {
+        problems: setup.problems(),
+        gpu_problem: gpu.as_ref().and_then(train::local::gpu_problem),
+        trainer_dir: setup.trainer_dir,
+        base_model: setup.base_model,
+        gpu,
+    }
+}
+
+#[tauri::command]
+async fn train_local_setup(st: State<'_, AppState>) -> Result<LocalSetupView, String> {
+    let m = st.local_train.clone();
+    tokio::task::spawn_blocking(move || local_setup_view(&m))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn train_local_set_setup(
+    st: State<'_, AppState>,
+    trainer_dir: String,
+    base_model: String,
+) -> Result<LocalSetupView, String> {
+    let m = st.local_train.clone();
+    tokio::task::spawn_blocking(move || {
+        m.set_setup(&train::local::LocalSetup {
+            trainer_dir,
+            base_model,
+        })?;
+        Ok(local_setup_view(&m))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The checkpoints of the newest local run, oldest first.
+#[tauri::command]
+async fn train_local_checkpoints(
+    st: State<'_, AppState>,
+) -> Result<Vec<train::local::CheckpointInfo>, String> {
+    Ok(st.local_train.checkpoints())
+}
+
+/// Train more steps from the newest local checkpoint, as a new run.
+#[tauri::command]
+async fn train_local_continue(st: State<'_, AppState>, steps: u32) -> Result<(), String> {
+    let m = st.local_train.clone();
+    tokio::task::spawn_blocking(move || m.keep_training(steps))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// A sample image, sent to the page as a data URL (the page can't read files).
+#[derive(Debug, Serialize)]
+struct SampleView {
+    path: String,
+    data_url: String,
+}
+
+#[tauri::command]
+async fn train_local_sample(
+    st: State<'_, AppState>,
+    request: train::local::SampleRequest,
+) -> Result<SampleView, String> {
+    use base64::Engine;
+    let m = st.local_train.clone();
+    tokio::task::spawn_blocking(move || {
+        let path = m.sample(&request)?;
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(SampleView {
+            data_url: format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            ),
+            path: path.display().to_string(),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn train_local_sample_cancel(st: State<'_, AppState>) -> Result<(), String> {
+    st.local_train.cancel_sample();
+    Ok(())
+}
+
+/// The user pressed Start: nothing is billed, so there is no quote step.
+#[tauri::command]
+async fn train_local_start(
+    st: State<'_, AppState>,
+    dir: String,
+    settings: train::settings::TrainSettings,
+) -> Result<(), String> {
+    if st
+        .train
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|m| m.is_running())
+    {
+        return Err("A rented-GPU training run is in progress.".into());
+    }
+    let m = st.local_train.clone();
+    tokio::task::spawn_blocking(move || m.start(std::path::Path::new(&dir), &settings))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Machines remembered from earlier rentals, skipped ones first.
@@ -1316,11 +1448,15 @@ async fn machine_forget(st: State<'_, AppState>, machine_id: u64) -> Result<(), 
 #[tauri::command]
 async fn train_open_results(app: AppHandle, st: State<'_, AppState>) -> Result<(), String> {
     let dir = st
-        .train
-        .lock()
-        .unwrap()
-        .clone()
-        .and_then(|m| m.results_dir())
+        .local_train
+        .results_dir()
+        .or_else(|| {
+            st.train
+                .lock()
+                .unwrap()
+                .clone()
+                .and_then(|m| m.results_dir())
+        })
         .ok_or("There are no results to show.")?;
     app.opener()
         .open_path(dir.to_string_lossy(), None::<&str>)
@@ -1934,8 +2070,20 @@ pub fn run() {
                     .join("SlopTweak"),
                 Mode::Mock => data_dir.join("output"),
             };
+            let local_train = {
+                let (config, default) = (config_dir.clone(), default_output_dir.clone());
+                train::local::LocalManager::new(train::local::LocalDeps {
+                    config_dir: config_dir.clone(),
+                    results_root: Arc::new(move || output_dir(&config, &default).join("LoRAs")),
+                    cache_dir: data_dir.join("local-train-cache"),
+                    exec: Arc::new(train::local::ProcessExec),
+                    gpu: Arc::new(train::local::query_gpu),
+                    clock: Arc::new(now_unix),
+                })
+            };
             app.manage(AppState {
                 train: Mutex::new(None),
+                local_train,
                 mode,
                 secrets,
                 catalog: Mutex::new(catalog::load_local(&data_dir)),
@@ -2054,6 +2202,13 @@ pub fn run() {
             train_quote,
             train_start,
             train_status,
+            train_local_setup,
+            train_local_set_setup,
+            train_local_start,
+            train_local_checkpoints,
+            train_local_continue,
+            train_local_sample,
+            train_local_sample_cancel,
             train_cancel,
             train_dismiss,
             train_open_results,

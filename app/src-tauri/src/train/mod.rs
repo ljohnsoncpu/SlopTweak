@@ -8,6 +8,7 @@ pub mod commands;
 pub mod dataset;
 pub mod diag;
 pub mod job;
+pub mod local;
 pub mod manager;
 pub mod moss;
 pub mod recent;

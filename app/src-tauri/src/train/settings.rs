@@ -50,6 +50,9 @@ pub struct TrainSettings {
     pub eval_strengths: Vec<f64>,
     pub eval_seeds: Vec<u32>,
     pub eval_preset: EvalPreset,
+    /// Train exactly this many steps instead of `epochs` passes over the
+    /// images (used to keep training an existing LoRA for a chosen length).
+    pub steps_override: Option<u32>,
 }
 
 impl Default for TrainSettings {
@@ -69,6 +72,7 @@ impl Default for TrainSettings {
             eval_strengths: vec![0.5, 0.75, 1.0],
             eval_seeds: vec![104_729, 130_363],
             eval_preset: EvalPreset::Quick,
+            steps_override: None,
         }
     }
 }
@@ -96,6 +100,12 @@ impl TrainSettings {
         if !(1..=400).contains(&self.epochs) || !(1..=50).contains(&self.repeats) {
             return Err("Epochs must be 1-400 and repeats 1-50.".into());
         }
+        if self
+            .steps_override
+            .is_some_and(|n| !(1..=20_000).contains(&n))
+        {
+            return Err("Steps must be between 1 and 20,000.".into());
+        }
         if !(0.0..=0.5).contains(&self.warmup_fraction) {
             return Err("Warm-up must be between 0% and 50% of the steps.".into());
         }
@@ -120,7 +130,8 @@ impl TrainSettings {
     }
 
     pub fn total_steps(&self, images: u32) -> u32 {
-        images * self.repeats * self.epochs / BATCH_SIZE
+        self.steps_override
+            .unwrap_or(images * self.repeats * self.epochs / BATCH_SIZE)
     }
 
     pub fn warmup_steps(&self, images: u32) -> u32 {
