@@ -236,6 +236,8 @@ mod tests {
         let d = folder(23);
         let thorough = TrainSettings {
             eval_preset: super::super::settings::EvalPreset::Thorough,
+            epochs: 40,
+            save_points: 4,
             ..Default::default()
         };
         let v = audit_view(d.path(), thorough, 12).unwrap();

@@ -16,8 +16,8 @@ use super::moss::{
     MOSS_TRAINER_TREE_SHA256,
 };
 use super::settings::{
-    eval_image_count, render_dataset_toml, render_eval_prompts, render_train_toml, EvalPrompt,
-    TrainPaths, TrainSettings, EVAL_NEGATIVE,
+    eval_image_count, render_dataset_toml, render_eval_prompts, render_train_toml, EvalPreset,
+    EvalPrompt, TrainPaths, TrainSettings, EVAL_NEGATIVE,
 };
 use crate::provider::LaunchSpec;
 
@@ -96,7 +96,12 @@ pub fn build(
     }
     let images = u32::try_from(report.images.len()).map_err(|_| "Too many images.")?;
     let paths = remote_paths(model);
-    let eval_prompts = render_eval_prompts(settings, prompts, EVAL_NEGATIVE)?;
+    let eval_enabled = settings.eval_preset != EvalPreset::None;
+    let eval_prompts = if eval_enabled {
+        render_eval_prompts(settings, prompts, EVAL_NEGATIVE)?
+    } else {
+        String::new()
+    };
 
     let mut tar = tar::Builder::new(Vec::new());
     let mut files = Vec::new();
@@ -136,7 +141,8 @@ pub fn build(
         "checkpoint_steps": settings.checkpoint_steps(images),
         "eval_checkpoints": settings.eval_checkpoints(images),
         "eval_strengths": settings.eval_strength_list(),
-        "eval_images_per_run": prompts.len() * settings.eval_seed_list().len(),
+        "eval_enabled": eval_enabled,
+        "eval_images_per_run": if eval_enabled { prompts.len() * settings.eval_seed_list().len() } else { 0 },
         "train_toml": render_train_toml(settings, images, &paths),
         "dataset_toml": render_dataset_toml(settings, &paths.image_dir),
         "eval_prompts": eval_prompts,
@@ -433,6 +439,8 @@ mod tests {
         let d = dataset(10);
         let s = TrainSettings {
             output_name: "lora".into(),
+            epochs: 40,
+            save_points: 4,
             ..Default::default()
         };
         let report = audit(d.path(), 1024).unwrap();

@@ -12,6 +12,8 @@ pub const BATCH_SIZE: u32 = 1;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EvalPreset {
+    /// No test images: train and save checkpoints only (Sample afterwards).
+    None,
     /// A quick look: the first few prompts, one seed, the base model and the
     /// final checkpoint at full strength.
     #[default]
@@ -62,11 +64,11 @@ impl Default for TrainSettings {
             rank: 16,
             alpha: 16,
             learning_rate: 1e-4,
-            epochs: 40,
+            epochs: 60,
             repeats: 1,
             warmup_fraction: 0.05,
             resolution: 1024,
-            save_points: 4,
+            save_points: 1,
             seed: 20_261_025,
             keep_tokens: 1,
             eval_strengths: vec![0.5, 0.75, 1.0],
@@ -161,6 +163,7 @@ impl TrainSettings {
     pub fn eval_checkpoints(&self, images: u32) -> Vec<u32> {
         let all = self.checkpoint_steps(images);
         match self.eval_preset {
+            EvalPreset::None => Vec::new(),
             EvalPreset::Quick => all.last().copied().into_iter().collect(),
             EvalPreset::Thorough => all,
         }
@@ -168,14 +171,16 @@ impl TrainSettings {
 
     pub fn eval_strength_list(&self) -> Vec<f64> {
         match self.eval_preset {
-            EvalPreset::Quick => vec![QUICK_STRENGTH],
+            EvalPreset::None | EvalPreset::Quick => vec![QUICK_STRENGTH],
             EvalPreset::Thorough => self.eval_strengths.clone(),
         }
     }
 
     pub fn eval_seed_list(&self) -> Vec<u32> {
         match self.eval_preset {
-            EvalPreset::Quick => self.eval_seeds.iter().take(1).copied().collect(),
+            EvalPreset::None | EvalPreset::Quick => {
+                self.eval_seeds.iter().take(1).copied().collect()
+            }
             EvalPreset::Thorough => self.eval_seeds.clone(),
         }
     }
@@ -183,6 +188,7 @@ impl TrainSettings {
     /// How many of the prompts the preset uses.
     pub fn eval_prompt_limit(&self) -> usize {
         match self.eval_preset {
+            EvalPreset::None => 0,
             EvalPreset::Quick => QUICK_PROMPTS,
             EvalPreset::Thorough => usize::MAX,
         }
@@ -344,6 +350,9 @@ pub fn render_eval_prompts(
 /// Images in the evaluation: the base control plus each tested checkpoint at
 /// each strength, every prompt x seed.
 pub fn eval_image_count(s: &TrainSettings, images: u32, prompts: usize) -> usize {
+    if s.eval_preset == EvalPreset::None {
+        return 0;
+    }
     let per_run = prompts * s.eval_seed_list().len();
     per_run * (1 + s.eval_checkpoints(images).len() * s.eval_strength_list().len())
 }
@@ -366,15 +375,30 @@ mod tests {
     fn thorough() -> TrainSettings {
         TrainSettings {
             eval_preset: EvalPreset::Thorough,
+            // The first validated run: 23 images x 40 epochs, 4 checkpoints.
+            epochs: 40,
+            save_points: 4,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn none_makes_no_test_images() {
+        let s = TrainSettings {
+            eval_preset: EvalPreset::None,
+            ..Default::default()
+        };
+        assert!(s.eval_checkpoints(23).is_empty());
+        assert_eq!(s.eval_prompt_limit(), 0);
+        assert_eq!(eval_image_count(&s, 23, 8), 0);
+        assert_eq!((s.epochs, s.save_points), (60, 1));
     }
 
     #[test]
     fn quick_is_the_default_and_makes_a_dozen_images() {
         let s = TrainSettings::default();
         assert_eq!(s.eval_preset, EvalPreset::Quick);
-        assert_eq!(s.eval_checkpoints(23), vec![920]);
+        assert_eq!(s.eval_checkpoints(23), vec![1380]);
         assert_eq!(s.eval_strength_list(), vec![1.0]);
         assert_eq!(s.eval_seed_list(), vec![104_729]);
         // 6 prompts x 1 seed x (base + final checkpoint).
@@ -422,6 +446,8 @@ mod tests {
     fn rendered_configs_are_valid_toml() {
         let s = TrainSettings {
             output_name: "thalia_run01".into(),
+            epochs: 40,
+            save_points: 4,
             ..Default::default()
         };
         let train: toml::Table = render_train_toml(&s, 23, &paths()).parse().unwrap();
