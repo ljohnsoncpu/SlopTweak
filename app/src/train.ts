@@ -51,9 +51,32 @@ interface Checkpoint {
   step: number;
 }
 
+interface InstallStatus {
+  state: "idle" | "running" | "finished";
+  stage: string;
+  detail: string;
+  step: number;
+  steps: number;
+  fraction: number | null;
+  elapsed_secs: number;
+  outcome: "completed" | "failed" | "cancelled" | null;
+  error: string | null;
+}
+
 interface LocalSetup {
-  trainer_dir: string;
   base_model: string;
+  /** Where the trainer comes from: SlopTweak's own setup, an earlier manual folder, or not set up. */
+  trainer: {
+    source: "managed" | "existing" | "none";
+    /** The folder SlopTweak sets the trainer up in. */
+    root: string;
+    download_gb: number;
+    disk_gb: number;
+    free_gb: number | null;
+    drive: string;
+    /** Set when there isn't room to set up there. */
+    space_problem: string | null;
+  };
   problems: string[];
   gpu: { name: string; total_mib: number; used_mib: number } | null;
   gpu_problem: string | null;
@@ -177,6 +200,7 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
   let mossAudit: MossAudit | null = null;
   let trainer: TrainerKind = "sdxl";
   let localSetup: LocalSetup | null = null;
+  let install: InstallStatus | null = null;
   // After a local run: keep training it, or try a prompt on its checkpoints.
   let checkpoints: Checkpoint[] = [];
   /** The run `checkpoints` belongs to. */
@@ -289,12 +313,54 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
     render();
   }
 
-  async function saveLocalSetup(trainerDir: string, baseModel: string): Promise<void> {
+  /** The user typed or pasted a checkpoint path. */
+  async function saveModelPath(baseModel: string): Promise<void> {
     await act(
-      invoke<LocalSetup>("train_local_set_setup", { trainerDir, baseModel }).then((s) => {
+      invoke<LocalSetup>("train_local_set_model", { baseModel }).then((s) => {
         localSetup = s;
       }),
     );
+  }
+
+  /** The system file dialog; nothing changes if it is closed without a choice. */
+  async function pickModel(): Promise<void> {
+    await act(
+      invoke<LocalSetup | null>("train_local_pick_model").then((s) => {
+        if (s) localSetup = s;
+      }),
+    );
+  }
+
+  /** Choose which folder the trainer is set up in; nothing changes if the dialog is closed. */
+  async function pickTrainerDir(): Promise<void> {
+    await act(
+      invoke<LocalSetup | null>("train_local_pick_trainer_dir").then((s) => {
+        if (s) localSetup = s;
+      }),
+    );
+  }
+
+  async function startInstall(): Promise<void> {
+    await act(invoke("train_local_install").then(pollInstall));
+  }
+
+  async function pollInstall(): Promise<void> {
+    try {
+      const next = await invoke<InstallStatus>("train_local_install_status");
+      const changed = JSON.stringify(next) !== JSON.stringify(install);
+      install = next;
+      if (next.state === "finished" && next.outcome !== "failed") {
+        // Done or cancelled: nothing to show, and the setup now counts as ready.
+        await invoke("train_local_install_dismiss");
+        install = null;
+        localSetup = await invoke<LocalSetup>("train_local_setup");
+      } else if (!changed) {
+        return;
+      }
+    } catch (e) {
+      error = String(e);
+    }
+    render();
   }
 
   /** Local runs are free, so Start is the only step: there is no quote. */
@@ -440,7 +506,10 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
       trainer = pick.value === "kromoss" ? "kromoss" : pick.value === "local" ? "local" : "sdxl";
       quote = null;
       error = "";
-      if (trainer === "local") void loadLocalSetup();
+      if (trainer === "local") {
+        void loadLocalSetup();
+        void pollInstall();
+      }
       if (dir) void runAudit();
       else render();
     });
@@ -453,7 +522,7 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
         h(
           "span",
           { class: "muted small hint" },
-          "Uses the kohya trainer installed on this PC and a checkpoint file you choose. Same captions and settings as the rented-GPU run, no cost. Test images aren't made; try the checkpoints in your image tool.",
+          "Trains on this PC's own GPU with the kohya trainer, which SlopTweak sets up for you once. You choose an SDXL checkpoint file. Same captions and settings as the rented-GPU run, no cost. Test images aren't made here; use Sample after a run.",
         ),
       trainer === "kromoss" &&
         h(
@@ -592,18 +661,92 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
       box.append(h("p", { class: "muted small" }, "Checking this PC…"));
       return box;
     }
-    const trainerDir = h("input", { type: "text", placeholder: "Folder with sdxl_train_network.py and a .venv" });
-    trainerDir.value = s.trainer_dir;
+
+    // The trainer: set up by SlopTweak, so there is nothing to find or configure.
+    const t = s.trainer;
+    if (install && install.state !== "idle") {
+      const i = install;
+      const overall = ((i.step - 1) + (i.fraction ?? 0)) / i.steps;
+      if (i.state === "running") {
+        box.append(
+          h("div", { class: "row" }, h("label", {}, "Trainer"), h("span", {}, `Setting up: step ${i.step} of ${i.steps} · ${i.stage}`)),
+          bar(overall),
+          h("p", { class: "muted small", style: "overflow-wrap:anywhere" }, `${i.detail} · ${minutes(i.elapsed_secs)}`),
+          h(
+            "div",
+            { class: "actions" },
+            h("button", { class: "ghost", onclick: () => void act(invoke("train_local_install_cancel").then(pollInstall)) }, "Cancel"),
+            h("span", { class: "muted small" }, "You can leave this tab; setup keeps going."),
+          ),
+        );
+      } else {
+        box.append(
+          h("div", { class: "row" }, h("label", {}, "Trainer"), h("span", { class: "error" }, "Setup didn't finish")),
+          h("p", { class: "error small", style: "white-space:pre-wrap;overflow-wrap:anywhere" }, i.error ?? "Something went wrong."),
+          h(
+            "div",
+            { class: "actions" },
+            h(
+              "button",
+              { class: "primary", onclick: () => void act(invoke("train_local_install_dismiss").then(startInstall)) },
+              "Try again",
+            ),
+            h("span", { class: "muted small" }, "It picks up where it stopped."),
+          ),
+        );
+      }
+    } else if (t.source === "none") {
+      box.append(
+        h("div", { class: "row" }, h("label", {}, "Trainer"), h("span", { class: "muted" }, "Not set up yet")),
+        h(
+          "p",
+          { class: "muted small" },
+          `SlopTweak sets the trainer up once, by itself: about ${t.download_gb.toFixed(0)} GB to download (PyTorch and the kohya trainer) and about ${t.disk_gb.toFixed(0)} GB of free disk while it installs (5 GB afterwards). It needs an NVIDIA GPU.`,
+        ),
+        h(
+          "div",
+          { class: "row" },
+          h("label", {}, "Install in"),
+          h("span", { class: "path", title: t.root }, t.root),
+          h("button", { onclick: () => void pickTrainerDir(), disabled: busy }, "Change…"),
+        ),
+        t.space_problem
+          ? h("p", { class: "error small" }, t.space_problem)
+          : h("p", { class: "muted small" }, t.free_gb !== null ? `${t.free_gb.toFixed(0)} GB free on ${t.drive}` : ""),
+        h(
+          "div",
+          { class: "actions" },
+          h("button", { class: "primary", onclick: () => void startInstall(), disabled: busy || !!t.space_problem }, "Set up trainer"),
+        ),
+      );
+    } else {
+      box.append(
+        h(
+          "div",
+          { class: "row" },
+          h("label", {}, "Trainer"),
+          h("span", { class: "muted" }, t.source === "managed" ? "Ready" : "Ready (the one you set up earlier)"),
+        ),
+      );
+    }
+
+    // The base checkpoint: pick it with the system file dialog, or paste a path.
     const model = h("input", { type: "text", placeholder: "Path to an SDXL .safetensors checkpoint" });
     model.value = s.base_model;
-    const save = () => void saveLocalSetup(trainerDir.value.trim(), model.value.trim());
-    trainerDir.addEventListener("change", save);
-    model.addEventListener("change", save);
+    model.addEventListener("change", () => void saveModelPath(model.value.trim()));
     box.append(
-      h("div", { class: "row" }, h("label", {}, "Trainer folder"), trainerDir),
-      h("div", { class: "row" }, h("label", {}, "Base model file"), model),
+      h(
+        "div",
+        { class: "row" },
+        h("label", {}, "Base model file"),
+        model,
+        h("button", { onclick: () => void pickModel(), disabled: busy }, "Choose file…"),
+      ),
     );
-    for (const p of s.problems) box.append(h("p", { class: "error small" }, p));
+    for (const p of s.problems) {
+      // The trainer has its own row and button above.
+      if (!p.includes("trainer")) box.append(h("p", { class: "error small" }, p));
+    }
     if (s.gpu) {
       const free = ((s.gpu.total_mib - s.gpu.used_mib) / 1024).toFixed(1);
       box.append(
@@ -978,6 +1121,7 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
     window.clearInterval(timer);
     timer = window.setInterval(() => {
       if (status?.state === "running" || status?.state === "finished") void poll();
+      if (install?.state === "running") void pollInstall();
     }, 2000);
   }
 

@@ -18,7 +18,12 @@
       const mossPlan = { images: 21, total_steps: 800, warmup_steps: 100, checkpoint_steps: [200, 400, 600, 800], eval_images: 0 };
       const plan = { images: 23, total_steps: 920, warmup_steps: 46, checkpoint_steps: [230, 460, 690, 920], eval_images: 312 };
       const rows = Array.from({ length: 23 }, (_, i) => ({ id: `thalia_miletus_${i}`, width: 1033, height: 1522, first_tag: "thalia_miletus", tags: 17 }));
-      let localSetup = { trainer_dir: "D:/ai/sd-scripts", base_model: "D:/ai/sdxl-models/bananaSplitzXXL_121.safetensors", problems: [], gpu: { name: "NVIDIA GeForce RTX 4080 Laptop GPU", total_mib: 12282, used_mib: 450 }, gpu_problem: null };
+      const trainerInfo = { source: "none", root: "C:/Users/user/AppData/Local/SlopTweak/local-trainer", download_gb: 4, disk_gb: 8, free_gb: 74, drive: "C:", space_problem: null };
+      let lowSpace = false;
+      let localSetup = { base_model: "", trainer: trainerInfo, problems: [], gpu: { name: "NVIDIA GeForce RTX 4080 Laptop GPU", total_mib: 12282, used_mib: 450 }, gpu_problem: null };
+      const refresh = () => { localSetup.problems = [...(localSetup.trainer.source === "none" ? ["The trainer isn't set up yet. Press \"Set up trainer\" first."] : []), ...(localSetup.base_model ? [] : ["Choose the SDXL checkpoint file to train on."])]; return localSetup; };
+      refresh();
+      let installAt = null, installCancelled = false, installFail = false;
       const stub = {
         train_defaults: () => ({ settings: { output_name: "lora", rank: 16, alpha: 16, learning_rate: 0.0001, epochs: 40, repeats: 1, warmup_fraction: 0.05, resolution: 1024, save_points: 4, seed: 1, keep_tokens: 1, eval_strengths: [0.5, 0.75, 1], eval_seeds: [1, 2], eval_preset: "quick" }, prompts: [] }),
         train_moss_defaults: () => ({ output_name: "lora", rank: 32, alpha: 32, steps: 800, save_every: 200, caption_mode: "mix", p_nl: 0.5, tag_dropout: 0.1, int8_compute: true, seed: 1, sample_prompt: "" }),
@@ -27,7 +32,31 @@
         train_audit: () => ({ report: { images: rows, issues: [{ severity: "warning", message: "thalia_miletus_9.png is 400x600; the short side is under 512 and will be upscaled." }], buckets: { "832x1216": 23 } }, plan, settings_error: null }),
         train_quote: ({ args }) => (kind = args.trainer) === "kromoss" ? ({ plan_id: "abc", trainer: "kromoss", gpu_name: "RTX 4090", gpu_location: "Spain, ES", hourly: 0.486, max_minutes: 120, max_usd: 1.5, worst_usd: 0.97, expected_minutes: 52, plan: mossPlan, expires_unix: 0 }) : ({ plan_id: "abc", trainer: "sdxl", gpu_name: "RTX 3090", gpu_location: "Spain, ES", hourly: 0.3605, max_minutes: 120, max_usd: 1.5, worst_usd: 0.72, expected_minutes: 38, plan, expires_unix: 0 }),
         train_local_setup: () => localSetup,
-        train_local_set_setup: ({ trainerDir, baseModel }) => (localSetup = { ...localSetup, trainer_dir: trainerDir, base_model: baseModel, problems: trainerDir && baseModel ? [] : ["Set the folder where kohya sd-scripts is installed."] }),
+        train_local_set_model: ({ baseModel }) => { localSetup.base_model = baseModel; return refresh(); },
+        train_local_pick_model: () => { localSetup.base_model = "D:/ai/sdxl-models/bananaSplitzXXL_121.safetensors"; return refresh(); },
+        train_local_pick_trainer_dir: () => {
+          lowSpace = !lowSpace;
+          const t = localSetup.trainer;
+          t.root = lowSpace ? "C:/Users/user/AppData/Local/SlopTweak/local-trainer" : "D:/ai/SlopTweak-trainer";
+          t.drive = lowSpace ? "C:" : "D:";
+          t.free_gb = lowSpace ? 3.4 : 485;
+          t.space_problem = lowSpace ? "Only 3.4 GB is free on C:, and setting up the trainer needs about 8 GB while it installs (5 GB afterwards). Free some space, or choose a folder on another drive." : null;
+          return refresh();
+        },
+        train_local_install: () => { installAt = Date.now(); installCancelled = false; },
+        train_local_install_cancel: () => { installCancelled = true; },
+        train_local_install_dismiss: () => { installAt = null; installFail = false; },
+        train_local_install_status: () => {
+          const idle = { state: "idle", stage: "", detail: "", step: 0, steps: 6, fraction: null, elapsed_secs: 0, outcome: null, error: null };
+          if (installAt === null) return idle;
+          const s = (Date.now() - installAt) / 1000;
+          if (installCancelled) return { ...idle, state: "finished", outcome: "cancelled", step: 3 };
+          if (installFail && s > 6) return { ...idle, state: "finished", outcome: "failed", step: 5, stage: "Installing PyTorch and libraries", elapsed_secs: 6, error: "packages failed with code 1.\nerror: failed to download torch: connection reset" };
+          if (s < 3) return { ...idle, state: "running", step: 1, stage: "Downloading the trainer", detail: "Downloading the kohya trainer (6 MB)", fraction: s / 3, elapsed_secs: Math.floor(s) };
+          if (s < 8) return { ...idle, state: "running", step: 5, stage: "Installing PyTorch and libraries", detail: "Downloading torch (2.3GiB)", elapsed_secs: Math.floor(s) };
+          localSetup.trainer.source = "managed"; refresh();
+          return { ...idle, state: "finished", outcome: "completed", step: 6, elapsed_secs: 8 };
+        },
         train_local_start: () => { t0 = Date.now(); cancelled = false; kind = "local"; },
         train_local_checkpoints: () => [240, 480, 720, 960].map((step) => ({ file: `thalia-step${String(step).padStart(8, "0")}.safetensors`, step })),
         train_local_continue: () => { t0 = Date.now(); cancelled = false; kind = "local"; },

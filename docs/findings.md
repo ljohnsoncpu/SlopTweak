@@ -3154,3 +3154,40 @@ preview: controls, progress, cancel, error text, focus kept while polling. **Not
 real window:** the new buttons and the data-URL image over Tauri IPC (the window couldn't be
 brought forward without click access to the taskbar). Also fixed: a long dataset path widened the
 Train card (`grid-template-columns: minmax(0, 1fr)` on `main` and `.view`).
+
+### SlopTweak sets up the local trainer itself (2026-10-29)
+
+Local training no longer asks for a trainer folder. `train/trainer_setup.rs` installs everything
+under one folder (default `<app local data>/local-trainer`; `SLOPTWEAK_LOCAL_TRAINER_ROOT`
+moves it, e.g. to another drive): the pinned kohya source (`job.rs` commit and tree digest), `uv`
+0.9.5 from its PyPI Windows wheel (SHA-256 `48a12390…`, one of the pins already in
+`instance/train_bootstrap.lock`), Python 3.12.12 through uv, and a venv from
+`app/src-tauri/trainer/requirements-windows.lock` (66 packages, hashes, torch 2.6.0+cu124),
+compiled with `uv pip compile --python-platform windows` from the same inputs as the cloud
+lock (`requirements.in` beside it). Steps are idempotent and a cancelled or failed setup resumes;
+`installed.json` records the pins, so an app update that changes them redoes the setup. A trainer
+folder from the earlier manual setup (`local-train.json`) is still used when SlopTweak has no
+setup of its own. The base checkpoint is chosen with the system file dialog (or a pasted path).
+
+- **Real run, 2026-10-29:** a clean setup into an empty folder took 108 s on this connection
+  (trainer 6 MB, uv 21 MB, Python, 66 packages "prepared in 1m 05s"), 5.0 GB on disk afterwards
+  (the uv cache and downloads are deleted at the end; allow about 8 GB free while installing).
+  PyTorch saw the RTX 4080. The managed install then trained 24 steps, made a sample image (44 s
+  with model load) and continued from the checkpoint, via `real_trainer_smoke`.
+- **Digest mystery solved:** the Rust `tree_digest` over the real codeload tarball matches
+  `TRAINER_TREE_SHA256`, so the earlier mismatch (`b480e8e2…`) came from computing it over
+  `git archive`, not from a different trainer. The setup refuses a tarball that doesn't match.
+- **Not verified:** the new "Choose file…" button and the setup panel in the real window (only the
+  stubbed preview and tests); a machine with no NVIDIA GPU (the check is unit-tested with a fake);
+  Windows long-path limits with a very deep data directory; free-disk check before starting.
+
+**Trainer location and free-space check (2026-10-29):** the setup panel shows where the trainer
+will go and the free space on that drive, with a "Change…" folder picker. SlopTweak always
+creates its own `SlopTweak-trainer` folder inside the picked one, and refuses a folder that
+already holds files that aren't its own (setup deletes and replaces things inside it, e.g.
+`cache/`). The choice is `trainer_root` in `local-train.json` (config dir); the dev override
+`SLOPTWEAK_LOCAL_TRAINER_ROOT` still wins; the default is `<app data>/local-trainer`. The free
+space comes from `GetDiskFreeSpaceExW` (free to the current user, nearest existing parent); setup
+won't start below 8 GB free and says which drive is short; an unknown amount never blocks.
+Changing the place moves nothing: an earlier setup stays where it was. This PC's setting is
+`D:\ai\SlopTweak-trainer` (not set up yet; the earlier manual `D:\ai\sd-scripts` is used until then).

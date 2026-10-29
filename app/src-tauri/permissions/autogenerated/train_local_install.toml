@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-train-local-install"
+description = "Enables the train_local_install command without any pre-configured scope."
+commands.allow = ["train_local_install"]
+
+[[permission]]
+identifier = "deny-train-local-install"
+description = "Denies the train_local_install command without any pre-configured scope."
+commands.deny = ["train_local_install"]

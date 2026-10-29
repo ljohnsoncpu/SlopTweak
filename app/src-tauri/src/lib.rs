@@ -117,6 +117,8 @@ struct AppState {
     train: Mutex<Option<Arc<train::manager::TrainManager>>>,
     /// SDXL training on this PC's own GPU (no rental).
     local_train: Arc<train::local::LocalManager>,
+    /// Sets up the trainer SlopTweak uses for local training.
+    trainer_setup: Arc<train::trainer_setup::TrainerInstaller>,
     catalog: Mutex<Catalog>,
     civitai: Arc<dyn CivitaiApi>,
     /// Last known Vast credit and when it was read.
@@ -1307,51 +1309,197 @@ async fn train_dismiss(st: State<'_, AppState>) -> Result<(), String> {
 /// What the Train tab shows about training on this PC.
 #[derive(Debug, Serialize)]
 struct LocalSetupView {
-    trainer_dir: String,
     base_model: String,
     /// What is missing; empty means ready.
     problems: Vec<String>,
     gpu: Option<train::local::GpuInfo>,
     /// Why the GPU can't train right now (not enough free memory).
     gpu_problem: Option<String>,
+    trainer: TrainerView,
 }
 
-fn local_setup_view(m: &train::local::LocalManager) -> LocalSetupView {
+/// Where the trainer stands, for the setup panel.
+#[derive(Debug, Serialize)]
+struct TrainerView {
+    /// `managed` (SlopTweak's own setup), `existing` (a folder from an
+    /// earlier version) or `none` (not set up yet).
+    source: &'static str,
+    /// The folder SlopTweak sets the trainer up in.
+    root: String,
+    download_gb: f64,
+    disk_gb: f64,
+    /// Free space on the drive holding `root`.
+    free_gb: Option<f64>,
+    drive: String,
+    /// Why setup can't start there (not enough room), if so.
+    space_problem: Option<String>,
+}
+
+fn local_setup_view(
+    m: &train::local::LocalManager,
+    installer: &train::trainer_setup::TrainerInstaller,
+) -> LocalSetupView {
     let setup = m.setup();
     let gpu = m.gpu();
+    let space = installer.space();
     LocalSetupView {
         problems: setup.problems(),
         gpu_problem: gpu.as_ref().and_then(train::local::gpu_problem),
-        trainer_dir: setup.trainer_dir,
         base_model: setup.base_model,
         gpu,
+        trainer: TrainerView {
+            source: m.trainer_source(),
+            root: installer.layout().root.display().to_string(),
+            download_gb: train::trainer_setup::DOWNLOAD_GB,
+            disk_gb: train::trainer_setup::DISK_GB,
+            free_gb: space.free_gb,
+            drive: space.drive,
+            space_problem: space.problem,
+        },
     }
 }
 
 #[tauri::command]
 async fn train_local_setup(st: State<'_, AppState>) -> Result<LocalSetupView, String> {
-    let m = st.local_train.clone();
-    tokio::task::spawn_blocking(move || local_setup_view(&m))
+    let (m, t) = (st.local_train.clone(), st.trainer_setup.clone());
+    tokio::task::spawn_blocking(move || local_setup_view(&m, &t))
         .await
         .map_err(|e| e.to_string())
 }
 
+/// Remember a checkpoint path the user typed or pasted.
 #[tauri::command]
-async fn train_local_set_setup(
+async fn train_local_set_model(
     st: State<'_, AppState>,
-    trainer_dir: String,
     base_model: String,
 ) -> Result<LocalSetupView, String> {
-    let m = st.local_train.clone();
+    let (m, t) = (st.local_train.clone(), st.trainer_setup.clone());
     tokio::task::spawn_blocking(move || {
-        m.set_setup(&train::local::LocalSetup {
-            trainer_dir,
-            base_model,
-        })?;
-        Ok(local_setup_view(&m))
+        m.set_base_model(&base_model)?;
+        Ok(local_setup_view(&m, &t))
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Let the user pick the SDXL checkpoint in the system file dialog.
+/// `None` when they close it without choosing.
+#[tauri::command]
+async fn train_local_pick_model(
+    app: AppHandle,
+    st: State<'_, AppState>,
+) -> Result<Option<LocalSetupView>, String> {
+    // Debug builds only: the UI check can't drive a native file dialog.
+    #[cfg(debug_assertions)]
+    let dev = std::env::var("SLOPTWEAK_DEV_PICK_MODEL")
+        .ok()
+        .map(PathBuf::from);
+    #[cfg(not(debug_assertions))]
+    let dev: Option<PathBuf> = None;
+    let path = match dev {
+        Some(p) => p,
+        None => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            app.dialog()
+                .file()
+                .set_title("Choose your SDXL checkpoint")
+                .add_filter("Checkpoint (.safetensors)", &["safetensors"])
+                .pick_file(move |p| {
+                    let _ = tx.send(p);
+                });
+            let Some(p) = rx
+                .await
+                .map_err(|e| e.to_string())?
+                .and_then(|p| p.into_path().ok())
+            else {
+                return Ok(None);
+            };
+            p
+        }
+    };
+    let (m, t) = (st.local_train.clone(), st.trainer_setup.clone());
+    tokio::task::spawn_blocking(move || {
+        m.set_base_model(&path.to_string_lossy())?;
+        Ok(Some(local_setup_view(&m, &t)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Let the user choose which folder the trainer is set up in. SlopTweak makes
+/// a `SlopTweak-trainer` folder of its own inside it. `None` when the dialog
+/// is closed without a choice.
+#[tauri::command]
+async fn train_local_pick_trainer_dir(
+    app: AppHandle,
+    st: State<'_, AppState>,
+) -> Result<Option<LocalSetupView>, String> {
+    if st.trainer_setup.is_running() {
+        return Err("Wait for the trainer setup to finish, or cancel it, first.".into());
+    }
+    // Debug builds only: the UI check can't drive a native folder dialog.
+    #[cfg(debug_assertions)]
+    let dev = std::env::var("SLOPTWEAK_DEV_PICK_TRAINER_DIR")
+        .ok()
+        .map(PathBuf::from);
+    #[cfg(not(debug_assertions))]
+    let dev: Option<PathBuf> = None;
+    let picked = match dev {
+        Some(p) => p,
+        None => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            app.dialog()
+                .file()
+                .set_title("Choose where SlopTweak keeps its trainer (about 5 GB)")
+                .pick_folder(move |p| {
+                    let _ = tx.send(p);
+                });
+            let Some(p) = rx
+                .await
+                .map_err(|e| e.to_string())?
+                .and_then(|p| p.into_path().ok())
+            else {
+                return Ok(None);
+            };
+            p
+        }
+    };
+    let (m, t) = (st.local_train.clone(), st.trainer_setup.clone());
+    tokio::task::spawn_blocking(move || {
+        m.set_trainer_root(&picked)?;
+        Ok(Some(local_setup_view(&m, &t)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Set the trainer up (download, install); progress is in the status.
+#[tauri::command]
+async fn train_local_install(st: State<'_, AppState>) -> Result<(), String> {
+    if st.local_train.is_running() {
+        return Err("Wait for the training run to finish first.".into());
+    }
+    st.trainer_setup.start()
+}
+
+#[tauri::command]
+async fn train_local_install_status(
+    st: State<'_, AppState>,
+) -> Result<train::trainer_setup::InstallStatus, String> {
+    Ok(st.trainer_setup.status())
+}
+
+#[tauri::command]
+async fn train_local_install_cancel(st: State<'_, AppState>) -> Result<(), String> {
+    st.trainer_setup.cancel();
+    Ok(())
+}
+
+/// Forget a finished setup (done or failed) so the panel returns to its start.
+#[tauri::command]
+async fn train_local_install_dismiss(st: State<'_, AppState>) -> Result<(), String> {
+    st.trainer_setup.dismiss();
+    Ok(())
 }
 
 /// The checkpoints of the newest local run, oldest first.
@@ -2070,10 +2218,34 @@ pub fn run() {
                     .join("SlopTweak"),
                 Mode::Mock => data_dir.join("output"),
             };
+            // One folder holds the whole trainer, so it can be moved or deleted
+            // as a unit. The user can choose where (Train tab); until then it is
+            // under the app's data folder. Read on every use, so a change counts
+            // at once.
+            let trainer_layout: Arc<dyn Fn() -> train::trainer_setup::Layout + Send + Sync> = {
+                let (config, default) = (config_dir.clone(), data_dir.join("local-trainer"));
+                Arc::new(move || {
+                    train::trainer_setup::Layout::new(train::local::trainer_root(
+                        &config,
+                        &default,
+                        std::env::var_os("SLOPTWEAK_LOCAL_TRAINER_ROOT").map(PathBuf::from),
+                    ))
+                })
+            };
+            let trainer_setup =
+                train::trainer_setup::TrainerInstaller::new(train::trainer_setup::InstallDeps {
+                    layout: trainer_layout.clone(),
+                    free_bytes: Arc::new(train::trainer_setup::free_space),
+                    pins: train::trainer_setup::Pins::current(),
+                    fetch: Arc::new(train::trainer_setup::HttpFetch),
+                    exec: Arc::new(train::local::ProcessExec),
+                    clock: Arc::new(now_unix),
+                });
             let local_train = {
                 let (config, default) = (config_dir.clone(), default_output_dir.clone());
                 train::local::LocalManager::new(train::local::LocalDeps {
                     config_dir: config_dir.clone(),
+                    trainer_layout,
                     results_root: Arc::new(move || output_dir(&config, &default).join("LoRAs")),
                     cache_dir: data_dir.join("local-train-cache"),
                     exec: Arc::new(train::local::ProcessExec),
@@ -2084,6 +2256,7 @@ pub fn run() {
             app.manage(AppState {
                 train: Mutex::new(None),
                 local_train,
+                trainer_setup,
                 mode,
                 secrets,
                 catalog: Mutex::new(catalog::load_local(&data_dir)),
@@ -2203,7 +2376,13 @@ pub fn run() {
             train_start,
             train_status,
             train_local_setup,
-            train_local_set_setup,
+            train_local_set_model,
+            train_local_pick_model,
+            train_local_pick_trainer_dir,
+            train_local_install,
+            train_local_install_status,
+            train_local_install_cancel,
+            train_local_install_dismiss,
             train_local_start,
             train_local_checkpoints,
             train_local_continue,
