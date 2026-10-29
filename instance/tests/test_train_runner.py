@@ -200,9 +200,7 @@ def test_a_quick_job_tests_only_the_final_checkpoint(rig: Rig) -> None:
 
 
 def test_a_job_without_evaluation_makes_no_test_images(rig: Rig) -> None:
-    rig.job.update(
-        eval_enabled=False, eval_checkpoints=[], eval_images_per_run=0, eval_prompts=""
-    )
+    rig.job.update(eval_enabled=False, eval_checkpoints=[], eval_images_per_run=0, eval_prompts="")
     rig.write_job()
     rig.runner.execute()
     assert read_state(rig)["stage"] == "done"
