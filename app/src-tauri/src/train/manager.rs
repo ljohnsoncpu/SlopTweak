@@ -274,6 +274,8 @@ pub struct Status {
     pub host_note: Option<String>,
     /// Where the failure report was saved.
     pub diagnostics_path: Option<String>,
+    /// Trained on this PC's own GPU: nothing rented, so no price or limits.
+    pub local: bool,
 }
 
 impl Status {
@@ -306,6 +308,7 @@ impl Status {
             container_log_note: None,
             host_note: None,
             diagnostics_path: None,
+            local: false,
         }
     }
 }

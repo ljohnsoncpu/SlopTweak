@@ -18,13 +18,27 @@
       const mossPlan = { images: 21, total_steps: 800, warmup_steps: 100, checkpoint_steps: [200, 400, 600, 800], eval_images: 0 };
       const plan = { images: 23, total_steps: 920, warmup_steps: 46, checkpoint_steps: [230, 460, 690, 920], eval_images: 312 };
       const rows = Array.from({ length: 23 }, (_, i) => ({ id: `thalia_miletus_${i}`, width: 1033, height: 1522, first_tag: "thalia_miletus", tags: 17 }));
+      let localSetup = { trainer_dir: "D:/ai/sd-scripts", base_model: "D:/ai/sdxl-models/bananaSplitzXXL_121.safetensors", problems: [], gpu: { name: "NVIDIA GeForce RTX 4080 Laptop GPU", total_mib: 12282, used_mib: 450 }, gpu_problem: null };
       const stub = {
         train_defaults: () => ({ settings: { output_name: "lora", rank: 16, alpha: 16, learning_rate: 0.0001, epochs: 40, repeats: 1, warmup_fraction: 0.05, resolution: 1024, save_points: 4, seed: 1, keep_tokens: 1, eval_strengths: [0.5, 0.75, 1], eval_seeds: [1, 2], eval_preset: "quick" }, prompts: [] }),
         train_moss_defaults: () => ({ output_name: "lora", rank: 32, alpha: 32, steps: 800, save_every: 200, caption_mode: "mix", p_nl: 0.5, tag_dropout: 0.1, int8_compute: true, seed: 1, sample_prompt: "" }),
         train_moss_audit: ({ settings }) => ({ images: 21, error: null, settings_error: null, trigger: "roka_soldier", plan: mossPlan }),
-        train_pick_dataset: () => "C:/Users/user/Documents/datasets/thalia_miletus",
+        train_pick_dataset: () => "C:/Users/user/Documents/Codex/2026-10-26/use-the-charset-skill-to-create-2/outputs/thales/dataset/v1",
         train_audit: () => ({ report: { images: rows, issues: [{ severity: "warning", message: "thalia_miletus_9.png is 400x600; the short side is under 512 and will be upscaled." }], buckets: { "832x1216": 23 } }, plan, settings_error: null }),
         train_quote: ({ args }) => (kind = args.trainer) === "kromoss" ? ({ plan_id: "abc", trainer: "kromoss", gpu_name: "RTX 4090", gpu_location: "Spain, ES", hourly: 0.486, max_minutes: 120, max_usd: 1.5, worst_usd: 0.97, expected_minutes: 52, plan: mossPlan, expires_unix: 0 }) : ({ plan_id: "abc", trainer: "sdxl", gpu_name: "RTX 3090", gpu_location: "Spain, ES", hourly: 0.3605, max_minutes: 120, max_usd: 1.5, worst_usd: 0.72, expected_minutes: 38, plan, expires_unix: 0 }),
+        train_local_setup: () => localSetup,
+        train_local_set_setup: ({ trainerDir, baseModel }) => (localSetup = { ...localSetup, trainer_dir: trainerDir, base_model: baseModel, problems: trainerDir && baseModel ? [] : ["Set the folder where kohya sd-scripts is installed."] }),
+        train_local_start: () => { t0 = Date.now(); cancelled = false; kind = "local"; },
+        train_local_checkpoints: () => [240, 480, 720, 960].map((step) => ({ file: `thalia-step${String(step).padStart(8, "0")}.safetensors`, step })),
+        train_local_continue: () => { t0 = Date.now(); cancelled = false; kind = "local"; },
+        train_local_sample: async ({ request }) => {
+          await new Promise((r) => setTimeout(r, 1200));
+          if (request.prompt.includes("fail")) throw new Error("The sampler exited with code 1. ValueError: stub failure");
+          const hue = request.seed % 360;
+          const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="416" height="608"><rect width="100%" height="100%" fill="hsl(${hue},45%,35%)"/><text x="20" y="40" fill="white" font-size="22">${request.shape} ${request.checkpoint || "base"}</text></svg>`;
+          return { path: "C:/Users/user/Pictures/SlopTweak/LoRAs/thalia-1/samples/1-0/00001.png", data_url: "data:image/svg+xml;base64," + btoa(svg) };
+        },
+        train_local_sample_cancel: () => {},
         train_start: () => { t0 = Date.now(); cancelled = false; },
         train_cancel: () => { cancelled = true; },
         train_dismiss: () => { t0 = null; },
@@ -32,6 +46,13 @@
         train_status: () => {
           if (t0 === null) return { state: "idle", message: "" };
           const s = (Date.now() - t0) / 1000;
+          if (kind === "local") {
+            const local = { local: true, gpu_name: "NVIDIA GeForce RTX 4080 Laptop GPU", hourly: null, elapsed_secs: Math.floor(Math.min(s, 20)), max_minutes: null, spent_usd: null, max_usd: null, instance_id: null, results_dir: "C:/Users/user/Pictures/SlopTweak/LoRAs/thalia-1", total_steps: 920, step: 0, eval_done: null, eval_total: null, synced: true, outcome: null, error: null, destroyed: true, stages: [], host_status: [], container_log: null, container_log_note: null, host_note: null, diagnostics_path: null };
+            if (cancelled) return { ...local, state: "finished", message: "Stopped. Checkpoints saved before you stopped are in the results folder.", outcome: "cancelled", step: Math.floor(s * 40) };
+            if (s < 4) return { ...local, state: "running", message: "Starting: loading the model and caching your images. This can take a minute." };
+            if (s < 20) return { ...local, state: "running", message: "Training on this PC: step " + Math.floor((s - 4) * 57) + " of 920.", step: Math.floor((s - 4) * 57) };
+            return { ...local, state: "finished", message: "Done. The LoRA checkpoints are in the results folder.", outcome: "completed", step: 920 };
+          }
           const base = { gpu_name: "RTX 3090", hourly: 0.3605, elapsed_secs: Math.floor(s), max_minutes: 120, spent_usd: 0.3605 * s / 3600, max_usd: 1.5, instance_id: 57743540, results_dir: "C:/Users/user/Pictures/SlopTweak/LoRAs/thalia-1", total_steps: kind === "kromoss" ? 800 : 920, step: null, eval_done: null, eval_total: kind === "kromoss" ? 0 : 312, synced: false, outcome: null, error: null, destroyed: false, stages: [], host_status: [], container_log: null, container_log_note: null, host_note: null, diagnostics_path: null };
           const stages = (names) => names.map(([name, at], i) => ({ name, started_secs: at, secs: Math.floor((names[i + 1]?.[1] ?? s) - at), current: i === names.length - 1 }));
           const live = { stages: stages([["Renting the GPU", 0], ["Vast is pulling the image and starting the machine", 3], ["Installing the training environment", 6]].filter((x) => x[1] <= s)), host_status: ["+0m03s  abc123: Downloading", "+0m05s  abc123: Pull complete"], container_log: "starting sidecar\nonstart: ok\nuv pip sync: resolving", container_log_note: "Machine log, refreshed 4s ago (about every 15 s while the GPU exists)" };
