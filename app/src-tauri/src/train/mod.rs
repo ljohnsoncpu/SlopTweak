@@ -15,3 +15,4 @@ pub mod recent;
 pub mod run;
 pub mod settings;
 pub mod sim;
+pub mod trainer_setup;

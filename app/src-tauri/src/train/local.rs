@@ -23,6 +23,7 @@ use super::manager::Status;
 use super::settings::{
     render_dataset_toml, render_train_toml, TrainPaths, TrainSettings, EVAL_NEGATIVE,
 };
+use super::trainer_setup::{check_root_usable, ready_trainer_dir, Layout, ROOT_NAME};
 
 /// Peak use measured on an RTX 4080 Laptop was 7.8 GB of the whole GPU; leave
 /// room for the desktop and a little headroom.
@@ -34,7 +35,12 @@ const LOG_TAIL_BYTES: u64 = 16 * 1024;
 
 // ----- setup -------------------------------------------------------------------
 
-/// Where the user's trainer and base checkpoint live.
+/// The trainer and base checkpoint a run uses.
+///
+/// The trainer is normally the one SlopTweak sets up itself (see
+/// `trainer_setup`); `trainer_dir` is only filled in for a folder an earlier
+/// version asked the user to point at, which is still used when SlopTweak has
+/// no setup of its own.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LocalSetup {
@@ -42,6 +48,8 @@ pub struct LocalSetup {
     pub trainer_dir: String,
     /// An SDXL-family `.safetensors` checkpoint.
     pub base_model: String,
+    /// Where SlopTweak sets up its own trainer; empty = the default place.
+    pub trainer_root: String,
 }
 
 impl LocalSetup {
@@ -61,6 +69,14 @@ impl LocalSetup {
         fs::rename(&tmp, &path).map_err(|e| format!("Couldn't save the local setup: {e}"))
     }
 
+    /// Use SlopTweak's own trainer when its setup is finished.
+    pub fn resolved(mut self, managed: &Layout) -> Self {
+        if let Some(dir) = ready_trainer_dir(managed) {
+            self.trainer_dir = dir.to_string_lossy().into_owned();
+        }
+        self
+    }
+
     pub fn python(&self) -> PathBuf {
         let venv = Path::new(&self.trainer_dir).join(".venv");
         if cfg!(windows) {
@@ -77,26 +93,28 @@ impl LocalSetup {
     /// What is missing, in plain words; empty means ready.
     pub fn problems(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if self.trainer_dir.trim().is_empty() {
-            out.push("Set the folder where kohya sd-scripts is installed.".to_string());
-        } else if !self.script().is_file() {
-            out.push(format!(
-                "{} has no sdxl_train_network.py; is this the sd-scripts folder?",
-                self.trainer_dir
-            ));
-        } else if !self.python().is_file() {
-            out.push(format!(
-                "No Python environment at {}. Create the trainer's .venv first.",
-                self.python().display()
-            ));
+        if !self.script().is_file() || !self.python().is_file() {
+            out.push("The trainer isn't set up yet. Press \"Set up trainer\" first.".to_string());
         }
         if self.base_model.trim().is_empty() {
-            out.push("Set the SDXL checkpoint file to train on.".to_string());
+            out.push("Choose the SDXL checkpoint file to train on.".to_string());
         } else if !Path::new(&self.base_model).is_file() {
             out.push(format!("The checkpoint {} doesn't exist.", self.base_model));
         }
         out
     }
+}
+
+/// Where SlopTweak sets up its trainer: the environment override
+/// (`SLOPTWEAK_LOCAL_TRAINER_ROOT`, for development), else the folder the
+/// user chose, else `default`.
+pub fn trainer_root(config_dir: &Path, default: &Path, env: Option<PathBuf>) -> PathBuf {
+    env.filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            let chosen = LocalSetup::load(config_dir).trainer_root;
+            (!chosen.trim().is_empty()).then(|| PathBuf::from(chosen))
+        })
+        .unwrap_or_else(|| default.to_path_buf())
 }
 
 // ----- GPU ---------------------------------------------------------------------
@@ -411,6 +429,8 @@ fn failure_text(log: &str) -> String {
 pub struct LocalDeps {
     /// Where `local-train.json` lives.
     pub config_dir: PathBuf,
+    /// Where SlopTweak sets up its own trainer.
+    pub trainer_layout: Arc<dyn Fn() -> Layout + Send + Sync>,
     /// Finished runs land in `<results_root>/<name>-<timestamp>/`.
     pub results_root: Arc<dyn Fn() -> PathBuf + Send + Sync>,
     /// Tokenizers and the Hugging Face cache, kept between runs.
@@ -480,14 +500,44 @@ impl LocalManager {
         })
     }
 
+    /// The trainer and checkpoint a run would use now.
     pub fn setup(&self) -> LocalSetup {
-        LocalSetup::load(&self.deps.config_dir)
+        LocalSetup::load(&self.deps.config_dir).resolved(&(self.deps.trainer_layout)())
     }
 
-    pub fn set_setup(&self, setup: &LocalSetup) -> Result<(), String> {
+    /// Where the trainer comes from: `managed` (SlopTweak's own setup),
+    /// `existing` (a folder from an earlier version) or `none`.
+    pub fn trainer_source(&self) -> &'static str {
+        if ready_trainer_dir(&(self.deps.trainer_layout)()).is_some() {
+            return "managed";
+        }
+        let old = LocalSetup::load(&self.deps.config_dir);
+        if old.script().is_file() && old.python().is_file() {
+            "existing"
+        } else {
+            "none"
+        }
+    }
+
+    /// Set the trainer up inside `picked` (in a `SlopTweak-trainer` folder of
+    /// its own). Nothing is moved: an earlier setup stays where it was.
+    pub fn set_trainer_root(&self, picked: &Path) -> Result<(), String> {
+        if !picked.is_dir() {
+            return Err(format!("{} isn't a folder.", picked.display()));
+        }
+        let root = picked.join(ROOT_NAME);
+        check_root_usable(&root)?;
         LocalSetup {
-            trainer_dir: setup.trainer_dir.trim().to_string(),
-            base_model: setup.base_model.trim().to_string(),
+            trainer_root: root.to_string_lossy().into_owned(),
+            ..LocalSetup::load(&self.deps.config_dir)
+        }
+        .save(&self.deps.config_dir)
+    }
+
+    pub fn set_base_model(&self, path: &str) -> Result<(), String> {
+        LocalSetup {
+            base_model: path.trim().to_string(),
+            ..LocalSetup::load(&self.deps.config_dir)
         }
         .save(&self.deps.config_dir)
     }
@@ -1048,12 +1098,63 @@ mod tests {
         let setup = LocalSetup {
             trainer_dir: root.join("sd-scripts").to_string_lossy().into_owned(),
             base_model: root.join("base.safetensors").to_string_lossy().into_owned(),
+            ..Default::default()
         };
         fs::create_dir_all(setup.python().parent().unwrap()).unwrap();
         fs::write(setup.python(), "").unwrap();
         fs::write(setup.script(), "").unwrap();
         fs::write(&setup.base_model, "").unwrap();
         setup
+    }
+
+    fn managed_layout(root: &Path) -> Arc<dyn Fn() -> Layout + Send + Sync> {
+        let managed = root.join("managed");
+        Arc::new(move || Layout::new(managed.clone()))
+    }
+
+    #[test]
+    fn the_trainer_location_comes_from_the_override_then_the_choice_then_the_default() {
+        let d = tempfile::tempdir().unwrap();
+        let default = d.path().join("default");
+        assert_eq!(trainer_root(d.path(), &default, None), default);
+        let rig = rig(Behaviour::Succeed, 11_000);
+        let picked = rig.root.path().join("drive");
+        fs::create_dir(&picked).unwrap();
+        rig.manager.set_trainer_root(&picked).unwrap();
+        let chosen = picked.join(ROOT_NAME);
+        assert_eq!(trainer_root(rig.root.path(), &default, None), chosen);
+        let dev = PathBuf::from("elsewhere");
+        assert_eq!(
+            trainer_root(rig.root.path(), &default, Some(dev.clone())),
+            dev
+        );
+        // The checkpoint and the old trainer folder are kept when the place changes.
+        rig.manager.set_base_model("m.safetensors").unwrap();
+        let saved = LocalSetup::load(rig.root.path());
+        assert_eq!(saved.trainer_root, chosen.to_string_lossy());
+        assert_eq!(saved.base_model, "m.safetensors");
+        assert!(saved.trainer_dir.contains("sd-scripts"));
+    }
+
+    #[test]
+    fn a_trainer_folder_never_lands_in_a_folder_that_holds_other_things() {
+        let rig = rig(Behaviour::Succeed, 11_000);
+        let picked = rig.root.path().join("ai");
+        fs::create_dir_all(picked.join(ROOT_NAME)).unwrap();
+        fs::write(picked.join(ROOT_NAME).join("notes.txt"), "mine").unwrap();
+        let err = rig.manager.set_trainer_root(&picked).unwrap_err();
+        assert!(
+            err.contains("notes.txt") && err.contains("different folder"),
+            "{err}"
+        );
+        assert!(rig
+            .manager
+            .set_trainer_root(&picked.join("missing"))
+            .is_err());
+        // Its own leftovers are fine.
+        fs::remove_file(picked.join(ROOT_NAME).join("notes.txt")).unwrap();
+        fs::create_dir(picked.join(ROOT_NAME).join("cache")).unwrap();
+        rig.manager.set_trainer_root(&picked).unwrap();
     }
 
     fn quick() -> TrainSettings {
@@ -1077,7 +1178,11 @@ mod tests {
             trainer_dir: d.path().to_string_lossy().into_owned(),
             ..setup
         };
-        assert!(wrong.problems()[0].contains("sdxl_train_network.py"));
+        assert!(
+            wrong.problems()[0].contains("set up"),
+            "{:?}",
+            wrong.problems()
+        );
     }
 
     #[test]
@@ -1249,6 +1354,7 @@ mod tests {
         let manager = LocalManager::new(LocalDeps {
             config_dir: root.path().to_path_buf(),
             results_root: Arc::new(move || results.clone()),
+            trainer_layout: managed_layout(root.path()),
             cache_dir: root.path().join("cache"),
             exec: Arc::new(Fake(behaviour)),
             gpu: Arc::new(move || {
@@ -1346,9 +1452,14 @@ mod tests {
         assert_eq!(r.manager.status().state, "idle");
 
         let r = rig(Behaviour::Succeed, 11_000);
-        r.manager.set_setup(&LocalSetup::default()).unwrap();
+        r.manager.set_base_model("").unwrap();
         let err = r.manager.start(r.src.path(), &quick()).unwrap_err();
-        assert!(err.contains("sd-scripts"), "{err}");
+        assert!(err.contains("Choose the SDXL checkpoint"), "{err}");
+
+        LocalSetup::default().save(r.root.path()).unwrap();
+        let err = r.manager.start(r.src.path(), &quick()).unwrap_err();
+        assert!(err.contains("set up"), "{err}");
+        assert_eq!(r.manager.trainer_source(), "none");
     }
 
     #[test]
@@ -1507,6 +1618,7 @@ mod tests {
         LocalSetup {
             trainer_dir: env("SLOPTWEAK_LOCAL_TRAINER_DIR"),
             base_model: env("SLOPTWEAK_LOCAL_BASE_MODEL"),
+            ..Default::default()
         }
         .save(root.path())
         .unwrap();
@@ -1514,6 +1626,7 @@ mod tests {
         let manager = LocalManager::new(LocalDeps {
             config_dir: root.path().to_path_buf(),
             results_root: Arc::new(move || results.clone()),
+            trainer_layout: managed_layout(root.path()),
             cache_dir: PathBuf::from(env("SLOPTWEAK_LOCAL_CACHE")),
             exec: Arc::new(ProcessExec),
             gpu: Arc::new(query_gpu),

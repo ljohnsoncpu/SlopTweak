@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-train-local-install-dismiss"
+description = "Enables the train_local_install_dismiss command without any pre-configured scope."
+commands.allow = ["train_local_install_dismiss"]
+
+[[permission]]
+identifier = "deny-train-local-install-dismiss"
+description = "Denies the train_local_install_dismiss command without any pre-configured scope."
+commands.deny = ["train_local_install_dismiss"]

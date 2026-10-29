@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-train-local-pick-trainer-dir"
+description = "Enables the train_local_pick_trainer_dir command without any pre-configured scope."
+commands.allow = ["train_local_pick_trainer_dir"]
+
+[[permission]]
+identifier = "deny-train-local-pick-trainer-dir"
+description = "Denies the train_local_pick_trainer_dir command without any pre-configured scope."
+commands.deny = ["train_local_pick_trainer_dir"]
