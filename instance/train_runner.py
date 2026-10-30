@@ -196,6 +196,8 @@ class Job:
     train_toml: str
     dataset_toml: str
     eval_prompts: str
+    # False: train and save checkpoints only, make no test images.
+    eval_enabled: bool = True
 
     @classmethod
     def parse(cls, text: str, models_dir: Path) -> Job:
@@ -216,13 +218,19 @@ class Job:
                 checkpoint_steps=tuple(int(s) for s in raw["checkpoint_steps"]),
                 # Older jobs tested every checkpoint.
                 eval_checkpoint_steps=tuple(
-                    int(s) for s in (raw.get("eval_checkpoints") or raw["checkpoint_steps"])
+                    int(s)
+                    for s in (
+                        []
+                        if raw.get("eval_enabled", True) is False
+                        else raw.get("eval_checkpoints") or raw["checkpoint_steps"]
+                    )
                 ),
                 eval_strengths=tuple(float(s) for s in raw["eval_strengths"]),
                 eval_images_per_run=int(raw["eval_images_per_run"]),
                 train_toml=str(raw["train_toml"]),
                 dataset_toml=str(raw["dataset_toml"]),
                 eval_prompts=str(raw["eval_prompts"]),
+                eval_enabled=raw.get("eval_enabled", True) is not False,
             )
         except (KeyError, TypeError, ValueError, AssertionError) as e:
             raise RunError(f"job.json is not valid: {e!r}") from e
@@ -253,10 +261,12 @@ class Job:
             raise RunError("job.json: the last checkpoint must be the final step")
         if not set(self.eval_checkpoint_steps) <= set(self.checkpoint_steps):
             raise RunError("job.json: evaluation checkpoints must be saved checkpoints")
-        if not self.eval_strengths or self.eval_images_per_run < 1:
+        if self.eval_enabled and (not self.eval_strengths or self.eval_images_per_run < 1):
             raise RunError("job.json: bad evaluation settings")
 
     def expected_eval_images(self) -> int:
+        if not self.eval_enabled:
+            return 0
         runs = 1 + len(self.eval_checkpoint_steps) * len(self.eval_strengths)
         return runs * self.eval_images_per_run
 
@@ -549,6 +559,8 @@ class Runner:
     def evaluation_commands(self) -> list[tuple[str, list[str]]]:
         assert self.job is not None
         job = self.job
+        if not job.eval_enabled:
+            return []
         base = [
             str(self.p.python),
             str(self.p.trainer / "sdxl_gen_img.py"),

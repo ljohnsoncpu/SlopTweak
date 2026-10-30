@@ -1079,7 +1079,7 @@ mod tests {
         let hourly = 0.5420 + 0.2 * 80.0 / 720.0;
         assert!((q.hourly - hourly).abs() < 1e-9);
         assert!((q.worst_usd - hourly * 2.0).abs() < 1e-9);
-        assert_eq!(q.plan.total_steps, 400);
+        assert_eq!(q.plan.total_steps, 600);
         assert_eq!(q.plan.images, 10);
         assert!(q.expected_minutes >= SETUP_MINUTES);
         // Quoting rents nothing.

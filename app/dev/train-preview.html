@@ -25,7 +25,7 @@
       refresh();
       let installAt = null, installCancelled = false, installFail = false;
       const stub = {
-        train_defaults: () => ({ settings: { output_name: "lora", rank: 16, alpha: 16, learning_rate: 0.0001, epochs: 40, repeats: 1, warmup_fraction: 0.05, resolution: 1024, save_points: 4, seed: 1, keep_tokens: 1, eval_strengths: [0.5, 0.75, 1], eval_seeds: [1, 2], eval_preset: "quick" }, prompts: [] }),
+        train_defaults: () => ({ settings: { output_name: "lora", rank: 16, alpha: 16, learning_rate: 0.0001, epochs: 60, repeats: 1, warmup_fraction: 0.05, resolution: 1024, save_points: 1, seed: 1, keep_tokens: 1, eval_strengths: [0.5, 0.75, 1], eval_seeds: [1, 2], eval_preset: "quick" }, prompts: [] }),
         train_moss_defaults: () => ({ output_name: "lora", rank: 32, alpha: 32, steps: 800, save_every: 200, caption_mode: "mix", p_nl: 0.5, tag_dropout: 0.1, int8_compute: true, seed: 1, sample_prompt: "" }),
         train_moss_audit: ({ settings }) => ({ images: 21, error: null, settings_error: null, trigger: "roka_soldier", plan: mossPlan }),
         train_pick_dataset: () => "C:/Users/user/Documents/Codex/2026-10-26/use-the-charset-skill-to-create-2/outputs/thales/dataset/v1",

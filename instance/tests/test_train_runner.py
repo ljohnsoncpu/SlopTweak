@@ -199,6 +199,16 @@ def test_a_quick_job_tests_only_the_final_checkpoint(rig: Rig) -> None:
     assert rig.runner.job is not None and rig.runner.job.expected_eval_images() == 2 * PER_RUN
 
 
+def test_a_job_without_evaluation_makes_no_test_images(rig: Rig) -> None:
+    rig.job.update(eval_enabled=False, eval_checkpoints=[], eval_images_per_run=0, eval_prompts="")
+    rig.write_job()
+    rig.runner.execute()
+    assert read_state(rig)["stage"] == "done"
+    assert not [c for c in rig.commands if "sdxl_gen_img.py" in " ".join(c)]
+    assert not [p for p in manifest_paths(rig) if p.startswith("evaluation/")]
+    assert rig.runner.job is not None and rig.runner.job.expected_eval_images() == 0
+
+
 def test_evaluation_checkpoints_must_be_saved_ones(rig: Rig) -> None:
     raw = json.dumps({**rig.job, "eval_checkpoints": [3]})
     with pytest.raises(tr.RunError, match="saved checkpoints"):
