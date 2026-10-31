@@ -677,6 +677,54 @@
       "nsfw": true,
       "license_note": "Krea 2 Community License plus the SNOFS license (https://huggingface.co/Ashen3/SNOFS): free for personal use and for businesses under $1M/yr revenue. It asks you to take reasonable steps against generating prohibited or unlawful content.",
       "invoke_min_version": "6.14.1"
+    },
+    {
+      "id": "qwen-image-edit",
+      "name": "Qwen-Image 2.1 Edit",
+      "description": "Make new images of your own characters, or edit a picture, with as many reference pictures as you like. Add character sheets, photos or a picture to change, point at them as <image1>, <image2>... in your words, and Qwen-Image 2.1 keeps their look. Runs in SlopTweak's Identity Edit panel, not Invoke. A 17 GB download (ready in about 5-10 minutes) and a 24 GB GPU, about $0.30/hr. Research license: read the note below.",
+      "good_for": "Your own characters, any number of references",
+      "price_tier": 2,
+      "backend": "comfyui",
+      "base": "qwen-image",
+      "source": {
+        "huggingface_repo": "Comfy-Org/Qwen-Image-2.1",
+        "revision": "aacf31a6d48e707f352ecba714cee0680da3479b",
+        "page": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1"
+      },
+      "files": [
+        {
+          "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/aacf31a6d48e707f352ecba714cee0680da3479b/diffusion_models/qwen_image_2.1_int8_convrot.safetensors",
+          "filename": "qwen_image_2.1_int8_convrot.safetensors",
+          "sha256": "CB74113CB03FAECD79611B01FD7FD642F0AA60D6F0B95086ABEE214D75EAA57D",
+          "size_bytes": 7256783064,
+          "kind": "main",
+          "requires_civitai_token": false,
+          "dest": "diffusion_models"
+        },
+        {
+          "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/aacf31a6d48e707f352ecba714cee0680da3479b/text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+          "filename": "qwen3vl_8b_int8_convrot.safetensors",
+          "sha256": "8BFD0F6E12ABF2D2D697ECC888E5E90B0D6741D6708F05799F53AFA560452E8F",
+          "size_bytes": 9350798360,
+          "kind": "text_encoder",
+          "requires_civitai_token": false,
+          "dest": "text_encoders"
+        },
+        {
+          "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/aacf31a6d48e707f352ecba714cee0680da3479b/vae/qwen_image_2.1_vae_bf16.safetensors",
+          "filename": "qwen_image_2.1_vae_bf16.safetensors",
+          "sha256": "BB21F7473051E1AC368515DD3F2E15CD44D7A11748EE8823E1DDCA3E4876B7C9",
+          "size_bytes": 675509688,
+          "kind": "vae",
+          "requires_civitai_token": false,
+          "dest": "vae"
+        }
+      ],
+      "min_vram_gb": 24,
+      "min_compute_cap": 800,
+      "min_ram_gb": 32,
+      "nsfw": false,
+      "license_note": "Qwen Research License (Qwen/Qwen-Image-2.1): as summarized from its text, use is limited to research or evaluation, and commercial use needs a separate license from Qwen. Read it yourself before relying on this model: https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE"
     }
   ]
 }

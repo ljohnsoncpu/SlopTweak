@@ -18,7 +18,7 @@ interface TrainSettings {
   keep_tokens: number;
   eval_strengths: number[];
   eval_seeds: number[];
-  eval_preset: "quick" | "thorough";
+  eval_preset: "none" | "quick" | "thorough";
 }
 
 interface MossSettings {
@@ -198,7 +198,7 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
   let settings: TrainSettings | null = null;
   let moss: MossSettings | null = null;
   let mossAudit: MossAudit | null = null;
-  let trainer: TrainerKind = "sdxl";
+  let trainer: TrainerKind = "local";
   let localSetup: LocalSetup | null = null;
   let install: InstallStatus | null = null;
   // After a local run: keep training it, or try a prompt on its checkpoints.
@@ -224,6 +224,8 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
   let timer: number | undefined;
   // The machine log is rebuilt on every poll: remember how the user left it.
   let logOpen = true;
+  // Changing a setting re-renders the page: keep the settings panel open.
+  let settingsOpen = false;
   let logScroll = 0;
   let logStick = true;
 
@@ -237,6 +239,11 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
     moss = await invoke<MossSettings>("train_moss_defaults");
     status = await invoke<Status>("train_status");
     render();
+    // Free GPU memory changes between visits: look again every time.
+    if (trainer === "local") {
+      void loadLocalSetup();
+      void pollInstall();
+    }
   }
 
   async function act(p: Promise<unknown>): Promise<void> {
@@ -551,9 +558,14 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
     return out;
   }
 
+  function settingsPanel(): HTMLDetailsElement {
+    const d = h("details", { open: settingsOpen }, h("summary", {}, "Training settings"));
+    d.addEventListener("toggle", () => (settingsOpen = d.open));
+    return d;
+  }
+
   function renderMossSettings(m: MossSettings): Node {
-    const d = h("details", {});
-    d.append(h("summary", {}, "Training settings"));
+    const d = settingsPanel();
     const form = h("div", { class: "form" });
     const name = h("input", { type: "text", maxlength: "48" });
     name.value = m.output_name;
@@ -617,8 +629,7 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
   }
 
   function renderSettings(s: TrainSettings): Node {
-    const d = h("details", {});
-    d.append(h("summary", {}, "Training settings"));
+    const d = settingsPanel();
     const form = h("div", { class: "form" });
     const name = h("input", { type: "text", maxlength: "48" });
     name.value = s.output_name;
@@ -628,6 +639,7 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
     });
     const preset = h("select", {});
     for (const [value, label] of [
+      ["none", "None (sample after the run)"],
       ["quick", "Quick (about 12 images)"],
       ["thorough", "Thorough (every checkpoint and strength)"],
     ]) {
@@ -636,7 +648,7 @@ export function mountTrain(root: HTMLElement): { show: () => void; hide: () => v
       preset.append(o);
     }
     preset.addEventListener("change", () => {
-      s.eval_preset = preset.value === "thorough" ? "thorough" : "quick";
+      s.eval_preset = preset.value === "thorough" ? "thorough" : preset.value === "none" ? "none" : "quick";
       quote = null;
       if (dir) void runAudit();
     });

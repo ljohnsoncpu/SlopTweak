@@ -66,9 +66,22 @@ pub enum Mode {
 }
 
 /// Slots 0 and 1 are character sheets (in Edit mode only slot 0 is used, as
-/// the optional reference); slot 2 is the picture to edit.
+/// the optional reference); slot 2 is the picture to edit. Slots 3 and up are
+/// extra references that only the Qwen family uses.
 pub const BASE_SLOT: usize = 2;
-const SLOTS: usize = 3;
+pub const FIRST_EXTRA_SLOT: usize = 3;
+const SLOTS: usize = 9;
+/// What the Qwen text encoder takes (its edit templates wire ten pictures).
+const QWEN_MAX_REFS: usize = 10;
+
+/// The slots a family reads, in the order its pictures are numbered. For
+/// Qwen that is also what the prompt's `<image1>`, `<image2>`... mean.
+fn reference_slots(family: Family) -> Vec<usize> {
+    match family {
+        Family::Krea => vec![0, 1],
+        Family::Qwen => [0, 1].into_iter().chain(FIRST_EXTRA_SLOT..SLOTS).collect(),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -89,13 +102,28 @@ impl Aspect {
     }
 }
 
+/// Which model family a ComfyUI entry belongs to: it decides the graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    /// Krea 2 with the Identity Edit LoRA and its node pack (one or two sheets).
+    Krea,
+    /// Qwen-Image 2.1: core ComfyUI nodes only, any number of references
+    /// (docs/spikes/qwen-image-2-1.md).
+    Qwen,
+}
+
+/// The catalog `base` of the Qwen-Image 2.1 entries.
+pub const QWEN_BASE: &str = "qwen-image";
+
 /// The ComfyUI file names the instance placed (the catalog's `filename`s).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelFiles {
+    pub family: Family,
     pub unet: String,
     pub clip: String,
     pub vae: String,
-    pub lora: String,
+    /// The Identity Edit LoRA (Krea only; Qwen has none).
+    pub lora: Option<String>,
 }
 
 impl ModelFiles {
@@ -107,11 +135,20 @@ impl ModelFiles {
                 .find(|f| f.kind == kind)
                 .map(|f| f.filename.clone())
         };
+        let family = if m.base == QWEN_BASE {
+            Family::Qwen
+        } else {
+            Family::Krea
+        };
         Some(Self {
+            family,
             unet: by("main")?,
             clip: by("text_encoder")?,
             vae: by("vae")?,
-            lora: by("lora")?,
+            lora: match family {
+                Family::Krea => Some(by("lora")?),
+                Family::Qwen => None,
+            },
         })
     }
 }
@@ -443,6 +480,130 @@ pub fn needs_shrink(bytes: &[u8]) -> bool {
     image_size(bytes).is_none_or(|(w, h)| u64::from(w) * u64::from(h) > SHRINK_ABOVE_PIXELS)
 }
 
+/// The picture a reference is encoded from: the whole picture, or the part
+/// the user chose; scaled down when it is huge (or up when the part is tiny).
+/// `load` is the node that loads reference `i`.
+fn prepared_pixels(
+    g: &mut Value,
+    load: &str,
+    i: usize,
+    shrink: &[bool],
+    focus: &[Option<Rect>],
+) -> Value {
+    let part = focus.get(i).copied().flatten();
+    let mut source = json!([load, 0]);
+    if let Some(c) = part {
+        let cut = format!("8{i}");
+        g[&cut] = crop_node(source, c);
+        source = json!([&cut, 0]);
+    }
+    let resize = match part {
+        Some(c) => {
+            let area = u64::from(c.w) * u64::from(c.h);
+            if area < FOCUS_MIN_PIXELS {
+                Some(("lanczos", FOCUS_ENLARGED_MEGAPIXELS))
+            } else if area > SHRINK_ABOVE_PIXELS {
+                Some(("area", SHRUNK_MEGAPIXELS))
+            } else {
+                None
+            }
+        }
+        None => shrink
+            .get(i)
+            .copied()
+            .unwrap_or(false)
+            .then_some(("area", SHRUNK_MEGAPIXELS)),
+    };
+    match resize {
+        Some((method, megapixels)) => {
+            let small = format!("7{i}");
+            g[&small] = json!({"class_type": "ImageScaleToTotalPixels", "inputs": {
+                    "image": source, "upscale_method": method,
+                    "megapixels": megapixels, "resolution_steps": 8}});
+            json!([&small, 0])
+        }
+        None => source,
+    }
+}
+
+/// Steps of the Qwen-Image 2.1 base model (its template's setting; CFG stays 1).
+const QWEN_STEPS: u32 = 25;
+
+/// The Qwen-Image 2.1 graph (docs/spikes/qwen-image-2-1.md): core ComfyUI
+/// nodes only. Each reference goes into the text encoder as `images.image_N`
+/// (it looks at the picture and also takes it as a latent), and the prompt
+/// points at them as `<image1>`, `<image2>`... The canvas is an empty latent of
+/// `size`; an edit scales its picture to that canvas first so the two line up.
+#[allow(clippy::too_many_arguments)]
+fn build_graph_qwen(
+    files: &ModelFiles,
+    refs: &[String],
+    prompt: &str,
+    size: (u32, u32),
+    seed: u64,
+    edit: Option<&EditGraph>,
+    shrink: &[bool],
+    focus: &[Option<Rect>],
+) -> Value {
+    let (w, h) = size;
+    let editing = edit.is_some();
+    let edit = edit.filter(|e| !e.is_plain());
+    let mut g = json!({
+        "1": {"class_type": "UNETLoader",
+              "inputs": {"unet_name": files.unet, "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader",
+              "inputs": {"clip_name": files.clip, "type": "qwen_image", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": files.vae}},
+        "6": {"class_type": "EmptyLatentImage",
+              "inputs": {"width": w, "height": h, "batch_size": 1}},
+    });
+    // Resolution 0: every reference keeps the size it is given here.
+    let mut enc = json!({
+        "clip": ["2", 0], "prompt": prompt, "negative_prompt": "",
+        "vae": ["3", 0], "resolution": 0,
+    });
+    for (i, name) in refs.iter().take(QWEN_MAX_REFS).enumerate() {
+        let load = format!("2{i}");
+        g[&load] = json!({"class_type": "LoadImage", "inputs": {"image": name}});
+        let pixels = if i == 0 && editing {
+            // The picture to edit, at the canvas's size ("40" is that picture
+            // when there is a painted area or less than full strength).
+            if edit.is_some() {
+                json!(["40", 0])
+            } else {
+                let source = prepared_pixels(&mut g, &load, i, shrink, focus);
+                g["45"] = json!({"class_type": "ImageScale", "inputs": {"image": source,
+                    "upscale_method": "lanczos", "width": w, "height": h, "crop": "disabled"}});
+                json!(["45", 0])
+            }
+        } else {
+            prepared_pixels(&mut g, &load, i, shrink, focus)
+        };
+        enc[format!("images.image_{}", i + 1)] = pixels;
+    }
+    g["4"] = json!({"class_type": "TextEncodeQwenImage21", "inputs": enc});
+    let mut latent = json!(["6", 0]);
+    let mut denoise = 1.0;
+    if let Some(e) = edit {
+        denoise = e.denoise;
+        latent = add_edit_nodes(&mut g, e, size);
+    }
+    g["7"] = json!({"class_type": "KSampler", "inputs": {
+        "seed": seed, "steps": QWEN_STEPS, "cfg": 1.0, "sampler_name": "euler",
+        "scheduler": "simple", "denoise": denoise,
+        "model": ["1", 0], "positive": ["4", 0], "negative": ["4", 1],
+        "latent_image": latent}});
+    g["8"] = json!({"class_type": "VAEDecode",
+                    "inputs": {"samples": ["7", 0], "vae": ["3", 0]}});
+    let result = match edit {
+        Some(e) if e.mask.is_some() => add_composite_nodes(&mut g, e, size),
+        _ => json!(["8", 0]),
+    };
+    g["9"] = json!({"class_type": "SaveImage",
+                    "inputs": {"filename_prefix": "SlopTweak", "images": result}});
+    g
+}
+
 /// [`build_graph`] plus `shrink`: which references to scale down to about 1 MP
 /// first, so a huge picture is never VAE-encoded at its own size (that can fill
 /// the GPU's memory and make a job crawl). `focus`: which references to cut
@@ -458,6 +619,9 @@ pub fn build_graph_with(
     shrink: &[bool],
     focus: &[Option<Rect>],
 ) -> Value {
+    if files.family == Family::Qwen {
+        return build_graph_qwen(files, refs, prompt, size, seed, edit, shrink, focus);
+    }
     let (w, h) = size;
     let edit = edit.filter(|e| !e.is_plain());
     let zoomed = edit.is_some_and(|e| e.crop.is_some());
@@ -468,7 +632,8 @@ pub fn build_graph_with(
               "inputs": {"clip_name": files.clip, "type": "krea2", "device": "default"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": files.vae}},
         "11": {"class_type": "LoraLoaderModelOnly",
-               "inputs": {"model": ["1", 0], "lora_name": files.lora, "strength_model": 1.0}},
+               "inputs": {"model": ["1", 0], "lora_name": files.lora.as_deref().unwrap_or_default(),
+                          "strength_model": 1.0}},
         "6": {"class_type": "EmptySD3LatentImage",
               "inputs": {"width": w, "height": h, "batch_size": 1}},
     });
@@ -487,40 +652,7 @@ pub fn build_graph_with(
         let pixels = if i == 0 && zoomed {
             json!(["40", 0])
         } else {
-            let part = focus.get(i).copied().flatten();
-            let mut source = json!([&load, 0]);
-            if let Some(c) = part {
-                let cut = format!("8{i}");
-                g[&cut] = crop_node(source, c);
-                source = json!([&cut, 0]);
-            }
-            let resize = match part {
-                Some(c) => {
-                    let area = u64::from(c.w) * u64::from(c.h);
-                    if area < FOCUS_MIN_PIXELS {
-                        Some(("lanczos", FOCUS_ENLARGED_MEGAPIXELS))
-                    } else if area > SHRINK_ABOVE_PIXELS {
-                        Some(("area", SHRUNK_MEGAPIXELS))
-                    } else {
-                        None
-                    }
-                }
-                None => shrink
-                    .get(i)
-                    .copied()
-                    .unwrap_or(false)
-                    .then_some(("area", SHRUNK_MEGAPIXELS)),
-            };
-            match resize {
-                Some((method, megapixels)) => {
-                    let small = format!("7{i}");
-                    g[&small] = json!({"class_type": "ImageScaleToTotalPixels", "inputs": {
-                        "image": source, "upscale_method": method,
-                        "megapixels": megapixels, "resolution_steps": 8}});
-                    json!([&small, 0])
-                }
-                None => source,
-            }
+            prepared_pixels(&mut g, &load, i, shrink, focus)
         };
         g[&latent]["inputs"]["pixels"] = pixels.clone();
         patch[format!("source_latent{suffix}")] = json!([&latent, 0]);
@@ -814,7 +946,7 @@ impl IdentityService {
 
     pub fn set_ref(&self, slot: usize, name: &str, bytes: Vec<u8>) -> Result<(), String> {
         if slot >= SLOTS {
-            return Err("There are only three picture slots.".into());
+            return Err("That picture slot doesn't exist.".into());
         }
         if !is_image(&bytes) {
             return Err("That file isn't a PNG, JPEG or WebP image.".into());
@@ -913,7 +1045,7 @@ impl IdentityService {
         mode: Mode,
         aspect: Aspect,
     ) -> Result<(Vec<Kept>, (u32, u32), Arc<AtomicBool>), String> {
-        let b = self.begin_with(prompt, mode, aspect, &EditOpts::default())?;
+        let b = self.begin_with(prompt, mode, aspect, &EditOpts::default(), Family::Krea)?;
         Ok((b.refs, b.size, b.cancel))
     }
 
@@ -923,6 +1055,7 @@ impl IdentityService {
         mode: Mode,
         aspect: Aspect,
         opts: &EditOpts,
+        family: Family,
     ) -> Result<Begun, String> {
         let prompt = prompt.trim();
         if prompt.is_empty() {
@@ -951,14 +1084,18 @@ impl IdentityService {
         let (refs, size, plan): (Vec<Kept>, _, _) = match mode {
             Mode::New => {
                 let mut refs = Vec::new();
-                for slot in 0..2 {
+                for slot in reference_slots(family) {
                     if let Some(k) = take(&i.refs[slot]) {
                         focus.push(focus_for(opts, slot, &k.bytes)?);
                         refs.push(k);
                     }
                 }
                 if refs.is_empty() {
-                    return Err("Add at least one character sheet.".into());
+                    return Err(match family {
+                        Family::Krea => "Add at least one character sheet.",
+                        Family::Qwen => "Add at least one picture.",
+                    }
+                    .into());
                 }
                 (refs, aspect.size(), None)
             }
@@ -972,9 +1109,16 @@ impl IdentityService {
                 // The picture to edit is always used whole.
                 focus.push(None);
                 let mut refs = vec![base];
-                if let Some(k) = take(&i.refs[0]) {
-                    focus.push(focus_for(opts, 0, &k.bytes)?);
-                    refs.push(k);
+                // Krea takes one optional sheet in an edit; Qwen takes them all.
+                let extra = match family {
+                    Family::Krea => vec![0],
+                    Family::Qwen => reference_slots(family),
+                };
+                for slot in extra {
+                    if let Some(k) = take(&i.refs[slot]) {
+                        focus.push(focus_for(opts, slot, &k.bytes)?);
+                        refs.push(k);
+                    }
                 }
                 (refs, size, Some(plan))
             }
@@ -1021,7 +1165,7 @@ impl IdentityService {
         seed: u64,
         opts: &EditOpts,
     ) -> Result<(), String> {
-        let b = self.begin_with(prompt, mode, aspect, opts)?;
+        let b = self.begin_with(prompt, mode, aspect, opts, target.files.family)?;
         let outcome = self
             .run(
                 target,
@@ -1141,7 +1285,9 @@ impl IdentityService {
             &shrink,
             focus,
         );
-        set_ref_boost(&mut graph, ref_boost);
+        if t.files.family == Family::Krea {
+            set_ref_boost(&mut graph, ref_boost);
+        }
         let queued = t
             .sidecar
             .comfy_post_json(
@@ -1277,10 +1423,11 @@ mod tests {
 
     fn files() -> ModelFiles {
         ModelFiles {
+            family: Family::Krea,
             unet: "wulver-v0.5-turbo.safetensors".into(),
             clip: "qwen3vl_4b_fp8_scaled.safetensors".into(),
             vae: "qwen_image_vae.safetensors".into(),
-            lora: "krea2_identity_edit_v1_2.safetensors".into(),
+            lora: Some("krea2_identity_edit_v1_2.safetensors".into()),
         }
     }
 
@@ -1703,7 +1850,7 @@ mod tests {
     fn references_are_checked() {
         let s = svc();
         assert!(s.set_ref(0, "a.png", png()).is_ok());
-        assert!(s.set_ref(3, "a.png", png()).is_err());
+        assert!(s.set_ref(SLOTS, "a.png", png()).is_err());
         assert!(s
             .set_ref(1, "a.txt", b"hello".to_vec())
             .unwrap_err()
@@ -1845,7 +1992,7 @@ mod tests {
         s.set_ref(1, "b.png", png_header(1000, 1000)).unwrap();
         s.set_ref(2, "base.png", png_header(1500, 1500)).unwrap();
         let new = |s: &IdentityService, o: &EditOpts| {
-            s.begin_with("a cafe", Mode::New, Aspect::Square, o)
+            s.begin_with("a cafe", Mode::New, Aspect::Square, o, Family::Krea)
         };
         let b = new(&s, &focus(1, rect(400, 300, 200, 200))).unwrap();
         assert_eq!(b.focus, vec![None, Some(rect(350, 250, 300, 300))]);
@@ -1855,8 +2002,9 @@ mod tests {
         assert!(new(&s, &focus(0, rect(0, 0, 0, 10))).is_err());
         assert_eq!(s.view().phase, Phase::Failed);
         // Edit: the picture to edit is never cut; the sheet may be. Slot 2 is ignored.
-        let edit =
-            |s: &IdentityService, o: &EditOpts| s.begin_with("dusk", Mode::Edit, Aspect::Square, o);
+        let edit = |s: &IdentityService, o: &EditOpts| {
+            s.begin_with("dusk", Mode::Edit, Aspect::Square, o, Family::Krea)
+        };
         let b = edit(&s, &focus(0, rect(100, 100, 400, 400))).unwrap();
         assert_eq!(b.focus, vec![None, Some(rect(0, 0, 600, 600))]);
         s.finished(Phase::Failed, "x");
@@ -1947,6 +2095,160 @@ mod tests {
             .begin(" ", Mode::Edit, Aspect::Square)
             .unwrap_err()
             .contains("what to change"));
+    }
+
+    fn qwen_files() -> ModelFiles {
+        ModelFiles {
+            family: Family::Qwen,
+            unet: "qwen_image_2.1_int8_convrot.safetensors".into(),
+            clip: "qwen3vl_8b_int8_convrot.safetensors".into(),
+            vae: "qwen_image_2.1_vae_bf16.safetensors".into(),
+            lora: None,
+        }
+    }
+
+    fn names(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("r{i}.png")).collect()
+    }
+
+    #[test]
+    fn qwen_graph_matches_the_spike() {
+        let g = build_graph(
+            &qwen_files(),
+            &names(2),
+            "<image1> and <image2> chat",
+            (896, 1152),
+            7,
+            None,
+        );
+        assert_eq!(g["2"]["inputs"]["type"], "qwen_image");
+        assert_eq!(g["6"]["class_type"], "EmptyLatentImage");
+        assert_eq!(g["6"]["inputs"]["width"], 896);
+        let enc = &g["4"];
+        assert_eq!(enc["class_type"], "TextEncodeQwenImage21");
+        assert_eq!(enc["inputs"]["prompt"], "<image1> and <image2> chat");
+        assert_eq!(enc["inputs"]["resolution"], 0);
+        assert_eq!(enc["inputs"]["images.image_1"], json!(["20", 0]));
+        assert_eq!(enc["inputs"]["images.image_2"], json!(["21", 0]));
+        let k = &g["7"]["inputs"];
+        assert_eq!(
+            (k["steps"].as_u64(), k["cfg"].as_f64()),
+            (Some(25), Some(1.0))
+        );
+        assert_eq!(k["positive"], json!(["4", 0]));
+        assert_eq!(k["negative"], json!(["4", 1]));
+        assert_eq!(k["model"], json!(["1", 0]));
+        // No Krea nodes, LoRA or reference-boost patch.
+        assert!(g.get("11").is_none() && g.get("12").is_none());
+        assert!(!g.to_string().contains("Krea2"));
+    }
+
+    #[test]
+    fn qwen_takes_up_to_ten_references_and_no_more() {
+        let g = build_graph(&qwen_files(), &names(12), "x", (1024, 1024), 1, None);
+        let inputs = g["4"]["inputs"].as_object().unwrap();
+        assert!(inputs.contains_key("images.image_10"));
+        assert!(!inputs.contains_key("images.image_11"));
+    }
+
+    #[test]
+    fn qwen_edit_puts_the_picture_first_at_the_canvas_size() {
+        // Plain edit: the picture is scaled to the canvas so the latent lines up.
+        let g = build_graph(
+            &qwen_files(),
+            &names(2),
+            "x",
+            (896, 1152),
+            1,
+            Some(&edit_graph(1.0, None, None)),
+        );
+        assert_eq!(g["4"]["inputs"]["images.image_1"], json!(["45", 0]));
+        assert_eq!(g["45"]["inputs"]["width"], 896);
+        assert_eq!(g["45"]["inputs"]["height"], 1152);
+        assert_eq!(g["7"]["inputs"]["latent_image"], json!(["6", 0]));
+        // Lower strength starts from the picture, as for Krea.
+        let g = build_graph(
+            &qwen_files(),
+            &names(1),
+            "x",
+            (896, 1152),
+            1,
+            Some(&edit_graph(0.7, None, None)),
+        );
+        assert_eq!(g["4"]["inputs"]["images.image_1"], json!(["40", 0]));
+        assert_eq!(g["7"]["inputs"]["denoise"], 0.7);
+        assert_eq!(g["7"]["inputs"]["latent_image"], json!(["42", 0]));
+        // A painted area composites back onto the untouched picture.
+        let g = build_graph(
+            &qwen_files(),
+            &names(1),
+            "x",
+            (896, 1152),
+            1,
+            Some(&edit_graph(1.0, Some("m.png"), None)),
+        );
+        assert_eq!(g["7"]["inputs"]["latent_image"], json!(["55", 0]));
+        assert_eq!(g["9"]["inputs"]["images"], json!(["62", 0]));
+    }
+
+    #[test]
+    fn qwen_references_can_be_cut_down_to_a_part() {
+        let part = Rect {
+            x: 10,
+            y: 20,
+            w: 300,
+            h: 400,
+        };
+        let g = build_graph_with(
+            &qwen_files(),
+            &names(3),
+            "x",
+            (1024, 1024),
+            1,
+            None,
+            &[false, false, false],
+            &[None, Some(part), None],
+        );
+        assert_eq!(g["81"]["class_type"], "ImageCrop");
+        // A small part is enlarged before it is encoded.
+        assert_eq!(g["71"]["inputs"]["image"], json!(["81", 0]));
+        assert_eq!(g["4"]["inputs"]["images.image_2"], json!(["71", 0]));
+    }
+
+    #[test]
+    fn extra_references_are_only_read_for_qwen() {
+        let s = IdentityService::new(Arc::new(|| {}));
+        let png = png_header(512, 512);
+        for slot in [0, 1, FIRST_EXTRA_SLOT, FIRST_EXTRA_SLOT + 1] {
+            s.set_ref(slot, &format!("s{slot}.png"), png.clone())
+                .unwrap();
+        }
+        let opts = EditOpts::default();
+        let b = s
+            .begin_with("go", Mode::New, Aspect::Square, &opts, Family::Krea)
+            .unwrap();
+        assert_eq!(b.refs.len(), 2, "Krea reads the two sheets");
+        s.finished(Phase::Done, "");
+        let b = s
+            .begin_with("go", Mode::New, Aspect::Square, &opts, Family::Qwen)
+            .unwrap();
+        let order: Vec<_> = b.refs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(order, ["s0.png", "s1.png", "s3.png", "s4.png"]);
+        assert_eq!(b.focus.len(), 4);
+        s.finished(Phase::Done, "");
+        // An edit puts the picture first, then every reference.
+        s.set_ref(BASE_SLOT, "base.png", png.clone()).unwrap();
+        let b = s
+            .begin_with("go", Mode::Edit, Aspect::Square, &opts, Family::Qwen)
+            .unwrap();
+        assert_eq!(b.refs.len(), 5);
+        assert_eq!(b.refs[0].name, "base.png");
+        s.finished(Phase::Done, "");
+        let b = s
+            .begin_with("go", Mode::Edit, Aspect::Square, &opts, Family::Krea)
+            .unwrap();
+        assert_eq!(b.refs.len(), 2, "Krea: the picture and one sheet");
+        assert!(s.set_ref(SLOTS, "x.png", png).is_err());
     }
 
     #[test]
