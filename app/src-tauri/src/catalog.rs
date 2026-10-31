@@ -798,6 +798,7 @@ mod tests {
             "kroma-identity-edit",
             "moss-image-dmd",
             "kromoss",
+            "qwen-image-edit",
         ];
         for o in models.iter().filter(|o| !edit_ids.contains(&o.id.as_str())) {
             assert_eq!(o.backend, Backend::Invoke, "{}", o.id);
@@ -930,6 +931,25 @@ mod tests {
         assert!(k.min_vram_gb >= 32.0);
         // The Identity Edit graph can be built from it.
         assert!(crate::identity::ModelFiles::of(k).is_some());
+    }
+
+    #[test]
+    fn bundled_qwen_image_edit_is_a_complete_comfyui_entry_without_a_lora() {
+        let models = bundled();
+        let q = models.iter().find(|m| m.id == "qwen-image-edit").unwrap();
+        assert_eq!(q.backend, Backend::Comfyui);
+        assert_eq!(q.base, crate::identity::QWEN_BASE);
+        let files = crate::identity::ModelFiles::of(q).unwrap();
+        assert_eq!(files.family, crate::identity::Family::Qwen);
+        assert_eq!(files.lora, None);
+        // One pinned revision for every file, ungated, and a licence note.
+        let rev = "aacf31a6d48e707f352ecba714cee0680da3479b";
+        assert!(q
+            .files
+            .iter()
+            .all(|f| f.url.contains(rev) && !f.requires_civitai_token));
+        assert!(q.license_note.contains("Research"));
+        assert!(q.min_vram_gb >= 24.0);
     }
 
     #[test]

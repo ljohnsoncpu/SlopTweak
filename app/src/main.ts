@@ -1425,9 +1425,12 @@ interface IdentityView {
   message: string;
 }
 
-let identity: IdentityView = { refs: [null, null, null], results: [], phase: "idle", message: "" };
+let identity: IdentityView = { refs: Array(9).fill(null), results: [], phase: "idle", message: "" };
 /** Slot 2 holds the picture to edit; slots 0 and 1 are character sheets. */
 const BASE_SLOT = 2;
+/** Slots 3 and up are extra references, which only Qwen-Image takes. */
+const EXTRA_SLOTS = [3, 4, 5, 6, 7, 8];
+const ALL_SLOTS = [0, 1, BASE_SLOT, ...EXTRA_SLOTS];
 const identityEditing = () => ui.idMode.value === "edit";
 /** An error from the last click (a bad request), shown until the next state change. */
 let identityError = "";
@@ -1487,6 +1490,18 @@ const isComfyGpu = () => state.kind === "ready" && snapshot?.active_backend === 
 /** The MOSS-Image panel is for that model; every other ComfyUI GPU is Identity Edit. */
 const isMoss = () => isComfyGpu() && currentModel()?.base === "moss-image";
 const isIdentity = () => isComfyGpu() && !isMoss();
+/** Qwen-Image takes any number of references, which the prompt names <image1>, <image2>... */
+const isQwen = () => isIdentity() && currentModel()?.base === "qwen-image";
+/** The slots a request reads, in the order the model numbers them. */
+function referenceOrder(editing: boolean): number[] {
+  if (!isQwen()) return editing ? [BASE_SLOT, 0] : [0, 1];
+  return [...(editing ? [BASE_SLOT] : []), 0, 1, ...EXTRA_SLOTS];
+}
+/** The extra boxes on show: every filled one, plus the next empty one. */
+function visibleExtras(): number[] {
+  const last = EXTRA_SLOTS.reduce((n, s) => (identity.refs[s] ? s : n), EXTRA_SLOTS[0]! - 1);
+  return EXTRA_SLOTS.filter((s) => s <= last + 1);
+}
 const identityBusy = () => identity.phase === "uploading" || identity.phase === "running";
 
 async function refreshIdentity(): Promise<void> {
@@ -1504,21 +1519,52 @@ function renderIdentity(): void {
   if (!isIdentity()) return;
   const busy = identityBusy();
   const editing = identityEditing();
+  const qwen = isQwen();
+  const extras = qwen ? visibleExtras() : [];
   el("ref-box-2").hidden = !editing;
-  el("ref-box-1").hidden = editing;
+  el("ref-box-1").hidden = editing && !qwen;
+  el("ref-extra").hidden = extras.length === 0;
+  for (const s of EXTRA_SLOTS) el(`ref-box-${s}`).hidden = !extras.includes(s);
+  el("id-pull-box").hidden = qwen;
   ui.idAspectRow.hidden = editing;
-  ui.idIntro.textContent = editing
-    ? "Add the picture you want to change, say what should change, and press Edit image. The result keeps the picture's shape. You can add a character sheet too, and paint just the part to change. Each image is saved to your output folder as it finishes."
-    : "Add one or two of your characters, say what they're doing, and press Make image. The characters keep their look. Each image is saved to your output folder as it finishes.";
-  ui.idPromptLabel.textContent = editing ? "What should change?" : "What are they doing?";
-  ui.idPrompt.placeholder = editing
-    ? "Change the jacket into a red hoodie. Keep everything else the same."
-    : "They sit together at a sunny café table, laughing.";
+  ui.idIntro.textContent = qwen
+    ? editing
+      ? "Add the picture you want to change, then any references you want to use (a character sheet, an outfit, a place). Say what should change, naming each picture as shown under it: <image1> is the picture to change. The result keeps the picture's shape, and you can paint just the part to change. Each image is saved to your output folder as it finishes."
+      : "Add your characters, photos or any other pictures as references, then say what you want, naming each one as shown under it: <image1>, <image2>... A new empty box appears as you add pictures, so use as many as you need. Each image is saved to your output folder as it finishes."
+    : editing
+      ? "Add the picture you want to change, say what should change, and press Edit image. The result keeps the picture's shape. You can add a character sheet too, and paint just the part to change. Each image is saved to your output folder as it finishes."
+      : "Add one or two of your characters, say what they're doing, and press Make image. The characters keep their look. Each image is saved to your output folder as it finishes.";
+  ui.idPromptLabel.textContent = editing ? "What should change?" : qwen ? "What do you want?" : "What are they doing?";
+  ui.idPrompt.placeholder = qwen
+    ? editing
+      ? "Change <image1>'s jacket into a red hoodie. Keep everything else the same."
+      : "<image1> and <image2> sit together at a sunny café table, laughing."
+    : editing
+      ? "Change the jacket into a red hoodie. Keep everything else the same."
+      : "They sit together at a sunny café table, laughing.";
   ui.idGo.textContent = editing ? "Edit image" : "Make image";
-  el<HTMLButtonElement>("ref-pick-0").textContent = editing ? "Character sheet (optional)…" : "Character 1…";
+  el<HTMLButtonElement>("ref-pick-0").textContent = qwen
+    ? "Reference 1…"
+    : editing
+      ? "Character sheet (optional)…"
+      : "Character 1…";
+  el<HTMLButtonElement>("ref-pick-1").textContent = qwen ? "Reference 2 (optional)…" : "Character 2 (optional)…";
+  for (const s of EXTRA_SLOTS) el<HTMLButtonElement>(`ref-pick-${s}`).textContent = "Another reference…";
+  const numbered = referenceOrder(editing).filter((s) => identity.refs[s]);
   identity.refs.forEach((r, slot) => {
     const box = el(`ref-img-${slot}`);
-    const empty = slot === BASE_SLOT ? "No picture yet" : editing ? "No sheet (optional)" : "No character yet";
+    const tag = el(`ref-tag-${slot}`);
+    const n = numbered.indexOf(slot) + 1;
+    tag.hidden = !qwen || !r || n === 0;
+    tag.textContent = `Call it <image${n}> in your words`;
+    const empty =
+      slot === BASE_SLOT
+        ? "No picture yet"
+        : qwen
+          ? "No reference yet"
+          : editing
+            ? "No sheet (optional)"
+            : "No character yet";
     if (focus[slot] && focus[slot]!.imageId !== r?.id) delete focus[slot];
     const overlay = slot === BASE_SLOT ? painted?.overlay : focus[slot]?.overlay;
     box.replaceChildren(...(r ? [zoomable(h("img", { src: r.data_url, alt: r.name, title: `${r.name} (click to enlarge)` })),
@@ -1526,7 +1572,7 @@ function renderIdentity(): void {
     ] : [empty]));
     el<HTMLButtonElement>(`ref-clear-${slot}`).hidden = !r;
     el<HTMLButtonElement>(`ref-pick-${slot}`).disabled = busy;
-    if (slot !== BASE_SLOT) {
+    if (slot < 2) {
       el<HTMLButtonElement>(`ref-focus-${slot}`).hidden = !r;
       el<HTMLButtonElement>(`ref-focus-${slot}`).disabled = busy;
       el<HTMLButtonElement>(`ref-focus-${slot}`).textContent = focus[slot] ? "Change the part…" : "Focus on a part…";
@@ -1535,7 +1581,9 @@ function renderIdentity(): void {
     }
   });
   renderEditTools(editing, identity.refs[BASE_SLOT] ?? null);
-  const haveInputs = editing ? !!identity.refs[BASE_SLOT] : !!identity.refs[0] || !!identity.refs[1];
+  const haveInputs = editing
+    ? !!identity.refs[BASE_SLOT]
+    : referenceOrder(false).some((s) => !!identity.refs[s]);
   ui.idGo.disabled = busy || !haveInputs || ui.idPrompt.value.trim() === "";
   ui.idGo.hidden = busy;
   ui.idCancel.hidden = !busy;
@@ -1550,8 +1598,12 @@ function renderIdentity(): void {
         h(
           "figcaption",
           {},
-          h("button", { class: "ghost", type: "button", disabled: busy, onclick: () => void identityUse(r.id, 0) }, "Use as character 1"),
-          h("button", { class: "ghost", type: "button", disabled: busy, onclick: () => void identityUse(r.id, 1) }, "As character 2"),
+          ...(qwen
+            ? [h("button", { class: "ghost", type: "button", disabled: busy, onclick: () => void identityUse(r.id, nextFreeReference()) }, "Use as a reference")]
+            : [
+                h("button", { class: "ghost", type: "button", disabled: busy, onclick: () => void identityUse(r.id, 0) }, "Use as character 1"),
+                h("button", { class: "ghost", type: "button", disabled: busy, onclick: () => void identityUse(r.id, 1) }, "As character 2"),
+              ]),
           h(
             "button",
             {
@@ -1587,8 +1639,10 @@ async function identityAct(p: Promise<unknown>): Promise<void> {
 }
 
 const identityUse = (id: string, slot: number) => identityAct(invoke("identity_use_result", { id, slot }));
+/** Where a result goes when it becomes a reference: the first empty one. */
+const nextFreeReference = () => [0, 1, ...EXTRA_SLOTS].find((s) => !identity.refs[s]) ?? EXTRA_SLOTS[EXTRA_SLOTS.length - 1]!;
 
-for (const slot of [0, 1, BASE_SLOT]) {
+for (const slot of ALL_SLOTS) {
   el<HTMLButtonElement>(`ref-pick-${slot}`).onclick = () => void identityAct(invoke("identity_pick_ref", { slot }));
   el<HTMLButtonElement>(`ref-clear-${slot}`).onclick = () => void identityAct(invoke("identity_clear_ref", { slot }));
 }
@@ -1946,9 +2000,14 @@ document.addEventListener("keydown", (e) => {
 });
 
 // ----- drop files / paste images into the picture boxes -----
-const visibleSlots = () => (identityEditing() ? [BASE_SLOT, 0] : [0, 1]);
+const visibleSlots = () =>
+  isQwen()
+    ? [...(identityEditing() ? [BASE_SLOT] : []), 0, 1, ...visibleExtras()]
+    : identityEditing()
+      ? [BASE_SLOT, 0]
+      : [0, 1];
 let hoverSlot: number | null = null;
-for (const slot of [0, 1, BASE_SLOT]) {
+for (const slot of ALL_SLOTS) {
   const box = el(`ref-box-${slot}`);
   box.onmouseenter = () => (hoverSlot = slot);
   box.onmouseleave = () => (hoverSlot = null);
@@ -1968,7 +2027,7 @@ function pickSlot(over: number | null, taken: Set<number>): number {
 }
 
 function markDrop(slot: number | null): void {
-  for (const s of [0, 1, BASE_SLOT]) el(`ref-img-${s}`).classList.toggle("drop", s === slot);
+  for (const s of ALL_SLOTS) el(`ref-img-${s}`).classList.toggle("drop", s === slot);
 }
 
 void getCurrentWebview().onDragDropEvent((event) => {
@@ -2023,8 +2082,8 @@ ui.idGo.onclick = () =>
           : null,
       focus: [0, 1].flatMap((slot) => {
         const f = focus[slot];
-        // Edit mode only uses sheet 1 (slot 0); New mode uses both.
-        return f && (slot === 0 || !identityEditing()) ? [{ slot, bbox: f.bbox }] : [];
+        // Krea's edit mode only uses sheet 1 (slot 0); New mode and Qwen use both.
+        return f && (slot === 0 || !identityEditing() || isQwen()) ? [{ slot, bbox: f.bbox }] : [];
       }),
     }),
   );

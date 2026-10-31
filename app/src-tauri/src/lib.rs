@@ -790,6 +790,8 @@ async fn identity_pick_ref(
         .file()
         .set_title(if slot == identity::BASE_SLOT {
             "Choose the picture to edit"
+        } else if slot >= identity::FIRST_EXTRA_SLOT {
+            "Choose a reference picture"
         } else {
             "Choose a character sheet"
         })

@@ -388,6 +388,11 @@ button.link.primary-link {
   margin: 12px 0;
 }
 
+.ref-tag {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
 .ref-img {
   aspect-ratio: 3 / 4;
   border: 1px dashed var(--line);
